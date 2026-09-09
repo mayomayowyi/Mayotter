@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 
 # 正式版。Build / 通常起動はこの値を使う
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.5"
 
 # 開発用 bat が MAYOTTER_APP_VERSION=1.0.0 を渡したときだけ実行時に上書き
 _dev_ver = (os.environ.get("MAYOTTER_APP_VERSION") or "").strip().strip('"').strip("'")

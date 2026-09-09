@@ -86,7 +86,8 @@ _HTBOTTOMRIGHT = 17
 _HTCLIENT = 1
 _HTCAPTION = 2
 
-_RESIZE_MARGIN = 2
+_RESIZE_MARGIN = 6
+_RESIZE_CORNER = 12
 
 _QT_EDGES_FOR_HT_CODE: dict[int, "Qt.Edges"] = {
     _HTLEFT: Qt.Edge.LeftEdge,
@@ -1385,6 +1386,33 @@ class MainWindow(QMainWindow):
         self._top_bar.setFixedHeight(32)
         def _top_bar_mouse_press(event):
             if event.button() == Qt.MouseButton.LeftButton:
+                local = self._top_bar.mapTo(self, event.position().toPoint())
+                code = self._resize_hit_code(local.x(), local.y())
+                edges = _QT_EDGES_FOR_HT_CODE.get(code)
+                # 角の斜めリサイズは +カラム 等のボタンより優先
+                corner = code in (
+                    _HTTOPLEFT,
+                    _HTTOPRIGHT,
+                    _HTBOTTOMLEFT,
+                    _HTBOTTOMRIGHT,
+                )
+                if (
+                    edges is not None
+                    and corner
+                    and not self.isMaximized()
+                    and not self.isFullScreen()
+                ):
+                    wh = self.windowHandle()
+                    if wh is not None:
+                        if self._edge_dock_enabled and self._edge_dock_revealed:
+                            estr = self._edges_str_from_ht_code(code)
+                            if estr and self._begin_dock_manual_resize(
+                                estr, event.globalPosition().toPoint()
+                            ):
+                                return
+                        else:
+                            wh.startSystemResize(edges)
+                            return
                 try:
                     child = self._top_bar.childAt(event.position().toPoint())
                 except Exception:
@@ -1399,7 +1427,6 @@ class MainWindow(QMainWindow):
                         w = w.parentWidget()
                     except Exception:
                         break
-                local = self._top_bar.mapTo(self, event.position().toPoint())
                 code = self._resize_hit_code(local.x(), local.y())
                 edges = _QT_EDGES_FOR_HT_CODE.get(code)
                 if edges is not None and not self.isMaximized() and not self.isFullScreen():
@@ -3687,7 +3714,8 @@ class MainWindow(QMainWindow):
             pass
 
     def _layout_mode_key(self) -> str:
-        if self._edge_dock_enabled and self._edge_dock_revealed:
+        # Dock 有効中は収納/展開に関わらず同一 pack を使う（追加が normal に逸れない）
+        if self._edge_dock_enabled:
             if self._edge_dock_direction in ("top", "bottom"):
                 return "tb"
             return "lr"
@@ -3833,6 +3861,12 @@ class MainWindow(QMainWindow):
             webview.download_progress.connect(self._on_download_progress)
         packs = self._service_packs()
         packs.setdefault(mode, []).append(column)
+        try:
+            host = getattr(self, "_scroll_content", None)
+            if host is not None and column.parent() is not host:
+                column.setParent(host)
+        except Exception:
+            pass
         column.hide()
 
     def _ensure_mode_columns(self, mode: str) -> None:
@@ -3844,7 +3878,10 @@ class MainWindow(QMainWindow):
             return
         packs = self._service_packs()
         lst = packs.setdefault(mode, [])
-        if len(lst) >= target:
+        # 既にある mode のカラムは設定のカラム数で水増ししない（+カラムで追加する）
+        if lst:
+            return
+        if target <= 0:
             return
         seed = []
         for col in packs.get("normal", []):
@@ -4193,15 +4230,26 @@ class MainWindow(QMainWindow):
             return ""
         r = self.rect()
         e = ""
-        m = 5
+        m = _RESIZE_MARGIN
+        c = _RESIZE_CORNER
         dock = self._edge_dock_direction
-        if pos.x() <= m and dock != "left":
+        x, y = pos.x(), pos.y()
+        w, h = r.width(), r.height()
+        if x < c and y < c and dock not in ("left", "top"):
+            return "LT"
+        if x >= w - c and y < c and dock not in ("right", "top"):
+            return "RT"
+        if x < c and y >= h - c and dock not in ("left", "bottom"):
+            return "LB"
+        if x >= w - c and y >= h - c and dock not in ("right", "bottom"):
+            return "RB"
+        if x <= m and dock != "left":
             e += "L"
-        elif pos.x() >= r.width() - m and dock != "right":
+        elif x >= w - m and dock != "right":
             e += "R"
-        if pos.y() <= m and dock != "top":
+        if y <= m and dock != "top":
             e += "T"
-        elif pos.y() >= r.height() - m and dock != "bottom":
+        elif y >= h - m and dock != "bottom":
             e += "B"
         return e
 
@@ -7254,30 +7302,40 @@ class MainWindow(QMainWindow):
         w = self.width()
         h = self.height()
         m = _RESIZE_MARGIN
+        c = _RESIZE_CORNER
 
         left = x < m
         right = x >= w - m
         top = y < m
         bottom = y >= h - m
+        # 角は辺より広い正方形で斜めリサイズを取りやすくする
+        left_c = x < c
+        right_c = x >= w - c
+        top_c = y < c
+        bottom_c = y >= h - c
 
         if getattr(self, "_edge_dock_enabled", False):
             dock = getattr(self, "_edge_dock_direction", "right")
             if dock == "left":
                 left = False
+                left_c = False
             elif dock == "right":
                 right = False
+                right_c = False
             elif dock == "top":
                 top = False
+                top_c = False
             elif dock == "bottom":
                 bottom = False
+                bottom_c = False
 
-        if left and top:
+        if left_c and top_c:
             return _HTTOPLEFT
-        if right and top:
+        if right_c and top_c:
             return _HTTOPRIGHT
-        if left and bottom:
+        if left_c and bottom_c:
             return _HTBOTTOMLEFT
-        if right and bottom:
+        if right_c and bottom_c:
             return _HTBOTTOMRIGHT
         if left:
             return _HTLEFT
@@ -11800,6 +11858,32 @@ class MainWindow(QMainWindow):
         packs = self._service_packs()
         packs[key].append(column)
         self._columns = packs[key]
+        # 収納中カラム群ではなく、開いている側へ追加する
+        try:
+            stowed = getattr(self, "_stowed_columns", None) or []
+            if column in stowed:
+                stowed = [c for c in stowed if c is not column]
+                self._stowed_columns = stowed
+            mode_key = key
+            if hasattr(self, "_mode_stowed_columns") and self._mode_stowed_columns is not None:
+                ms = list(self._mode_stowed_columns.get(mode_key) or [])
+                if column in ms:
+                    self._mode_stowed_columns[mode_key] = [c for c in ms if c is not column]
+        except Exception:
+            pass
+        # 収納カラムの後ろではなく、表示中の末尾に並べる
+        try:
+            stowed_set = set(getattr(self, "_stowed_columns", None) or [])
+            if stowed_set and column in self._columns:
+                self._columns.remove(column)
+                insert_at = 0
+                for i, c in enumerate(self._columns):
+                    if c not in stowed_set:
+                        insert_at = i + 1
+                self._columns.insert(insert_at, column)
+                packs[key] = self._columns
+        except Exception:
+            pass
         self._scroll_layout.addWidget(column)
         column.show()
         self._account_add_trace("column_shown", aid=account.account_id, cid=column.get_column_id())
@@ -11819,6 +11903,12 @@ class MainWindow(QMainWindow):
         else:
             self._fit_after_column_add(column)
             self._update_boundary_visibility()
+            if self._edge_dock_enabled and self._edge_dock_revealed:
+                try:
+                    column.show()
+                    self._fit_columns()
+                except Exception:
+                    pass
         try:
             delay = int(getattr(webview, "_pending_restore_delay_ms", 0) or 0)
         except Exception:

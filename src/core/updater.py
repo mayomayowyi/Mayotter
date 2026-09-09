@@ -159,20 +159,19 @@ def check_for_update(
     return None
 
 def ensure_update_tmp() -> Path:
-    UPDATE_TMP_DIR.mkdir(parents=True, exist_ok=True)
-    return UPDATE_TMP_DIR
+    tmp = install_dir_for_running_app() / "update_tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    return tmp
 
 def clear_update_tmp() -> None:
-    if not UPDATE_TMP_DIR.exists():
-        return
     try:
-        resolved = UPDATE_TMP_DIR.resolve()
-        base = APP_BASE_DIR.resolve()
-        if resolved.name != "update_tmp":
+        tmp = install_dir_for_running_app() / "update_tmp"
+        if not tmp.exists():
             return
-        if base not in resolved.parents and resolved != base / "update_tmp":
-            if resolved.parent != base:
-                return
+        resolved = tmp.resolve()
+        base = install_dir_for_running_app().resolve()
+        if resolved.name != "update_tmp" or resolved.parent != base:
+            return
         shutil.rmtree(resolved, ignore_errors=True)
     except Exception:
         pass
@@ -194,7 +193,7 @@ def download_release_asset(
     name = dest_name or url.rsplit("/", 1)[-1] or "update.bin"
     if "?" in name:
         name = name.split("?", 1)[0]
-    dest = UPDATE_TMP_DIR / name
+    dest = ensure_update_tmp() / name
 
     require_hash = not _is_dev_edition()
     if require_hash and not (expected_sha256 and str(expected_sha256).strip()):
@@ -269,7 +268,7 @@ def download_release_asset(
 
 def mark_download_complete(path: Path, release: ReleaseInfo) -> Path:
     ensure_update_tmp()
-    marker = UPDATE_TMP_DIR / "download_complete.json"
+    marker = ensure_update_tmp() / "download_complete.json"
     payload = {
         "version": release.version,
         "file": str(path),
@@ -300,7 +299,7 @@ def extract_release_zip(zip_path: Path, dest_dir: Path | None = None) -> Path | 
 
     ensure_update_tmp()
     if dest_dir is None:
-        dest_dir = UPDATE_TMP_DIR / "extract"
+        dest_dir = ensure_update_tmp() / "extract"
     try:
         if dest_dir.exists():
             shutil.rmtree(dest_dir, ignore_errors=True)
@@ -342,12 +341,18 @@ def find_staged_app_root(extract_dir: Path) -> Path | None:
         pass
     return None
 
-def install_dir_for_running_app() -> Path:
+def running_app_location() -> tuple[Path, str]:
+    """実行中本体の (配置ディレクトリ, EXE名)。フォルダ名は問わない。"""
     import sys
 
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(APP_BASE_DIR).resolve()
+        exe = Path(sys.executable).resolve()
+        return exe.parent, (exe.name or "Mayotter.exe")
+    return Path(APP_BASE_DIR).resolve(), "Mayotter.exe"
+
+
+def install_dir_for_running_app() -> Path:
+    return running_app_location()[0]
 
 
 def write_windows_apply_script(
@@ -357,51 +362,78 @@ def write_windows_apply_script(
     install_dir: Path,
     exe_name: str = "Mayotter.exe",
 ) -> Path | None:
-    ensure_update_tmp()
-    script = UPDATE_TMP_DIR / "apply_update.bat"
+    tmp = ensure_update_tmp()
+    script = tmp / "apply_update.bat"
     src = str(staged_root.resolve())
     dst = str(install_dir.resolve())
-    exe = str((install_dir / exe_name).resolve())
+    exe = str((Path(install_dir) / exe_name).resolve())
+    pkg_exe = "Mayotter.exe"
     content = f"""@echo off
 setlocal EnableExtensions
+chcp 65001 >nul
 set "PID={int(parent_pid)}"
 set "SRC={src}"
 set "DST={dst}"
 set "EXE={exe}"
-echo [Mayotter updater] waiting for PID %PID% ...
+set "PKG_EXE={pkg_exe}"
+set "LOG=%~dp0apply_update.log"
+echo [Mayotter updater] start > "%LOG%"
+echo PID=%PID% SRC=%SRC% DST=%DST% EXE=%EXE% >> "%LOG%"
+echo [Mayotter updater] waiting for PID %PID% ... >> "%LOG%"
 :waitloop
 tasklist /FI "PID eq %PID%" 2>nul | findstr /C:"%PID%" >nul
 if not errorlevel 1 (
   timeout /t 1 /nobreak >nul
   goto waitloop
 )
-echo [Mayotter updater] applying files ...
+echo [Mayotter updater] parent exited >> "%LOG%"
+set /a _tries=0
+:waitexe
+tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | findstr /I "{exe_name}" >nul
+if errorlevel 1 goto apply
+set /a _tries+=1
+if %_tries% GEQ 45 goto apply
+timeout /t 1 /nobreak >nul
+goto waitexe
+:apply
+timeout /t 1 /nobreak >nul
+echo [Mayotter updater] applying files ... >> "%LOG%"
 if not exist "%SRC%" (
-  echo [Mayotter updater] missing staged source
+  echo [Mayotter updater] missing staged source >> "%LOG%"
   exit /b 1
 )
-rem /XD excludes user data and staging dirs
-robocopy "%SRC%" "%DST%" /E /XD data data_dev update_tmp /R:2 /W:1 /NFL /NDL /NJH /NJS /NC /NS
+rem DST は実行中 EXE のディレクトリ（フォルダ名は Mayotter である必要はない）
+robocopy "%SRC%" "%DST%" /E /XD data data_dev update_tmp /R:5 /W:2 /NFL /NDL /NJH /NJS /NC /NS
 set "RC=%ERRORLEVEL%"
+echo [Mayotter updater] robocopy RC=%RC% >> "%LOG%"
 if %RC% GEQ 8 (
-  echo [Mayotter updater] robocopy failed RC=%RC%
+  echo [Mayotter updater] robocopy failed RC=%RC% >> "%LOG%"
   exit /b 1
+)
+if /I not "%PKG_EXE%"=="{exe_name}" (
+  if exist "%DST%\\%PKG_EXE%" (
+    copy /Y "%DST%\\%PKG_EXE%" "%EXE%" >> "%LOG%" 2>&1
+  )
 )
 if exist "%EXE%" (
+  echo [Mayotter updater] starting %EXE% >> "%LOG%"
   start "" "%EXE%"
+) else if exist "%DST%\\%PKG_EXE%" (
+  echo [Mayotter updater] starting %DST%\\%PKG_EXE% >> "%LOG%"
+  start "" "%DST%\\%PKG_EXE%"
 ) else (
-  echo [Mayotter updater] exe missing: %EXE%
+  echo [Mayotter updater] exe missing: %EXE% >> "%LOG%"
   exit /b 1
 )
+echo [Mayotter updater] done >> "%LOG%"
 endlocal
 exit /b 0
 """
     try:
-        script.write_text(content, encoding="utf-8")
+        script.write_text(content, encoding="utf-8-sig", newline="\r\n")
         return script
     except Exception:
         return None
-
 
 def launch_apply_helper(script_path: Path) -> bool:
     import sys
@@ -410,19 +442,24 @@ def launch_apply_helper(script_path: Path) -> bool:
     if not script_path or not Path(script_path).is_file():
         return False
     try:
-        if sys.platform.startswith("win"):
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            subprocess.Popen(
-                ["cmd.exe", "/c", str(Path(script_path).resolve())],
-                cwd=str(Path(script_path).resolve().parent),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creationflags,
-                close_fds=True,
-            )
-            return True
-        return False
+        if not sys.platform.startswith("win"):
+            return False
+        script = str(Path(script_path).resolve())
+        cwd = str(Path(script_path).resolve().parent)
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        # start /b で親プロセスから切り離し、終了後も BAT が生き残るようにする
+        subprocess.Popen(
+            f'start "" /b cmd.exe /c "{script}"',
+            cwd=cwd,
+            shell=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=create_no_window | new_group,
+            close_fds=True,
+        )
+        return True
     except Exception:
         return False
 
@@ -431,7 +468,7 @@ def prepare_and_launch_self_update(
     zip_path: Path,
     *,
     parent_pid: int | None = None,
-    exe_name: str = "Mayotter.exe",
+    exe_name: str | None = None,
 ) -> tuple[bool, str]:
     import os
 
@@ -443,12 +480,13 @@ def prepare_and_launch_self_update(
     staged = find_staged_app_root(extracted)
     if staged is None:
         return False, "更新パッケージにMayotter本体が見つかりません。"
-    install = install_dir_for_running_app()
+    install, running_exe = running_app_location()
+    apply_exe = (exe_name or running_exe or "Mayotter.exe").strip() or "Mayotter.exe"
     script = write_windows_apply_script(
         parent_pid=int(parent_pid),
         staged_root=staged,
         install_dir=install,
-        exe_name=exe_name,
+        exe_name=apply_exe,
     )
     if script is None:
         return False, "更新ヘルパーの作成に失敗しました。"
