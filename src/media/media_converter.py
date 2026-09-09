@@ -8,7 +8,6 @@ from pathlib import Path
 
 from src.media.ffmpeg_util import (
     FFmpegError,
-    FFmpegNotFoundError,
     TARGET_I,
     TARGET_TP,
     find_ffmpeg,

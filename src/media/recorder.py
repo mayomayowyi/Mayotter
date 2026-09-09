@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import struct
-import sys
 import wave
 from pathlib import Path
 

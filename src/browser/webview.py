@@ -30,7 +30,6 @@ from src.browser.url_policy import (
 
 from src.browser.content_filter import install_filter
 
-import time as _nav_time
 
 _nav_recent: dict[str, float] = {}
 _NAV_DEDUP_SEC = 0.75
@@ -52,7 +51,7 @@ def _nav_begin(url) -> bool:
     key = _nav_key(url)
     if not key or key.startswith("about:"):
         return True
-    now = _nav_time.monotonic()
+    now = time.monotonic()
     stale = [k for k, ts in _nav_recent.items() if now - ts > _NAV_DEDUP_SEC]
     for k in stale:
         _nav_recent.pop(k, None)
@@ -170,6 +169,7 @@ def is_x_twitter_url(url: str) -> bool:
 def x_shortcut_script(enabled: bool) -> str:
     return _X_SHORTCUT_INSTALL_JS if enabled else _X_SHORTCUT_REMOVE_JS
 
+
 def attach_capture_holder_parent(parent: QWidget | None) -> None:
     global _OFFSCREEN_CAPTURE_HOLDER, _CAPTURE_HOST_WINDOW
     if parent is None:
@@ -187,11 +187,6 @@ def attach_capture_holder_parent(parent: QWidget | None) -> None:
             w.setFixedSize(1, 1)
             w.move(0, 0)
             w.hide()
-            print(
-                f"[TransientWindow] holder attached parent={type(parent).__name__} "
-                f"isWindow={w.isWindow()} visible={w.isVisible()}",
-                flush=True,
-            )
             return
         w = QWidget(parent)
         w.setObjectName("mayotter_offscreen_capture_holder")
@@ -203,13 +198,8 @@ def attach_capture_holder_parent(parent: QWidget | None) -> None:
         w.move(0, 0)
         w.hide()
         _OFFSCREEN_CAPTURE_HOLDER = w
-        print(
-            f"[TransientWindow] holder CREATE parent={type(parent).__name__} "
-            f"isWindow={w.isWindow()} (no top-level)",
-            flush=True,
-        )
     except Exception as exc:
-        print(f"[TransientWindow] holder attach failed: {exc!r}", flush=True)
+        pass
 
 def _offscreen_capture_holder() -> QWidget | None:
     w = _OFFSCREEN_CAPTURE_HOLDER
@@ -218,7 +208,6 @@ def _offscreen_capture_holder() -> QWidget | None:
         if host is not None:
             attach_capture_holder_parent(host)
             return _OFFSCREEN_CAPTURE_HOLDER
-        print("[TransientWindow] holder missing (MainWindow not attached yet)", flush=True)
         return None
     return w
 
@@ -430,6 +419,7 @@ class MayotterPage(QWebEnginePage):
             pass
         self._attach_choose_served = False
         self._attach_auto_mode = False
+
 
     def chooseFiles(self, mode, old_files, accepted_mime_types):
         import os
@@ -671,39 +661,16 @@ class XWebView(QWebEngineView):
     tab_opener: "Callable[[str], None] | None" = None
 
     def __init__(self, profile: QWebEngineProfile, parent=None) -> None:
-        def _vtrace(stage: str) -> None:
-            try:
-                import os
-                from src.core.paths import LOGS_DIR
-                LOGS_DIR.mkdir(parents=True, exist_ok=True)
-                with open(LOGS_DIR / "last_account_add.log", "a", encoding="utf-8") as f:
-                    f.write(f"webview {stage}\n")
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        _vtrace("super_enter")
         super().__init__(parent)
-        _vtrace("super_done")
         self._profile = profile
         self._current_url = ""
         self._last_activity = time.time()
         self._last_user_gesture_mono: float | None = None
         self._suppress_user_gesture_mark = False
         self._media_wide_active = False
-        _vtrace("create_page_enter")
         self.setPage(self._create_page(profile))
-        _vtrace("create_page_done")
-        _vtrace("install_filter_enter")
         install_filter(self.page())
-        _vtrace("install_filter_done")
-        _vtrace("attach_download_enter")
         attach_download_handler(profile)
-        _vtrace("attach_download_done")
 
         key = id(profile)
         refs = _DOWNLOAD_VIEWS.setdefault(key, [])
@@ -715,8 +682,12 @@ class XWebView(QWebEngineView):
 
     def _install_focus_proxy_filter(self) -> None:
         proxy = self.focusProxy()
-        if proxy is not None:
-            proxy.installEventFilter(self)
+        if proxy is None:
+            return
+        if getattr(self, "_focus_proxy_filter_installed", False):
+            return
+        proxy.installEventFilter(self)
+        self._focus_proxy_filter_installed = True
 
     def touch_activity(self) -> None:
         self._last_activity = time.time()
@@ -778,6 +749,8 @@ class XWebView(QWebEngineView):
         except Exception:
             pass
         super().keyPressEvent(event)
+
+
 
     def _local_paths_from_mime(self, md) -> list[str]:
         paths: list[str] = []
@@ -1296,10 +1269,6 @@ class XWebView(QWebEngineView):
 
     def createWindow(self, kind) -> QWebEngineView:
         owner = self
-        print(
-            f"[CreateWindow] kind={kind!r} source={type(self).__name__}",
-            flush=True,
-        )
 
         class _CapturePage(QWebEnginePage):
 
@@ -1361,11 +1330,9 @@ class XWebView(QWebEngineView):
         class _CaptureView(QWebEngineView):
 
             def show(self) -> None:
-                print("[TransientWindow] SHOW blocked CaptureView.show()", flush=True)
                 return
 
             def showNormal(self) -> None:
-                print("[TransientWindow] SHOW blocked CaptureView.showNormal()", flush=True)
                 return
 
             def showFullScreen(self) -> None:
@@ -1378,12 +1345,6 @@ class XWebView(QWebEngineView):
                 return
 
             def setVisible(self, visible: bool) -> None:
-                if visible:
-                    print(
-                        f"[TransientWindow] SHOW blocked CaptureView.setVisible(True) "
-                        f"isWindow={self.isWindow()}",
-                        flush=True,
-                    )
                 super().setVisible(False)
 
             def showEvent(self, event) -> None:
@@ -1397,7 +1358,6 @@ class XWebView(QWebEngineView):
                     self.setFixedSize(1, 1)
                 except Exception:
                     pass
-                print("[TransientWindow] SHOWEVENT CaptureView forced hide", flush=True)
 
             def raise_(self) -> None:
                 return
@@ -1421,14 +1381,6 @@ class XWebView(QWebEngineView):
         view.setFixedSize(1, 1)
         view.move(0, 0)
         view.hide()
-        print(
-            f"[TransientWindow] CREATE CaptureView "
-            f"parent={type(parent).__name__}/{parent.objectName()!r} "
-            f"isWindow={view.isWindow()} visible={view.isVisible()} "
-            f"flags=0x{int(view.windowFlags()):x} "
-            f"dontShow={view.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)}",
-            flush=True,
-        )
         page = _CapturePage(self.page().profile(), view)
         view.setPage(page)
 
@@ -1472,11 +1424,6 @@ class XWebView(QWebEngineView):
 
         from PySide6.QtCore import QTimer
         QTimer.singleShot(15000, _drop)
-        print(
-            f"[CaptureView] ready parent=offscreen_holder "
-            f"(no visible window / no taskbar / no focus)",
-            flush=True,
-        )
         return view
 
     def _open_from_new_window_request(self, text: str) -> None:
@@ -1491,26 +1438,13 @@ class XWebView(QWebEngineView):
             pass
         try:
             if is_google_click_redirector(text):
-                print(
-                    f"[InternalNavigation] skip intermediate url={text[:120]!r}",
-                    flush=True,
-                )
                 return
         except Exception:
             pass
-        print(
-            f"[InternalNavigation] classification begin url={text[:120]!r}",
-            flush=True,
-        )
         try:
             action = decide_navigation(text)
         except Exception:
             action = "in_app"
-        print(
-            f"[InternalNavigation] classification result={action} "
-            f"(no visible window)",
-            flush=True,
-        )
         if action == "block":
             return
         if action == "external_browser":

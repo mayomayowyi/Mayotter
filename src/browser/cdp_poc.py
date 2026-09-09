@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import os
 import socket
 import struct
 import threading
 import time
-import urllib.error
 import urllib.request
 from typing import Any
 

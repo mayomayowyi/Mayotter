@@ -12,14 +12,9 @@ TEXT = "#f1f3f7"
 TEXT_SECONDARY = "#aeb6c5"
 TEXT_MUTED = "#7f899a"
 ACCENT = "#4a7ec7"
-ACCENT_HOVER = "#5b8fd6"
-DANGER = "#e66464"
-SUCCESS = "#7dcea0"
-TOPBAR = "#0f1117"
 
 RADIUS_SM = 6
 RADIUS_MD = 8
-RADIUS_LG = 10
 
 def overlay_stylesheet() -> str:
     from pathlib import Path

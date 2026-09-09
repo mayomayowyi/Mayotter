@@ -24,29 +24,6 @@ SOURCE_TYPE_BOOKMARKS = "bookmarks"
 SOURCE_TYPE_MENTIONS = "mentions"
 SOURCE_TYPE_LIKES = "likes"
 
-COLUMN_PRESETS: tuple[str, ...] = (
-    SOURCE_TYPE_HOME,
-    SOURCE_TYPE_NOTIFICATIONS,
-    SOURCE_TYPE_FAVORITES,
-    SOURCE_TYPE_PROFILE,
-    SOURCE_TYPE_LISTS,
-    SOURCE_TYPE_SEARCH,
-    SOURCE_TYPE_DIRECT_MESSAGES,
-    SOURCE_TYPE_GROK,
-)
-
-COLUMN_PRESET_LABELS: dict[str, str] = {
-    SOURCE_TYPE_HOME: "ホーム",
-    SOURCE_TYPE_NOTIFICATIONS: "通知",
-    SOURCE_TYPE_FAVORITES: "お気に入り",
-    SOURCE_TYPE_SAVED: "お気に入り",
-    SOURCE_TYPE_PROFILE: "プロフィール",
-    SOURCE_TYPE_LISTS: "リスト",
-    SOURCE_TYPE_SEARCH: "検索",
-    SOURCE_TYPE_DIRECT_MESSAGES: "ダイレクトメッセージ",
-    SOURCE_TYPE_GROK: "Grok",
-}
-
 _SOURCE_TYPES_NEEDING_INPUT = frozenset({
     SOURCE_TYPE_SEARCH,
 })
@@ -54,7 +31,6 @@ _SOURCE_TYPES_NEEDING_INPUT = frozenset({
 FAVORITES_ENTRY_URL = "https://x.com/i/bookmarks"
 SAVED_ENTRY_URL = FAVORITES_ENTRY_URL
 
-LISTS_ENTRY_URL = "https://x.com/i/lists"
 DM_ENTRY_URL = "https://x.com/messages"
 X_GROK_ENTRY_URL = "https://x.com/i/grok"
 
@@ -77,6 +53,10 @@ def _is_grok_url(url: str) -> bool:
 
 def resolve_source_url(column_type: str, account_initial_url: str = "", source_url: str = "") -> str:
     column_type = migrate_column_type(column_type)
+
+    saved = (source_url or "").strip()
+    if saved.startswith("http://") or saved.startswith("https://"):
+        return saved
 
     if _is_grok_url(account_initial_url):
         if column_type == SOURCE_TYPE_URL and source_url:

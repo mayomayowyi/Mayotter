@@ -6,7 +6,6 @@ from pathlib import Path
 from src.ui.theme import (
     apply_overlay_theme,
     overlay_stylesheet,
-    SURFACE,
     TEXT,
     TEXT_SECONDARY,
     BORDER_ACCENT,

@@ -50,7 +50,17 @@ def main() -> int:
     except Exception:
         pass
 
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import (
+        QApplication,
+        QDialog,
+        QVBoxLayout,
+        QHBoxLayout,
+        QLabel,
+        QPushButton,
+        QToolButton,
+    )
+    from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer, QSize, QRectF
+    from PySide6.QtGui import QPainterPath, QRegion
 
     from src.browser.profile_manager import ProfileManager
     from src.core.settings import SettingsManager
@@ -64,69 +74,148 @@ def main() -> int:
     lock = InstanceLock(DATA_DIR)
     if not lock.try_acquire():
         try:
-            QMessageBox.information(
-                None,
-                "Mayotter",
-                "すでに同じデータ領域でMayotterが起動しています。\n"
-                f"（{DATA_DIR}）",
-            )
+            from src.ui.theme import apply_overlay_theme, POPOVER_OPEN_MS, POPOVER_CLOSE_MS
         except Exception:
-            print(f"[Mayotter] already running for data={DATA_DIR}", flush=True)
+            apply_overlay_theme = None
+            POPOVER_OPEN_MS, POPOVER_CLOSE_MS = 170, 120
+        try:
+            from src.ui.icons import make_close_icon
+        except Exception:
+            make_close_icon = None
+        try:
+            dlg = QDialog(None)
+            dlg.setObjectName("mayotter_settings_dialog")
+            dlg.setWindowTitle("Mayotter")
+            dlg.setWindowFlags(
+                Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+            )
+            dlg.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            dlg.setMinimumWidth(360)
+            if apply_overlay_theme is not None:
+                try:
+                    apply_overlay_theme(dlg)
+                except Exception:
+                    pass
+
+            root = QVBoxLayout(dlg)
+            root.setContentsMargins(10, 8, 10, 8)
+            root.setSpacing(8)
+            title_row = QHBoxLayout()
+            title_lbl = QLabel("Mayotter")
+            title_lbl.setStyleSheet("color:#f1f3f7; font-size:14px; font-weight:600;")
+            title_row.addWidget(title_lbl)
+            title_row.addStretch(1)
+            close_tb = QToolButton()
+            if make_close_icon is not None:
+                try:
+                    close_tb.setIcon(make_close_icon("#93a5c4", 12))
+                    close_tb.setIconSize(QSize(12, 12))
+                except Exception:
+                    pass
+            close_tb.setFixedSize(24, 24)
+            close_tb.setStyleSheet(
+                "QToolButton { background:transparent; border:none; border-radius:4px; }"
+                "QToolButton:hover { background:#1a2740; }"
+            )
+            title_row.addWidget(close_tb)
+            root.addLayout(title_row)
+
+            msg = QLabel(
+                "すでに同じデータ領域でMayotterが起動しています。\n"
+                f"（{DATA_DIR}）"
+            )
+            msg.setWordWrap(True)
+            msg.setStyleSheet("color:#eaf1fb; font-size:12px;")
+            root.addWidget(msg)
+
+            btn_row = QHBoxLayout()
+            btn_row.addStretch(1)
+            ok_btn = QPushButton("OK")
+            ok_btn.setMinimumWidth(56)
+            btn_row.addWidget(ok_btn)
+            root.addLayout(btn_row)
+
+            def _apply_round_mask():
+                try:
+                    path = QPainterPath()
+                    path.addRoundedRect(QRectF(0, 0, max(1, dlg.width()), max(1, dlg.height())), 10, 10)
+                    dlg.setMask(QRegion(path.toFillPolygon().toPolygon()))
+                except Exception:
+                    pass
+
+            dlg.adjustSize()
+            _apply_round_mask()
+
+            finished = {"done": False}
+
+            def _finish(code=0):
+                if finished["done"]:
+                    return
+                finished["done"] = True
+                try:
+                    anim = getattr(dlg, "_mayotter_fade_anim", None)
+                    if anim is not None:
+                        try:
+                            anim.stop()
+                        except Exception:
+                            pass
+                        dlg._mayotter_fade_anim = None
+                except Exception:
+                    pass
+                try:
+                    dlg.done(int(code))
+                except Exception:
+                    try:
+                        dlg.close()
+                    except Exception:
+                        pass
+
+            def _fade_close():
+                if getattr(dlg, "_mayotter_fading_out", False):
+                    return
+                dlg._mayotter_fading_out = True
+                try:
+                    anim = QPropertyAnimation(dlg, b"windowOpacity", dlg)
+                    anim.setDuration(int(POPOVER_CLOSE_MS))
+                    anim.setStartValue(float(dlg.windowOpacity() or 1.0))
+                    anim.setEndValue(0.0)
+                    anim.setEasingCurve(QEasingCurve.Type.InCubic)
+                    anim.finished.connect(lambda: _finish(0))
+                    anim.start()
+                    dlg._mayotter_fade_anim = anim
+                    QTimer.singleShot(int(POPOVER_CLOSE_MS) + 120, lambda: _finish(0))
+                except Exception:
+                    _finish(0)
+
+            ok_btn.clicked.connect(_fade_close)
+            close_tb.clicked.connect(_fade_close)
+
+            try:
+                dlg.setWindowOpacity(0.0)
+            except Exception:
+                pass
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            try:
+                anim_in = QPropertyAnimation(dlg, b"windowOpacity", dlg)
+                anim_in.setDuration(int(POPOVER_OPEN_MS))
+                anim_in.setStartValue(0.0)
+                anim_in.setEndValue(1.0)
+                anim_in.setEasingCurve(QEasingCurve.Type.OutCubic)
+                anim_in.start()
+                dlg._mayotter_fade_anim = anim_in
+            except Exception:
+                pass
+            # アニメ失敗・非対応環境でも必ず見えるようにする
+            QTimer.singleShot(0, lambda: dlg.setWindowOpacity(1.0) if not getattr(dlg, "_mayotter_fading_out", False) else None)
+            QTimer.singleShot(int(POPOVER_OPEN_MS) + 50, lambda: dlg.setWindowOpacity(1.0) if not getattr(dlg, "_mayotter_fading_out", False) else None)
+            dlg.exec()
+        except Exception as exc:
+            print(f"[Mayotter] already running for data={DATA_DIR} ({exc!r})", flush=True)
         return 1
     app._mayotter_instance_lock = lock
 
-    _td = os.environ.get("MAYOTTER_TRANSIENT_DEBUG", "").strip().lower()
-    if _td in ("1", "true", "yes", "on"):
-        try:
-            from PySide6.QtCore import QObject, QEvent
-
-            class _TopLevelShowProbe(QObject):
-                def eventFilter(self, obj, event):
-                    try:
-                        et = event.type()
-                        if et in (QEvent.Type.Show, QEvent.Type.ShowToParent):
-                            is_win = bool(getattr(obj, "isWindow", lambda: False)())
-                            if is_win:
-                                name = ""
-                                try:
-                                    name = obj.objectName() or ""
-                                except Exception:
-                                    pass
-                                cls = type(obj).__name__
-                                if cls == "MainWindow" or name == "MainWindow":
-                                    return False
-                                flags = 0
-                                try:
-                                    flags = int(obj.windowFlags())
-                                except Exception:
-                                    pass
-                                geo = "?"
-                                try:
-                                    g = obj.geometry()
-                                    geo = f"{g.x()},{g.y()} {g.width()}x{g.height()}"
-                                except Exception:
-                                    pass
-                                parent = getattr(obj, "parent", lambda: None)()
-                                import time as _t
-                                pid = id(obj)
-                                is_win = bool(getattr(obj, "isWindow", lambda: False)())
-                                print(
-                                    f"[TransientWindow] SHOW ts={_t.time():.3f} id={pid} class={cls} "
-                                    f"objectName={name!r} parent={type(parent).__name__ if parent else None} "
-                                    f"isWindow={is_win} flags=0x{flags:x} geo={geo} "
-                                    f"visible={getattr(obj, 'isVisible', lambda: None)()}",
-                                    flush=True,
-                                )
-                    except Exception:
-                        pass
-                    return False
-
-            _probe = _TopLevelShowProbe(app)
-            app.installEventFilter(_probe)
-            app._mayotter_toplevel_show_probe = _probe
-            print("[TransientWindow] top-level SHOW probe installed", flush=True)
-        except Exception as exc:
-            print(f"[TransientWindow] probe install failed: {exc!r}", flush=True)
 
     try:
         app.setStyleSheet(

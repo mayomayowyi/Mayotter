@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import sys
-import traceback
 from datetime import datetime
 from pathlib import Path
 

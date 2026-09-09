@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -27,13 +28,6 @@ EDGE_DOCK_DISABLE_ON_FULLSCREEN_KEY = "edge_dock_disable_on_fullscreen"
 EDGE_DOCK_UNREAD_INDICATOR_KEY = "edge_dock_unread_indicator"
 EDGE_DOCK_ENABLED_KEY = "edge_dock_enabled"
 EDGE_DOCK_DIRECTION_KEY = "edge_dock_direction"
-EDGE_DOCK_WIDTH_LR_KEY = "edge_dock_width_lr"
-EDGE_DOCK_HEIGHT_LR_KEY = "edge_dock_height_lr"
-EDGE_DOCK_WIDTH_TB_KEY = "edge_dock_width_tb"
-EDGE_DOCK_HEIGHT_TB_KEY = "edge_dock_height_tb"
-EDGE_DOCK_PANEL_HEIGHT_RATIO_KEY = "edge_dock_panel_height_ratio"
-EDGE_DOCK_EDGE_OFFSET_KEY = "edge_dock_edge_offset"
-EDGE_DOCK_MONITOR_INDEX_KEY = "edge_dock_monitor_index"
 
 EXTERNAL_SITE_POLICY_KEY = "external_site_policy"
 ALLOWED_EXTERNAL_NEW_TAB_KEY = "allowed_external_new_tab"
@@ -63,8 +57,12 @@ class SettingsManager:
     def load(self) -> dict[str, Any]:
         if not self._settings_path.exists():
             return {}
-        with open(self._settings_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(self._settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError, UnicodeError):
+            return {}
 
     def get_column_widths(self) -> dict[str, int]:
         settings = self.load()
@@ -131,8 +129,16 @@ class SettingsManager:
         current = self.load()
         current.update(settings)
         self._settings_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._settings_path, "w", encoding="utf-8") as f:
+        # 途中終了で app.json が壊れるのを避けるため一時ファイルへ書いてから差し替える
+        tmp_path = self._settings_path.with_suffix(self._settings_path.suffix + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(current, f, indent=2, ensure_ascii=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, self._settings_path)
 
     def get_window_geometry(self) -> bytes | None:
         settings = self.load()

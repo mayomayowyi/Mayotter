@@ -8,77 +8,11 @@ from pathlib import Path
 
 BG_TOP = "#0f1117"
 BG_BOTTOM = "#181c26"
-PANEL = (20, 30, 48, 220)
 PANEL_BORDER = "#2b3242"
 TITLE = "#f1f3f7"
-SECONDARY = "#9fb4d8"
-ACCENT = "#33639f"
 WAVE_ACTIVE = "#1d9bf0"
 WAVE_DIM = "#2f517d"
-TIMER = "#c5d4ea"
 REC_RED = "#e66464"
-
-def sample_waveform_timeline(
-    audio_path: str | Path | None,
-    *,
-    hop_seconds: float | None = 0.05,
-    max_bars: int | None = None,
-) -> tuple[list[float], float]:
-    if not audio_path:
-        return [], 0.0
-    path = Path(audio_path)
-    if not path.is_file():
-        return [], 0.0
-    if path.suffix.lower() != ".wav":
-        return [], 0.0
-    try:
-        with wave.open(str(path), "rb") as w:
-            nch = w.getnchannels()
-            sw = w.getsampwidth()
-            rate = w.getframerate()
-            nframes = w.getnframes()
-            if nframes <= 0 or rate <= 0 or sw not in (1, 2):
-                return [], 0.0
-            duration = nframes / float(rate)
-            raw = w.readframes(nframes)
-        if sw == 2:
-            count = len(raw) // 2
-            samples = struct.unpack("<" + "h" * count, raw[: count * 2])
-            scale = 32768.0
-        else:
-            samples = [b - 128 for b in raw]
-            scale = 128.0
-        if nch > 1:
-            mono = []
-            for i in range(0, len(samples), nch):
-                chunk = samples[i : i + nch]
-                mono.append(int(sum(chunk) / len(chunk)))
-            samples = mono
-        if not samples:
-            return [], duration
-        if max_bars is not None:
-            bars = max(8, int(max_bars))
-        else:
-            hop = hop_seconds if hop_seconds and hop_seconds > 0 else 0.05
-            bars = max(8, int(duration / hop) + 1)
-            bars = min(bars, 6000)
-        chunk = max(1, len(samples) // bars)
-        peaks: list[float] = []
-        for i in range(bars):
-            seg = samples[i * chunk : (i + 1) * chunk]
-            if not seg:
-                peaks.append(0.0)
-                continue
-            peak = max(abs(s) for s in seg) / scale
-            peaks.append(float(peak))
-        mx = max(peaks) if peaks else 0.0
-        if mx > 1e-9:
-            peaks = [min(1.0, p / mx) for p in peaks]
-        else:
-            peaks = [0.05 for _ in peaks]
-        return peaks, duration
-    except Exception:
-        return [], 0.0
 
 def decode_audio_to_wav(src: str | Path, dst: Path) -> Path | None:
     from src.media.ffmpeg_util import find_ffmpeg, FFmpegError

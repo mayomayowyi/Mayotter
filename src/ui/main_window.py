@@ -69,8 +69,6 @@ from src.ui.icons import (
 )
 from src.core.models import GROK_HOME_URL, Column
 from src.ui.edge_dock import EdgeDetector, EdgeAnimator, PanelState
-from src.ui import resize_debug as _rzdbg
-from src.ui import dock_debug as _dockdbg
 
 _WM_NCHITTEST = 0x0084
 _WM_NCLBUTTONDBLCLK = 0x00A3
@@ -412,16 +410,6 @@ class _TabChip(QWidget):
 
     def showEvent(self, event) -> None:
         if self.parent() is None or self.isWindow():
-            try:
-                print(
-                    f"[TransientWindow] BLOCK TabChip top-level show "
-                    f"parent={self.parent()} isWindow={self.isWindow()} "
-                    f"geo={self.geometry().x()},{self.geometry().y()} "
-                    f"{self.width()}x{self.height()}",
-                    flush=True,
-                )
-            except Exception:
-                pass
             try:
                 self.hide()
                 self.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
@@ -861,13 +849,6 @@ class _TabStrip(QWidget):
             self._layout.addWidget(chip)
         self._layout.addStretch(1)
 
-    def _set_current_chip(self, index: int) -> None:
-        for i, chip in enumerate(self._chips):
-            chip.set_active(i == index)
-
-    def get_chip_count(self) -> int:
-        return len(self._chips)
-
 class _MSG(ctypes.Structure):
     _fields_ = [
         ("hwnd", ctypes.c_void_p),
@@ -914,11 +895,6 @@ class _RootHitTestFilter(QAbstractNativeEventFilter):
     def _local_from_physical(self, gx: int, gy: int) -> QPoint:
         return self._window._local_from_physical(gx, gy)
 
-    def _hit_code_for_pos(self, x: int, y: int) -> int:
-        if self._window.isMaximized() or self._window.isFullScreen():
-            return 0
-        return self._window._resize_hit_code(x, y)
-
     def nativeEventFilter(self, event_type: bytes, message) -> tuple[bool, int]:
         if self._in_filter or not self._alive:
             return False, 0
@@ -955,13 +931,11 @@ class _RootHitTestFilter(QAbstractNativeEventFilter):
             w = self._window
             if w is not None:
                 w._os_sizing = True
-                _rzdbg.log("os_sizing", state="enter")
             return False, 0
         if msg.message == _WM_EXITSIZEMOVE:
             w = self._window
             if w is not None and getattr(w, "_os_sizing", False):
                 w._os_sizing = False
-                _rzdbg.log("os_sizing", state="exit")
                 try:
                     if getattr(w, "_edge_dock_enabled", False):
                         w._sync_dock_after_os_resize()
@@ -1007,15 +981,6 @@ class _RootHitTestFilter(QAbstractNativeEventFilter):
 
         resize_code = self._window._resize_hit_code(local.x(), local.y())
         if resize_code != 0:
-            _rzdbg.log(
-                "WM_NCHITTEST",
-                hwnd=hwnd,
-                is_main=is_main_hwnd,
-                global_phys=(gx, gy),
-                local=(local.x(), local.y()),
-                window_size=(self._window.width(), self._window.height()),
-                ht_code=resize_code,
-            )
             if not is_main_hwnd:
                 return True, _HTTRANSPARENT
             w = self._window
@@ -1027,16 +992,6 @@ class _RootHitTestFilter(QAbstractNativeEventFilter):
 
         m = _RESIZE_MARGIN
         w, h = self._window.width(), self._window.height()
-        if local.x() < m or local.x() >= w - m or local.y() < m or local.y() >= h - m:
-            _rzdbg.log(
-                "WM_NCHITTEST_near_edge_miss",
-                hwnd=hwnd,
-                is_main=is_main_hwnd,
-                global_phys=(gx, gy),
-                local=(local.x(), local.y()),
-                window_size=(w, h),
-                ht_code=0,
-            )
         return False, 0
 
 class _DockNotifySphereWidget(QWidget):
@@ -1324,6 +1279,7 @@ class MainWindow(QMainWindow):
 
         self._edge_dock_reveal_progress = 0.0
         self._edge_dock_animating = False
+        self._dock_geom_reenter = False
         self._dock_slide_proxy: QLabel | None = None
         self._dock_slide_use_proxy = False
         self._dock_collapse_chrome = False
@@ -1359,6 +1315,8 @@ class MainWindow(QMainWindow):
         self._bound_mode_key: str = "normal"
         self._pending_stow_ids: list = []
         self._stow_restore_rail = None
+        self._stow_restore_rail_left = None
+        self._StowRestoreKnobClass = None
         self._boundary_hand_cursor = False
 
         self._edge_detector: EdgeDetector | None = None
@@ -1455,12 +1413,6 @@ class MainWindow(QMainWindow):
                                 return
                         else:
                             ok = wh.startSystemResize(edges)
-                            _rzdbg.log(
-                                "startSystemResize",
-                                source="top_bar",
-                                edges=str(edges),
-                                ok=bool(ok),
-                            )
                             return
                 if self._edge_dock_enabled:
                     try:
@@ -2224,9 +2176,6 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         self.addAction(exit_action)
 
-    def _is_edge_dock_active(self) -> bool:
-        return self._edge_dock_enabled
-
     def _get_screen_geometry(self) -> QRect:
         screens = QGuiApplication.screens()
         if self._edge_dock_enabled:
@@ -2441,22 +2390,39 @@ class MainWindow(QMainWindow):
         self._edge_dock_direction = saved_direction
         self._edge_dock_edge_offset = saved_offset
         self._edge_dock_monitor_index = saved_monitor
-        self._edge_dock_revealed = False
-        self._edge_dock_reveal_progress = 0.0
         self._edge_dock_animating = False
+        self._edge_dock_revealed = True
+        self._edge_dock_reveal_progress = 1.0
+        try:
+            self._update_stow_restore_rail()
+        except Exception:
+            pass
 
         full = self._expanded_geometry()
+        self.setMinimumSize(1, 1)
+        self.setMaximumSize(16777215, 16777215)
         self.setGeometry(full)
         self._dock_shape_mask_key = None
         self._apply_dock_shape_mask(full.width(), full.height())
+        self._apply_reveal_mask(1.0)
 
         self._setup_edge_detector()
         if self._edge_detector:
             self._edge_detector.set_pinned_open(True)
-        self._expand_edge_dock()
-        QTimer.singleShot(1500, self._end_edge_dock_reveal_grace)
-        if self._edge_detector:
+            self._edge_detector.set_state(PanelState.EXPANDED)
             self._edge_detector.start()
+
+        self._set_interactive(True)
+        self._set_window_opaque(True)
+        self._update_edge_dock_column_visibility()
+        try:
+            self._set_dock_webengines_visible(True)
+        except Exception:
+            pass
+        self._apply_dock_content_insets()
+        self._apply_edge_dock_always_on_top()
+        self._apply_edge_dock_zoom()
+        QTimer.singleShot(1500, self._end_edge_dock_reveal_grace)
         try:
             self._ensure_edge_dock_fs_timer()
         except Exception:
@@ -2487,6 +2453,10 @@ class MainWindow(QMainWindow):
         self._edge_dock_revealed = False
         self._edge_dock_reveal_progress = 0.0
         self._edge_dock_animating = False
+        try:
+            self._update_stow_restore_rail()
+        except Exception:
+            pass
 
         if self._edge_dock_direction not in ("left", "right", "top", "bottom"):
             self._edge_dock_direction = self._detect_edge_dock_direction()
@@ -2578,6 +2548,8 @@ class MainWindow(QMainWindow):
 
         self._edge_dock_enabled = False
         self._edge_dock_revealed = False
+        self._edge_dock_animating = False
+        self._dock_window_lerp = False
 
         if self._edge_detector:
             self._edge_detector.stop()
@@ -2592,47 +2564,63 @@ class MainWindow(QMainWindow):
         if self._edge_animator:
             self._edge_animator.stop()
 
-        self.setMask(QRegion())
+        try:
+            self.setUpdatesEnabled(False)
+            self._set_dock_content_updates(False)
+        except Exception:
+            pass
+        try:
+            if self._edge_dock_clip and self._edge_dock_root:
+                cg = QRect(0, 0, max(1, self._edge_dock_clip.width()), max(1, self._edge_dock_clip.height()))
+                self._edge_dock_root.setGeometry(cg)
+            self._set_window_opaque(True)
+            self._set_interactive(True)
 
-        if self._edge_dock_clip and self._edge_dock_root:
-            cg = QRect(0, 0, max(1, self._edge_dock_clip.width()), max(1, self._edge_dock_clip.height()))
-            self._edge_dock_root.setGeometry(cg)
-        self._set_window_opaque(True)
-        self._set_interactive(True)
-
-        g = self._edge_dock_normal_geometry
-        self._edge_dock_normal_geometry = None
-        if g is None and self._settings_manager and hasattr(self._settings_manager, "get_window_geometry_normal"):
-            try:
-                raw = self._settings_manager.get_window_geometry_normal()
-                if raw:
-
-                    self.restoreGeometry(raw)
-                    g = None
-            except Exception:
-                g = None
-        if g is not None:
-
-            try:
-                self.setGeometry(g.x(), g.y(), g.width(), g.height())
-            except Exception:
-                pass
-        self._apply_mode_column_visibility()
-        self._update_window_mask()
-
-        handle = self.windowHandle()
-        if handle is not None and bool(handle.flags() & Qt.WindowType.WindowStaysOnTopHint):
-            handle.setFlag(Qt.WindowType.WindowStaysOnTopHint, False)
-            if sys.platform == "win32":
+            g = self._edge_dock_normal_geometry
+            self._edge_dock_normal_geometry = None
+            if g is None and self._settings_manager and hasattr(self._settings_manager, "get_window_geometry_normal"):
                 try:
-                    import ctypes
-                    hwnd = int(self.winId())
-                    if hwnd:
-                        ctypes.windll.user32.SetWindowPos(
-                            hwnd, -2, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010,
-                        )
+                    raw = self._settings_manager.get_window_geometry_normal()
+                    if raw:
+
+                        self.restoreGeometry(raw)
+                        g = None
+                except Exception:
+                    g = None
+            if g is not None:
+
+                try:
+                    self.setGeometry(g.x(), g.y(), g.width(), g.height())
                 except Exception:
                     pass
+            self._apply_mode_column_visibility()
+            try:
+                self._set_dock_webengines_visible(True)
+            except Exception:
+                pass
+            self._window_mask_key = None
+            self._window_mask_pending = False
+            self._update_window_mask()
+
+            handle = self.windowHandle()
+            if handle is not None and bool(handle.flags() & Qt.WindowType.WindowStaysOnTopHint):
+                handle.setFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+                if sys.platform == "win32":
+                    try:
+                        import ctypes
+                        hwnd = int(self.winId())
+                        if hwnd:
+                            ctypes.windll.user32.SetWindowPos(
+                                hwnd, -2, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010,
+                            )
+                    except Exception:
+                        pass
+        finally:
+            try:
+                self._set_dock_content_updates(True)
+                self.setUpdatesEnabled(True)
+            except Exception:
+                pass
 
         self._update_edge_dock_ui()
         try:
@@ -2645,6 +2633,10 @@ class MainWindow(QMainWindow):
             if bubble is not None:
                 bubble.hide()
             self._dock_notify_busy = False
+        except Exception:
+            pass
+        try:
+            self._update_stow_restore_rail()
         except Exception:
             pass
 
@@ -2747,15 +2739,6 @@ class MainWindow(QMainWindow):
                 size = self._panel_size_for_edge(direction)
                 full = self._expanded_geometry_for_edge(direction, size)
                 profile = "TB" if direction in ("top", "bottom") else "LR"
-                _dockdbg.log(
-                    "direction_change",
-                    edge=direction,
-                    profile=profile,
-                    size=(size.width(), size.height()),
-                    expanded=(full.x(), full.y(), full.width(), full.height()),
-                    lr=(self._edge_dock_width_lr, self._edge_dock_height_lr),
-                    tb=(self._edge_dock_width_tb, self._edge_dock_height_tb),
-                )
                 self.setGeometry(full)
                 self._edge_dock_anim_cw = max(1, full.width())
                 self._edge_dock_anim_ch = max(1, full.height())
@@ -2780,6 +2763,11 @@ class MainWindow(QMainWindow):
         self._edge_dock_column_count = self._column_count_for_edge(direction)
         if self._edge_dock_revealed:
             self._update_edge_dock_column_visibility()
+            try:
+                self._set_dock_content_updates(True)
+                self._set_dock_webengines_visible(True)
+            except Exception:
+                pass
             self._dock_shape_mask_wh = None
             self._apply_dock_shape_mask()
         self._edge_dock_profile_lock = False
@@ -2857,7 +2845,13 @@ class MainWindow(QMainWindow):
                     or cg.width() != g.width()
                     or cg.height() != g.height()
                 ):
-                    self.setGeometry(g)
+                    if getattr(self, "_dock_geom_reenter", False):
+                        return
+                    self._dock_geom_reenter = True
+                    try:
+                        self.setGeometry(g)
+                    finally:
+                        self._dock_geom_reenter = False
                     if abs(cg.width() - g.width()) >= 3 or abs(cg.height() - g.height()) >= 3:
                         self._apply_dock_shape_mask(g.width(), g.height())
                     try:
@@ -2869,14 +2863,6 @@ class MainWindow(QMainWindow):
                             self._dock_anim_t0 = _time.monotonic()
                         elif n % 8 == 0:
                             elapsed = _time.monotonic() - t0
-                            if elapsed > 0:
-                                _dockdbg.log(
-                                    "anim_fps",
-                                    frames=n,
-                                    elapsed_ms=int(elapsed * 1000),
-                                    fps=round(n / elapsed, 1),
-                                    t=round(float(t), 3),
-                                )
                     except Exception:
                         pass
                 fw, fh = max(1, g.width()), max(1, g.height())
@@ -2888,6 +2874,11 @@ class MainWindow(QMainWindow):
                     root.setGeometry(0, 0, fw, fh)
             if getattr(self, "_dock_expand_we_pending", False) and t >= 0.40:
                 self._dock_expand_we_pending = False
+                try:
+                    if max(1, self.width()) > self.EDGE_DOCK_INDICATOR_WIDTH * 4:
+                        self._fit_columns()
+                except Exception:
+                    pass
                 self._set_dock_content_updates(True)
                 self._set_dock_webengines_visible(True)
                 self._apply_edge_dock_zoom()
@@ -2899,8 +2890,6 @@ class MainWindow(QMainWindow):
             clip.setGeometry(0, 0, fw, fh)
         if root.size() != QSize(fw, fh) or root.pos() != QPoint(0, 0):
             root.setGeometry(0, 0, fw, fh)
-        self._apply_edge_dock_window_mask(t, edge, ind, fw, fh)
-
     def _clear_collapse_slide_proxy(self) -> None:
         self._dock_slide_use_proxy = False
         self._dock_collapse_chrome = False
@@ -2915,13 +2904,6 @@ class MainWindow(QMainWindow):
         self._dock_slide_proxy = None
         if proxy is not None:
             _dispose_widget_no_toplevel(proxy)
-
-    def _start_collapse_slide_proxy(self) -> bool:
-        self._clear_collapse_slide_proxy()
-        return False
-
-    def _apply_edge_dock_window_mask(self, t: float, edge: str, ind: int, fw: int, fh: int) -> None:
-        return
 
     def _expand_edge_dock(self) -> None:
         if self._edge_dock_revealed or self._edge_dock_animating:
@@ -2975,15 +2957,16 @@ class MainWindow(QMainWindow):
             self.show()
         self._edge_dock_column_count = self._column_count_for_edge()
         count = min(self._edge_dock_column_count, max(1, len(self._columns)))
+        stowed_set = self._stowed_column_set()
         for i, col in enumerate(self._columns):
-            if i < count:
+            if i < count and col not in stowed_set:
                 col.show()
             else:
                 col.hide()
         root = getattr(self, "_edge_dock_root", None)
         if root is not None and not root.isVisible():
             root.show()
-        self._set_dock_webengines_visible(False)
+        # WebEngine は hide せず updates だけ止める（setVisible(False) は再表示時の黒画面が長い）
         self._set_dock_content_updates(False)
 
         if self.geometry() != strip:
@@ -3073,7 +3056,6 @@ class MainWindow(QMainWindow):
         self._dock_anim_t0 = 0.0
 
         self._set_window_opaque(True)
-        self._set_dock_webengines_visible(False)
         self._set_dock_content_updates(False)
 
         root = getattr(self, "_edge_dock_root", None)
@@ -3093,8 +3075,6 @@ class MainWindow(QMainWindow):
         self._dock_window_lerp = False
         self._dock_expand_we_pending = False
         self._clear_collapse_slide_proxy()
-        self._set_dock_content_updates(True)
-        self._set_dock_webengines_visible(True)
         self._edge_dock_animating = False
         self._edge_dock_anim_cw = self._edge_dock_anim_ch = 0
         self._edge_dock_revealed = True
@@ -3104,14 +3084,84 @@ class MainWindow(QMainWindow):
         full = self._expanded_geometry_for_edge(self._edge_dock_direction)
         if self.geometry() != full:
             self.setGeometry(full)
+        fw = max(1, self.width())
+        fh = max(1, self.height())
+        clip = getattr(self, "_edge_dock_clip", None)
+        root = getattr(self, "_edge_dock_root", None)
+        if clip is not None:
+            cg = QRect(0, 0, fw, fh)
+            if clip.geometry() != cg:
+                clip.setGeometry(cg)
+        if root is not None:
+            if root.size() != QSize(fw, fh) or root.pos() != QPoint(0, 0):
+                root.setGeometry(0, 0, fw, fh)
+            root.updateGeometry()
+            lay = root.layout()
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
         self._apply_reveal_mask(1.0)
         self._snap_to_dock_edge()
         self._store_live_size(self.width(), self.height(), self._edge_dock_direction)
         self._set_window_opaque(True)
         self._set_interactive(True)
+        # revealed=True 後に mode 切替 (normal→lr/tb) + stow 反映 + column show/hide
         self._update_edge_dock_column_visibility()
-        self._apply_dock_shape_mask()
+        # insets は fit より先。後から margin が変わると viewport 幅と column 幅がずれる
         self._apply_dock_content_insets()
+        if root is not None:
+            lay = root.layout()
+            if lay is not None:
+                lay.activate()
+        # WebEngine は geometry 確定後に再表示する（先に visible にすると黒画面が伸びる）
+        if fw > self.EDGE_DOCK_INDICATOR_WIDTH * 4:
+            self._fit_columns()
+        try:
+            for col in self._columns:
+                if not col.isVisible():
+                    continue
+                for wv in getattr(col, "webviews", lambda: [])():
+                    if wv is None:
+                        continue
+                    parent = wv.parentWidget()
+                    if parent is None or not parent.size().isValid():
+                        continue
+                    r = parent.rect()
+                    if r.width() <= 0 or r.height() <= 0:
+                        continue
+                    if wv.geometry() != r:
+                        wv.setGeometry(r)
+        except Exception:
+            pass
+        # bind 後の _columns (lr/tb) に対して updates / WebEngine 表示を適用する
+        try:
+            self._set_dock_content_updates(True)
+        except Exception:
+            pass
+        try:
+            self._set_dock_webengines_visible(True)
+        except Exception:
+            pass
+        try:
+            for col in self._columns:
+                if not col.isVisible():
+                    continue
+                for wv in getattr(col, "webviews", lambda: [])():
+                    if wv is None:
+                        continue
+                    try:
+                        if not wv.updatesEnabled():
+                            wv.setUpdatesEnabled(True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # fit / WebEngine geometry 確定後に境界を再同期（切替直後の 0 高さ handle を防ぐ）
+        try:
+            self._update_boundary_visibility()
+        except Exception:
+            pass
+        self._apply_dock_shape_mask()
         self._apply_edge_dock_always_on_top()
         self._apply_edge_dock_zoom()
         try:
@@ -3122,13 +3172,6 @@ class MainWindow(QMainWindow):
             self._restore_dock_popups()
         except Exception:
             pass
-        _dockdbg.log(
-            "expand_finished",
-            direction=self._edge_dock_direction,
-            geom=(self.x(), self.y(), self.width(), self.height()),
-            lr=(self._edge_dock_width_lr, self._edge_dock_height_lr),
-            tb=(self._edge_dock_width_tb, self._edge_dock_height_tb),
-        )
 
     def _is_foreign_fullscreen_active(self) -> bool:
         try:
@@ -3215,14 +3258,33 @@ class MainWindow(QMainWindow):
                 self._collapse_edge_dock()
         except Exception:
             pass
+        # 最前面だけ外す。MainWindow 全体の hide はせず、通常の収納 strip として残す
         try:
-            flags = self.windowFlags()
-            if flags & Qt.WindowType.WindowStaysOnTopHint:
-                self.setWindowFlags(flags & ~Qt.WindowType.WindowStaysOnTopHint)
-        except Exception:
-            pass
-        try:
-            self.hide()
+            handle = self.windowHandle()
+            if handle is not None:
+                if bool(handle.flags() & Qt.WindowType.WindowStaysOnTopHint):
+                    handle.setFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+                    if sys.platform == "win32":
+                        try:
+                            import ctypes
+                            hwnd = int(self.winId())
+                            if hwnd:
+                                HWND_NOTOPMOST = -2
+                                SWP_NOMOVE = 0x0002
+                                SWP_NOSIZE = 0x0001
+                                SWP_NOACTIVATE = 0x0010
+                                ctypes.windll.user32.SetWindowPos(
+                                    hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                                )
+                        except Exception:
+                            pass
+            else:
+                flags = self.windowFlags()
+                if flags & Qt.WindowType.WindowStaysOnTopHint:
+                    self.setWindowFlags(flags & ~Qt.WindowType.WindowStaysOnTopHint)
+                    if self.isVisible():
+                        self.show()
         except Exception:
             pass
         try:
@@ -3239,8 +3301,6 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            if not self.isVisible():
-                self.show()
             if not self._edge_dock_revealed:
                 collapsed = self._collapsed_geometry()
                 if self.geometry() != collapsed:
@@ -3262,10 +3322,16 @@ class MainWindow(QMainWindow):
         self._edge_dock_revealed = False
         self._edge_detector.set_state(PanelState.COLLAPSED)
         self._edge_dock_reveal_progress = 0.0
-        self._set_dock_content_updates(True)
-        self._set_dock_webengines_visible(False)
+        # 収納中も WebEngine は hide しない（再展開時の setVisible コストを避ける）
+        # updates は止めたまま。カラムも非 stow は表示したまま 4px にクリップされる
+        self._set_dock_content_updates(False)
+        try:
+            stowed_set = self._stowed_column_set()
+        except Exception:
+            stowed_set = set()
         for col in self._columns:
-            col.hide()
+            if col in stowed_set:
+                col.hide()
         collapsed = self._collapsed_geometry()
         self.setMinimumSize(1, 1)
         self.setMaximumSize(16777215, 16777215)
@@ -3620,22 +3686,6 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _start_dock_notify_spin(self) -> None:
-        w = getattr(self, "_dock_notify_icon", None)
-        if w is not None:
-            try:
-                w.start_anim()
-            except Exception:
-                pass
-
-    def _stop_dock_notify_spin(self) -> None:
-        w = getattr(self, "_dock_notify_icon", None)
-        if w is not None:
-            try:
-                w.stop_anim()
-            except Exception:
-                pass
-
     def _layout_mode_key(self) -> str:
         if self._edge_dock_enabled and self._edge_dock_revealed:
             if self._edge_dock_direction in ("top", "bottom"):
@@ -3645,10 +3695,6 @@ class MainWindow(QMainWindow):
 
     def _service_packs(self) -> dict:
         return self._grok_packs if self._grok_mode else self._twitter_packs
-
-    def _columns_for_mode(self, mode: str) -> list:
-        packs = self._service_packs()
-        return packs.setdefault(mode, [])
 
     def _active_column_count(self) -> int:
         key = self._layout_mode_key()
@@ -3844,6 +3890,63 @@ class MainWindow(QMainWindow):
         packs = self._service_packs()
         new_list = packs.setdefault(key, [])
 
+        prev_key = getattr(self, "_bound_mode_key", None) or "normal"
+        if not hasattr(self, "_mode_stowed_columns") or self._mode_stowed_columns is None:
+            self._mode_stowed_columns = {"normal": [], "lr": [], "tb": []}
+        if not hasattr(self, "_mode_stow_saved_widths") or self._mode_stow_saved_widths is None:
+            self._mode_stow_saved_widths = {"normal": {}, "lr": {}, "tb": {}}
+        try:
+            cur_stowed = list(getattr(self, "_stowed_columns", None) or [])
+            if cur_stowed:
+                self._mode_stowed_columns[prev_key] = cur_stowed
+                self._mode_stow_saved_widths[prev_key] = dict(getattr(self, "_stow_saved_widths", None) or {})
+            else:
+                kept = [
+                    c for c in (self._mode_stowed_columns.get(prev_key) or [])
+                    if c in (getattr(self, "_columns", None) or [])
+                ]
+                self._mode_stowed_columns[prev_key] = kept
+        except Exception:
+            pass
+
+        mode_stowed = [
+            c for c in (self._mode_stowed_columns.get(key) or [])
+            if c in new_list
+        ]
+        stowed_set = set(mode_stowed)
+
+        # 同一 mode / 同一リストなら layout の takeAt+hide+再追加を避け、WebEngine の再アタッチを防ぐ
+        if (
+            prev_key == key
+            and getattr(self, "_columns", None) is new_list
+            and getattr(self, "_bound_mode_key", None) == key
+        ):
+            self._stowed_columns = mode_stowed
+            self._mode_stowed_columns[key] = list(mode_stowed)
+            self._stow_saved_widths = dict(self._mode_stow_saved_widths.get(key) or {})
+            if not hasattr(self, "_mode_preferred_widths") or self._mode_preferred_widths is None:
+                self._mode_preferred_widths = {"normal": {}, "lr": {}, "tb": {}}
+            self._preferred_widths = dict(self._mode_preferred_widths.get(key) or {})
+            for col in self._columns:
+                if col in stowed_set:
+                    col.hide()
+                elif not col.isVisible():
+                    col.show()
+            if not getattr(self, "_edge_dock_animating", False):
+                self._fit_columns()
+            self._update_boundary_visibility()
+            self._apply_dock_content_insets()
+            self._enforce_all_columns_single_tab()
+            try:
+                self._update_stow_restore_rail()
+            except Exception:
+                pass
+            try:
+                self._materialize_visible_pending_loads()
+            except Exception:
+                pass
+            return
+
         if self._scroll_layout is not None:
             while self._scroll_layout.count():
                 item = self._scroll_layout.takeAt(0)
@@ -3852,34 +3955,18 @@ class MainWindow(QMainWindow):
                     w.hide()
                     w.setParent(self._scroll_content)
 
-        prev_key = getattr(self, "_bound_mode_key", None) or "normal"
-        if not hasattr(self, "_mode_stowed_columns") or self._mode_stowed_columns is None:
-            self._mode_stowed_columns = {"normal": [], "lr": [], "tb": []}
-        if not hasattr(self, "_mode_stow_saved_widths") or self._mode_stow_saved_widths is None:
-            self._mode_stow_saved_widths = {"normal": {}, "lr": {}, "tb": {}}
-        try:
-            self._mode_stowed_columns[prev_key] = list(getattr(self, "_stowed_columns", None) or [])
-            self._mode_stow_saved_widths[prev_key] = dict(getattr(self, "_stow_saved_widths", None) or {})
-        except Exception:
-            pass
-
         self._columns = new_list
         if self._grok_mode:
             self._grok_columns = self._grok_packs["normal"]
         else:
             self._twitter_columns = self._twitter_packs["normal"]
 
-        mode_stowed = [
-            c for c in (self._mode_stowed_columns.get(key) or [])
-            if c in self._columns
-        ]
         self._stowed_columns = mode_stowed
         self._mode_stowed_columns[key] = list(mode_stowed)
         self._stow_saved_widths = dict(self._mode_stow_saved_widths.get(key) or {})
         if not hasattr(self, "_mode_preferred_widths") or self._mode_preferred_widths is None:
             self._mode_preferred_widths = {"normal": {}, "lr": {}, "tb": {}}
         self._preferred_widths = dict(self._mode_preferred_widths.get(key) or {})
-        stowed_set = set(mode_stowed)
 
         for col in self._columns:
             self._scroll_layout.addWidget(col)
@@ -3990,9 +4077,6 @@ class MainWindow(QMainWindow):
             return max(1, int(self._edge_dock_column_count_tb))
         return max(1, int(self._edge_dock_column_count_lr))
 
-    def _sync_dock_column_count_from_visible(self) -> None:
-        self._sync_count_from_active_list()
-
     def _apply_edge_dock_always_on_top(self) -> None:
         if not self._edge_dock_enabled:
             return
@@ -4061,20 +4145,6 @@ class MainWindow(QMainWindow):
         self._apply_mode_column_visibility()
         self._enforce_all_columns_single_tab()
         self._apply_edge_dock_zoom()
-
-    def _cycle_edge_dock_column_count(self) -> None:
-        max_count = max(1, len(self._columns))
-        cur = self._column_count_for_edge()
-        nxt = (cur % max_count) + 1
-        if self._edge_dock_direction in ("top", "bottom"):
-            self._edge_dock_column_count_tb = nxt
-        else:
-            self._edge_dock_column_count_lr = nxt
-        self._edge_dock_column_count = nxt
-        self._save_edge_dock_settings()
-        self._update_edge_dock_ui()
-        if self._edge_dock_revealed:
-            self._update_edge_dock_column_visibility()
 
     def _update_resize_cursor(self, pos: QPoint) -> None:
         if not self._edge_dock_revealed or self._edge_dock_resizing:
@@ -4525,7 +4595,7 @@ class MainWindow(QMainWindow):
         self._set_dock_chrome_expanded(False)
 
     def _init_boundary_action_overlay(self) -> None:
-        from src.ui.icons import make_reset_widths_icon, make_stow_right_icon
+        from src.ui.icons import make_reset_widths_icon, make_stow_left_icon, make_stow_right_icon
         from PySide6.QtGui import QPainter, QColor, QPen
 
         self._boundary_action_col = None
@@ -4535,7 +4605,9 @@ class MainWindow(QMainWindow):
         self._boundary_stow_btn = None
         self._boundary_action_film = None
 
-        self._boundary_icon_stow = make_stow_right_icon("#9fb4d8", 14)
+        self._boundary_icon_stow_left = make_stow_left_icon("#9fb4d8", 14)
+        self._boundary_icon_stow_right = make_stow_right_icon("#9fb4d8", 14)
+        self._boundary_icon_stow = self._boundary_icon_stow_right
         self._boundary_icon_reset = make_reset_widths_icon("#9fb4d8", 14)
 
         class _BoundaryInteractionOverlay(QWidget):
@@ -4546,6 +4618,8 @@ class MainWindow(QMainWindow):
                 self._cx = 0
                 self._top = 0
                 self._bot = 0
+                self._stow_left_rect = None
+                self._stow_right_rect = None
                 self._stow_rect = None
                 self._reset_rect = None
                 self._press_on_action = False
@@ -4611,31 +4685,37 @@ class MainWindow(QMainWindow):
             def _get_action_rects(self, w: int, h: int, t: float, btn: int = 22):
                 from PySide6.QtCore import QRect
                 if t <= 0.02 or w < 4 or h < 20:
-                    return None, None
-                s = min(max(28, btn + 8), max(28, w - 2), max(28, h // 5))
-                lcx = w // 2
+                    return None, None, None
+                s = min(max(26, btn + 6), max(26, (w - 6) // 2), max(26, h // 5))
                 margin = 6
+                gap = 2
                 stow_y = margin
                 reset_y = h - s - margin
                 if reset_y < stow_y + s + 8:
                     reset_y = stow_y + s + 8
                 if reset_y + s > h:
                     reset_y = max(0, h - s)
-                stow_x = max(0, min(w - s, lcx - s // 2))
-                reset_x = max(0, min(w - s, lcx - s // 2))
-                return QRect(stow_x, stow_y, s, s), QRect(reset_x, reset_y, s, s)
+                pair = s * 2 + gap
+                left_x = max(0, (w - pair) // 2)
+                right_x = left_x + s + gap
+                reset_x = max(0, min(w - s, (w - s) // 2))
+                return (
+                    QRect(left_x, stow_y, s, s),
+                    QRect(right_x, stow_y, s, s),
+                    QRect(reset_x, reset_y, s, s),
+                )
 
-            def _get_visual_rects(self, hit_stow, hit_reset, t: float, btn: int = 22):
+            def _get_visual_rects(self, hits, t: float, btn: int = 22):
                 from PySide6.QtCore import QRect
-                if hit_stow is None or hit_reset is None:
-                    return None, None
+                if not hits or any(h is None for h in hits):
+                    return tuple(None for _ in (hits or (None, None, None)))
                 scale = 0.94 + 0.06 * t
                 b = float(getattr(self, "_breathe", 0.0) or 0.0)
                 tri = 1.0 - abs(2.0 * b - 1.0)
                 scale *= 0.985 + 0.015 * tri
                 vs = max(14, int(round(btn * scale)))
                 out = []
-                for hit in (hit_stow, hit_reset):
+                for hit in hits:
                     vs2 = min(vs, hit.width() - 2, hit.height() - 2)
                     if vs2 < 10:
                         out.append(hit)
@@ -4643,13 +4723,17 @@ class MainWindow(QMainWindow):
                     x = hit.x() + (hit.width() - vs2) // 2
                     y = hit.y() + (hit.height() - vs2) // 2
                     out.append(QRect(x, y, vs2, vs2))
-                return out[0], out[1]
+                return tuple(out)
 
             def _refresh_action_rects(self) -> None:
                 t, btn, fixed_w, h = self._layout_metrics()
                 w = max(1, self.width()) if self.width() > 0 else fixed_w
                 hh = max(1, self.height()) if self.height() > 0 else h
-                self._stow_rect, self._reset_rect = self._get_action_rects(w, hh, t, btn)
+                left, right, reset = self._get_action_rects(w, hh, t, btn)
+                self._stow_left_rect = left
+                self._stow_right_rect = right
+                self._stow_rect = right
+                self._reset_rect = reset
                 self._apply_knob_mask()
 
             def _apply_knob_mask(self) -> None:
@@ -4661,6 +4745,8 @@ class MainWindow(QMainWindow):
             def paintEvent(self, event) -> None:
                 t, btn, fixed_w, h = self._layout_metrics()
                 if t <= 0.02:
+                    self._stow_left_rect = None
+                    self._stow_right_rect = None
                     self._stow_rect = None
                     self._reset_rect = None
                     self.clearMask()
@@ -4669,10 +4755,14 @@ class MainWindow(QMainWindow):
                 p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                 w = self.width()
                 hh = self.height()
-                self._stow_rect, self._reset_rect = self._get_action_rects(w, hh, t, btn)
+                left, right, reset = self._get_action_rects(w, hh, t, btn)
+                self._stow_left_rect = left
+                self._stow_right_rect = right
+                self._stow_rect = right
+                self._reset_rect = reset
                 self._apply_knob_mask()
-                v_stow, v_reset = self._get_visual_rects(
-                    self._stow_rect, self._reset_rect, t, btn
+                v_left, v_right, v_reset = self._get_visual_rects(
+                    (self._stow_left_rect, self._stow_right_rect, self._reset_rect), t, btn
                 )
 
                 b = float(getattr(self, "_breathe", 0.0) or 0.0)
@@ -4689,7 +4779,7 @@ class MainWindow(QMainWindow):
                     min(255, int(92 * lift)),
                 )
                 knob_op = t
-                for r in (v_stow, v_reset):
+                for r in (v_left, v_right, v_reset):
                     if r is None:
                         continue
                     p.setOpacity(knob_op)
@@ -4700,7 +4790,8 @@ class MainWindow(QMainWindow):
                     p.setOpacity(1.0)
 
                 for r, icon in (
-                    (v_stow, self._owner._boundary_icon_stow),
+                    (v_left, getattr(self._owner, "_boundary_icon_stow_left", None)),
+                    (v_right, getattr(self._owner, "_boundary_icon_stow_right", None)),
                     (v_reset, self._owner._boundary_icon_reset),
                 ):
                     if r is None or icon is None:
@@ -4724,20 +4815,17 @@ class MainWindow(QMainWindow):
                 self._press_pos = pos
                 self._press_gpos = event.globalPosition()
                 self._handed_off = False
-                on_stow = self._stow_rect is not None and self._stow_rect.contains(pos)
+                on_left = self._stow_left_rect is not None and self._stow_left_rect.contains(pos)
+                on_right = self._stow_right_rect is not None and self._stow_right_rect.contains(pos)
                 on_reset = self._reset_rect is not None and self._reset_rect.contains(pos)
-                self._press_on_action = bool(on_stow or on_reset)
-                hit = "STOW" if on_stow else ("RESET" if on_reset else "none")
-                print(
-                    f"[Boundary] press x={pos.x()} y={pos.y()} "
-                    f"stow={self._stow_rect} reset={self._reset_rect} hit={hit}",
-                    flush=True,
-                )
+                self._press_on_action = bool(on_left or on_right or on_reset)
                 event.accept()
 
             def _update_hover_cursor(self, pos) -> None:
                 self._refresh_action_rects()
-                if self._stow_rect is not None and self._stow_rect.contains(pos):
+                if self._stow_left_rect is not None and self._stow_left_rect.contains(pos):
+                    self.setCursor(Qt.CursorShape.PointingHandCursor)
+                elif self._stow_right_rect is not None and self._stow_right_rect.contains(pos):
                     self.setCursor(Qt.CursorShape.PointingHandCursor)
                 elif self._reset_rect is not None and self._reset_rect.contains(pos):
                     self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4778,17 +4866,12 @@ class MainWindow(QMainWindow):
                     return
                 self._refresh_action_rects()
                 pos = event.position().toPoint()
-                if self._stow_rect is not None and self._stow_rect.contains(pos):
-                    print("[Boundary] action hit: STOW → Stow triggered", flush=True)
+                if self._stow_left_rect is not None and self._stow_left_rect.contains(pos):
+                    self._owner._on_boundary_stow_left_clicked()
+                elif self._stow_right_rect is not None and self._stow_right_rect.contains(pos):
                     self._owner._on_boundary_stow_clicked()
                 elif self._reset_rect is not None and self._reset_rect.contains(pos):
-                    print("[Boundary] action hit: RESET → Reset triggered", flush=True)
                     self._owner._on_boundary_reset_clicked()
-                else:
-                    print(
-                        f"[Boundary] release x={pos.x()} y={pos.y()} hit=none",
-                        flush=True,
-                    )
                 self._press_gpos = None
                 self._press_on_action = False
                 event.accept()
@@ -4809,9 +4892,6 @@ class MainWindow(QMainWindow):
         self._boundary_action_film = ov
 
     def update_boundary_actions(self, cx: int, top: int, bot: int, expand: float, col) -> None:
-        if getattr(self, "_stowed_columns", None):
-            self.hide_boundary_actions()
-            return
         if getattr(self, "_boundary_dragging", False):
             self.hide_boundary_actions()
             return
@@ -4829,7 +4909,7 @@ class MainWindow(QMainWindow):
         if t > 0.02 and not timer.isActive():
             timer.start()
 
-        fixed_w = 52
+        fixed_w = 64
         if fixed_w % 2:
             fixed_w += 1
         h = max(40, int(bot) - int(top))
@@ -4916,24 +4996,20 @@ class MainWindow(QMainWindow):
             if hasattr(ov, "_refresh_action_rects"):
                 ov._refresh_action_rects()
             local = ov.mapFromGlobal(gp)
-            stow = getattr(ov, "_stow_rect", None)
+            stow_left = getattr(ov, "_stow_left_rect", None)
+            stow_right = getattr(ov, "_stow_right_rect", None) or getattr(ov, "_stow_rect", None)
             reset = getattr(ov, "_reset_rect", None)
-            if stow is not None and stow.contains(local):
-                print(
-                    f"[BoundaryFilter] hit=STOW local=({local.x()},{local.y()}) → Stow",
-                    flush=True,
-                )
+            if stow_left is not None and stow_left.contains(local):
+                self._on_boundary_stow_left_clicked()
+                return True
+            if stow_right is not None and stow_right.contains(local):
                 self._on_boundary_stow_clicked()
                 return True
             if reset is not None and reset.contains(local):
-                print(
-                    f"[BoundaryFilter] hit=RESET local=({local.x()},{local.y()}) → Reset",
-                    flush=True,
-                )
                 self._on_boundary_reset_clicked()
                 return True
-        except Exception as e:
-            print(f"[BoundaryFilter] failed: {e}", flush=True)
+        except Exception:
+            return False
         return False
 
     def _update_boundary_action_cursor_from_global(self, event) -> None:
@@ -4945,9 +5021,12 @@ class MainWindow(QMainWindow):
                 if hasattr(ov, "_refresh_action_rects"):
                     ov._refresh_action_rects()
                 local = ov.mapFromGlobal(gp)
-                stow = getattr(ov, "_stow_rect", None)
+                stow_left = getattr(ov, "_stow_left_rect", None)
+                stow_right = getattr(ov, "_stow_right_rect", None) or getattr(ov, "_stow_rect", None)
                 reset = getattr(ov, "_reset_rect", None)
-                if stow is not None and stow.contains(local):
+                if stow_left is not None and stow_left.contains(local):
+                    on_knob = True
+                elif stow_right is not None and stow_right.contains(local):
                     on_knob = True
                 elif reset is not None and reset.contains(local):
                     on_knob = True
@@ -5026,6 +5105,12 @@ class MainWindow(QMainWindow):
     def _on_boundary_reset_clicked(self) -> None:
         self.hide_boundary_actions()
         self._reset_all_column_widths()
+
+    def _on_boundary_stow_left_clicked(self) -> None:
+        col = getattr(self, "_boundary_action_col", None)
+        self.hide_boundary_actions()
+        if col is not None:
+            self._stow_columns_left_of(col)
 
     def _on_boundary_stow_clicked(self) -> None:
         col = getattr(self, "_boundary_action_col", None)
@@ -6805,10 +6890,11 @@ class MainWindow(QMainWindow):
             "QKeySequenceEdit", "QAbstractItemView", "QScrollBar", "QTabBar",
             "QTabWidget", "QSlider", "DownloadIconButton",
             "_ColumnDragHandle",
+            "_BoundaryHandle",
         ):
             return True
         try:
-            if str(w.objectName() or "") == "col_drag_handle":
+            if str(w.objectName() or "") in ("col_drag_handle", "column_resize_handle"):
                 return True
         except Exception:
             pass
@@ -6911,7 +6997,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             suspended.append("column_add")
-            print("[DockPopup] SUSPEND column_add", flush=True)
         dov = getattr(self, "_download_overlay", None)
         if dov is not None and (dov.isVisible() or bool(getattr(dov, "_mayotter_fading_out", False))):
             try:
@@ -6927,7 +7012,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             suspended.append("download")
-            print("[DockPopup] SUSPEND download", flush=True)
         menu = getattr(self, "_current_service_menu", None)
         if menu is not None and menu.isVisible():
             try:
@@ -6939,7 +7023,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             suspended.append("service_menu")
-            print("[DockPopup] SUSPEND service_menu", flush=True)
         self._suspended_dock_popups = suspended
 
     def _restore_dock_popups(self) -> None:
@@ -6983,9 +7066,8 @@ class MainWindow(QMainWindow):
                 QApplication.instance().installEventFilter(ov)
             except Exception:
                 pass
-            print("[DockPopup] RESTORE column_add", flush=True)
         except Exception as e:
-            print(f"[DockPopup] RESTORE column_add failed: {e}", flush=True)
+            pass
 
     def _restore_download_overlay_suspended(self) -> None:
         dov = getattr(self, "_download_overlay", None)
@@ -6997,9 +7079,8 @@ class MainWindow(QMainWindow):
                 dov.open_history()
             else:
                 dov.show()
-            print("[DockPopup] RESTORE download", flush=True)
         except Exception as e:
-            print(f"[DockPopup] RESTORE download failed: {e}", flush=True)
+            pass
 
     def _restore_service_menu_suspended(self) -> None:
         menu = getattr(self, "_current_service_menu", None)
@@ -7016,9 +7097,8 @@ class MainWindow(QMainWindow):
                 QApplication.instance().installEventFilter(menu)
             except Exception:
                 pass
-            print("[DockPopup] RESTORE service_menu", flush=True)
         except Exception as e:
-            print(f"[DockPopup] RESTORE service_menu failed: {e}", flush=True)
+            pass
 
     def eventFilter(self, obj, event):
         try:
@@ -7139,28 +7219,8 @@ class MainWindow(QMainWindow):
                     sb_hit = True
                     estr = ""
                 if estr:
-                    _rzdbg.log(
-                        "DockResize",
-                        phase="press",
-                        edge=estr,
-                        dock=getattr(self, "_edge_dock_direction", None),
-                        global_pos=(gp.x(), gp.y()),
-                        local=(local.x(), local.y()),
-                        window_size=(self.width(), self.height()),
-                        scrollbar_hit=False,
-                    )
                     if self._begin_dock_manual_resize(estr, gp):
                         return True
-                elif sb_hit:
-                    _rzdbg.log(
-                        "DockResize",
-                        phase="press",
-                        edge="",
-                        dock=getattr(self, "_edge_dock_direction", None),
-                        global_pos=(gp.x(), gp.y()),
-                        local=(local.x(), local.y()),
-                        scrollbar_hit=True,
-                    )
         if (
             event.type() == QEvent.Type.MouseButtonPress
             and getattr(event, "button", lambda: None)() == Qt.MouseButton.LeftButton
@@ -7251,7 +7311,6 @@ class MainWindow(QMainWindow):
         if self._edge_detector:
             self._edge_detector.set_pinned_open(True)
         self.grabMouse()
-        _rzdbg.log("dock_manual_resize_begin", edges=edges)
         return True
 
     def mousePressEvent(self, event) -> None:
@@ -7264,16 +7323,6 @@ class MainWindow(QMainWindow):
                 gpos = event.globalPosition().toPoint()
             except Exception:
                 gpos = None
-            _rzdbg.log(
-                "main_mouse_press",
-                local=(pos.x(), pos.y()),
-                global_pos=(gpos.x(), gpos.y()) if gpos else None,
-                child_at=type(child).__name__ if child is not None else None,
-                ht_code=code,
-                edges=str(edges) if edges is not None else None,
-                window_size=(self.width(), self.height()),
-                min_size=(self.minimumWidth(), self.minimumHeight()),
-            )
             if edges is not None:
                 if gpos is not None and self._column_reorder_grip_at_global(gpos):
                     edges = None
@@ -7299,12 +7348,6 @@ class MainWindow(QMainWindow):
                     wh = self.windowHandle()
                     if wh is not None:
                         ok = wh.startSystemResize(edges)
-                        _rzdbg.log(
-                            "startSystemResize",
-                            source="main_mouse",
-                            edges=str(edges),
-                            ok=bool(ok),
-                        )
                         event.accept()
                         return
 
@@ -7418,13 +7461,6 @@ class MainWindow(QMainWindow):
                 visible = [c for c in getattr(self, "_columns", []) if c.isVisible()]
                 if visible:
                     col_w = visible[0].get_width()
-                _rzdbg.log(
-                    "DockResize",
-                    phase="move",
-                    dock=dock,
-                    dock_width=fw,
-                    column_width=col_w,
-                )
             except Exception:
                 pass
             event.accept()
@@ -7934,12 +7970,6 @@ class MainWindow(QMainWindow):
 
         self._add_column(account)
 
-    def _switch_service(self, grok: bool) -> None:
-        if self._grok_mode == grok:
-            return
-        self._grok_mode = grok
-        self._bind_active_columns()
-
     @staticmethod
     def _is_valid_saved_account(acc: dict) -> bool:
         return bool((acc.get("account_id") or "").strip())
@@ -8066,6 +8096,10 @@ class MainWindow(QMainWindow):
                         if not hasattr(self, "_pending_stow_ids") or self._pending_stow_ids is None:
                             self._pending_stow_ids = []
                         self._pending_stow_ids.append(col.get_column_id())
+                        if not hasattr(self, "_mode_stowed_columns") or self._mode_stowed_columns is None:
+                            self._mode_stowed_columns = {"normal": [], "lr": [], "tb": []}
+                        if col not in self._mode_stowed_columns.setdefault("normal", []):
+                            self._mode_stowed_columns["normal"].append(col)
                 except Exception:
                     pass
                 loaded_index += 1
@@ -8174,9 +8208,11 @@ class MainWindow(QMainWindow):
                         if isinstance(tabs_raw, list) and tabs_raw:
                             self._restore_column_tabs(col, tabs_raw, active_tab)
                         if bool(col_conf.get("stowed")):
-                            if not hasattr(self, "_pending_stow_ids") or self._pending_stow_ids is None:
-                                self._pending_stow_ids = []
-                            self._pending_stow_ids.append(col.get_column_id())
+                            # Dock 等の mode 用。通常起動の _pending_stow_ids には混ぜない
+                            if not hasattr(self, "_mode_stowed_columns") or self._mode_stowed_columns is None:
+                                self._mode_stowed_columns = {"normal": [], "lr": [], "tb": []}
+                            if col not in self._mode_stowed_columns.setdefault(mode, []):
+                                self._mode_stowed_columns[mode].append(col)
                     except Exception:
                         pass
                     w = int(col_conf.get("width") or 0)
@@ -8272,17 +8308,14 @@ class MainWindow(QMainWindow):
         if ov is None:
             return
         if getattr(self, "_download_toggling", False):
-            print("[DockPopup] Download toggle skipped (reentrant)", flush=True)
             return
         self._download_toggling = True
         try:
             fading = bool(getattr(ov, "_mayotter_fading_out", False)) and ov.isVisible()
             vis = bool(ov.is_open())
-            print(f"[DockPopup] Download toggle visible={vis} fading={fading}", flush=True)
             if vis or fading:
                 ov.close_overlay()
                 self._download_closed_at = _time.monotonic()
-                print("[DockPopup] Download CLOSE", flush=True)
                 return
             self._download_closed_at = 0.0
             ov.open_history()
@@ -8290,11 +8323,6 @@ class MainWindow(QMainWindow):
                 self._download_icon_btn.clear_completed()
             except Exception:
                 pass
-            print(
-                f"[DockPopup] Download OPEN visible={ov.isVisible()} opacity={ov.windowOpacity():.2f} "
-                f"geo={ov.geometry().getRect()}",
-                flush=True,
-            )
         finally:
             from PySide6.QtCore import QTimer
             QTimer.singleShot(50, lambda: setattr(self, "_download_toggling", False))
@@ -8310,17 +8338,14 @@ class MainWindow(QMainWindow):
         if ov is None:
             return
         if getattr(self, "_column_add_toggling", False):
-            print("[DockPopup] +C toggle skipped (reentrant)", flush=True)
             return
         self._column_add_toggling = True
         try:
             fading = bool(getattr(ov, "_mayotter_fading_out", False)) and ov.isVisible()
             vis = bool(ov.is_open())
-            print(f"[DockPopup] +C toggle visible={vis} fading={fading}", flush=True)
             if vis or fading:
                 ov.close_overlay()
                 self._column_add_closed_at = _time.monotonic()
-                print("[DockPopup] +C CLOSE", flush=True)
                 return
             self._column_add_closed_at = 0.0
             accounts = {
@@ -8328,11 +8353,6 @@ class MainWindow(QMainWindow):
                 for a in self._pickable_accounts(grok=self._grok_mode)
             }
             ov.open_for(accounts)
-            print(
-                f"[DockPopup] +C OPEN visible={ov.isVisible()} opacity={ov.windowOpacity():.2f} "
-                f"geo={ov.geometry().getRect()}",
-                flush=True,
-            )
         finally:
             from PySide6.QtCore import QTimer
             QTimer.singleShot(50, lambda: setattr(self, "_column_add_toggling", False))
@@ -8598,11 +8618,6 @@ class MainWindow(QMainWindow):
         ):
             self._store_live_size(self.width(), self.height())
             self._update_chrome_by_window_width()
-            _dockdbg.log(
-                "resize_live_deferred",
-                direction=self._edge_dock_direction,
-                geom=(self.x(), self.y(), self.width(), self.height()),
-            )
             return
 
         if self._edge_dock_clip and self._edge_dock_root:
@@ -8633,12 +8648,6 @@ class MainWindow(QMainWindow):
             and self.width() > self.EDGE_DOCK_INDICATOR_WIDTH * 4
         ):
             self._store_live_size(self.width(), self.height())
-            _dockdbg.log(
-                "resize_live",
-                direction=self._edge_dock_direction,
-                geom=(self.x(), self.y(), self.width(), self.height()),
-                panel=(self._panel_size().width(), self._panel_size().height()),
-            )
         if getattr(self, "_edge_dock_resizing", False):
             self._update_chrome_by_window_width()
             return
@@ -8680,14 +8689,15 @@ class MainWindow(QMainWindow):
         if self._edge_dock_revealed and fw > self.EDGE_DOCK_INDICATOR_WIDTH * 4:
             self._store_live_size(fw, fh, self._edge_dock_direction)
             self._fit_columns()
-        _dockdbg.log(
-            "os_resize_sync",
-            direction=self._edge_dock_direction,
-            geom=(self.x(), self.y(), fw, fh),
-            revealed=self._edge_dock_revealed,
-        )
 
     def changeEvent(self, event: QEvent) -> None:
+        if event.type() == QEvent.Type.WindowStateChange and getattr(self, "_edge_dock_enabled", False):
+            state = self.windowState()
+            bad = Qt.WindowState.WindowMinimized | Qt.WindowState.WindowMaximized
+            if state & bad:
+                self.setWindowState(state & ~bad)
+                if not self.isVisible():
+                    self.show()
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
             QTimer.singleShot(0, self._update_window_mask)
@@ -10839,73 +10849,6 @@ class MainWindow(QMainWindow):
         self._snapshot_composer_media(page, on_ready=_after_before_snap)
         return
 
-    def _probe_composer_media_then_finish(self, page, paths, attempt, info) -> None:
-        target = getattr(self, "_recording_target", None)
-        wv = (target or {}).get("webview")
-        if wv is None:
-            col = getattr(self, "_active_column", None)
-            try:
-                wv = col.current_webview() if col else None
-            except Exception:
-                wv = None
-
-        def _on_v(ok, result):
-            if ok:
-                self._report_attach_success(page)
-                return
-            if wv is not None:
-                self._media_log("ATTACH", "media not detected → synthetic chooser fallback")
-                self._synthetic_chooser_only(wv, page, paths, attempt, info or {})
-            else:
-                self._report_attach_failure(page, "media_not_detected")
-
-        self._verify_x_composer_media(page, on_result=_on_v)
-
-    def _synthetic_chooser_only(
-        self, wv, page, paths, attempt, info, before_snapshot=None
-    ) -> None:
-        from src.browser.webview import MayotterPage
-        page.pending_attach_files = list(paths)
-        page._attach_choose_served = False
-        page._attach_auto_mode = True
-        MayotterPage.pending_attach_files = list(paths)
-        MayotterPage._attach_auto_mode_global = True
-        btn = (info or {}).get("media_button_rect") or {}
-        if btn.get("x") is not None:
-            try:
-                self._synthesize_webview_click(wv, float(btn["x"]), float(btn["y"]))
-                self._media_log("ATTACH", "synthetic_click_result=ok target=media_button_fallback")
-            except Exception as exc:
-                self._media_log("ATTACH", f"synthetic_click_fail={exc!r}")
-
-        def _check():
-            served = bool(getattr(page, "_attach_choose_served", False))
-            self._media_log("ATTACH", f"chooseFiles_check served={served}")
-            if served:
-                def _on_v(ok, ev):
-                    if ok:
-                        self._report_attach_success(page)
-                    else:
-                        self._report_attach_failure(page, "media_not_detected_after_chooser")
-                self._verify_x_composer_media(
-                    page, on_result=_on_v, before_snapshot=before_snapshot or {}
-                )
-            else:
-                self._recording_target = None
-                self._set_attach_auto_mode(page, False)
-                try:
-                    page.pending_attach_files = None
-                    MayotterPage.pending_attach_files = None
-                except Exception:
-                    pass
-                self._media_log(
-                    "ATTACH",
-                    "failed stage=E_chooser reason=chooseFiles_not_called_no_user_activation (QtWebEngine: file chooser requires page user activation; record button is outside the page)",
-                )
-                self._on_media_status("音声の自動添付に失敗しました")
-
-        QTimer.singleShot(600, _check)
-
     def _synthesize_webview_click(self, webview, css_x: float, css_y: float) -> None:
         from PySide6.QtCore import QPoint, QPointF, QEvent
         from PySide6.QtGui import QMouseEvent
@@ -12167,9 +12110,6 @@ class MainWindow(QMainWindow):
         self._reorder_dragging = None
         self._reorder_last_x = None
 
-    def _commit_column_reorder(self, column: AccountColumn) -> None:
-        self._commit_column_reorder_at(column, None)
-
     def _commit_column_reorder_at(self, column: AccountColumn, global_x) -> None:
         if column not in self._columns:
             return
@@ -12224,42 +12164,6 @@ class MainWindow(QMainWindow):
                 print(f"[REORDER] commit done order={ids}", flush=True)
         except Exception:
             pass
-        try:
-            import os
-            if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                ids = [getattr(c, "get_column_id", lambda: "?")() for c in self._columns]
-                print(f"[REORDER] commit done order={ids}", flush=True)
-        except Exception:
-            pass
-
-    def _apply_reorder(self, column: AccountColumn, new_index: int) -> None:
-
-        if column not in self._columns:
-            return
-        n = len(self._columns)
-        new_index = max(0, min(int(new_index), n - 1))
-        self._reorder_columns_visual(column, new_index)
-
-        key = self._layout_mode_key()
-        packs = self._service_packs()
-        packs[key] = list(self._columns)
-
-        self._update_boundary_visibility()
-        self._save_accounts()
-        self._save_columns()
-
-        self._reorder_original = None
-        self._reorder_preview_index = None
-        self._reorder_dragging = None
-        try:
-            column.setGraphicsEffect(None)
-            if hasattr(column, "_reorder_opacity_effect"):
-                column._reorder_opacity_effect = None
-        except Exception:
-            pass
-        ind = getattr(self, "_column_insert_indicator", None)
-        if ind is not None:
-            ind.hide()
 
     def _redistribute_equal_widths(self) -> None:
         if getattr(self, "_restoring_session", False):
@@ -12360,17 +12264,9 @@ class MainWindow(QMainWindow):
     def _reset_all_column_widths(self) -> None:
         self._redistribute_equal_widths()
 
-    def _stow_columns_right_of(self, boundary_col) -> None:
-        if boundary_col is None:
-            return
-        visible = [c for c in self._columns if c.isVisible()]
-        if boundary_col not in visible:
-            return
-        idx = visible.index(boundary_col)
-        to_stow = visible[idx + 1 :]
-        if not to_stow:
-            return
-        snap: dict = {}
+    def _stow_columns_list(self, to_stow, visible, keep_visible=None) -> None:
+        keep_visible = list(keep_visible or [])
+        snap: dict = dict(getattr(self, "_stow_saved_widths", None) or {})
         pref = dict(getattr(self, "_preferred_widths", None) or {})
         for col in visible:
             try:
@@ -12380,6 +12276,8 @@ class MainWindow(QMainWindow):
                 cid = ""
                 live = int(col.width()) if col.width() > 0 else 0
             if not cid:
+                continue
+            if cid in snap and int(snap.get(cid) or 0) > 0:
                 continue
             w = int(pref.get(cid) or 0)
             if w <= 0:
@@ -12417,9 +12315,8 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         if self._active_column in to_stow:
-            left = visible[: idx + 1]
-            if left:
-                self._set_active_column(left[-1])
+            if keep_visible:
+                self._set_active_column(keep_visible[-1])
             else:
                 self._active_column = None
                 self._clear_strip()
@@ -12429,18 +12326,60 @@ class MainWindow(QMainWindow):
         self._update_stow_restore_rail()
         self._persist_stowed_state()
 
+
+    def _stow_columns_left_of(self, boundary_col) -> None:
+        if boundary_col is None:
+            return
+        visible = [c for c in self._columns if c.isVisible()]
+        if boundary_col not in visible:
+            return
+        idx = visible.index(boundary_col)
+        to_stow = visible[: idx + 1]
+        if not to_stow:
+            return
+        self._stow_columns_list(to_stow, visible, keep_visible=visible[idx + 1 :])
+
+    def _stow_columns_right_of(self, boundary_col) -> None:
+        if boundary_col is None:
+            return
+        visible = [c for c in self._columns if c.isVisible()]
+        if boundary_col not in visible:
+            return
+        idx = visible.index(boundary_col)
+        to_stow = visible[idx + 1 :]
+        if not to_stow:
+            return
+        self._stow_columns_list(to_stow, visible, keep_visible=visible[: idx + 1])
+
     def _persist_stowed_state(self) -> None:
         if not self._settings_manager:
             return
         if getattr(self, "_restoring_session", False):
             return
         ids = []
-        for col in getattr(self, "_stowed_columns", None) or []:
+        seen = set()
+        for col in list(getattr(self, "_stowed_columns", None) or []):
             try:
-                ids.append(col.get_column_id())
+                cid = col.get_column_id()
             except Exception:
                 continue
+            if cid and cid not in seen:
+                seen.add(cid)
+                ids.append(cid)
+        for _lst in (getattr(self, "_mode_stowed_columns", None) or {}).values():
+            for col in list(_lst or []):
+                try:
+                    cid = col.get_column_id()
+                except Exception:
+                    continue
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    ids.append(cid)
         widths = dict(getattr(self, "_stow_saved_widths", None) or {})
+        for _w in (getattr(self, "_mode_stow_saved_widths", None) or {}).values():
+            for k, v in dict(_w or {}).items():
+                if k not in widths and v:
+                    widths[k] = v
         if hasattr(self._settings_manager, "save_stowed_state"):
             self._settings_manager.save_stowed_state(ids, widths)
 
@@ -12496,9 +12435,10 @@ class MainWindow(QMainWindow):
                 self._mode_stowed_columns = {"normal": [], "lr": [], "tb": []}
             if not hasattr(self, "_mode_stow_saved_widths") or self._mode_stow_saved_widths is None:
                 self._mode_stow_saved_widths = {"normal": {}, "lr": {}, "tb": {}}
-            self._mode_stowed_columns["normal"] = list(stowed)
-            self._mode_stow_saved_widths["normal"] = dict(self._stow_saved_widths)
-            self._bound_mode_key = "normal"
+            key = self._layout_mode_key()
+            self._mode_stowed_columns[key] = list(stowed)
+            self._mode_stow_saved_widths[key] = dict(self._stow_saved_widths)
+            self._bound_mode_key = key
         except Exception:
             pass
         self._fit_columns()
@@ -12510,43 +12450,47 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _restore_stowed_columns(self) -> None:
-        stowed = getattr(self, "_stowed_columns", None) or []
-        if not stowed:
+    def _restore_stowed_columns(self, side: str | None = None) -> None:
+        all_stowed = list(getattr(self, "_stowed_columns", None) or [])
+        if not all_stowed:
+            return
+        if side in ("left", "right"):
+            target = self._stowed_columns_for_side(side)
+        else:
+            target = list(all_stowed)
+        if not target:
             return
         active = set(self._columns)
         snap = dict(getattr(self, "_stow_saved_widths", None) or {})
-        pref = dict(getattr(self, "_preferred_widths", None) or {})
-        for col in self._columns:
-            if col not in active or not col.isVisible():
-                continue
-            try:
-                cid = col.get_column_id()
-                live = int(col.get_width() or 0)
-            except Exception:
-                continue
-            if cid and live > 0:
-                snap[cid] = live
-                pref[cid] = live
-        self._preferred_widths = pref
-        for col in stowed:
+        target_set = set(target)
+        for col in target:
             if col in active:
                 col.show()
-        self._stowed_columns = []
+        remaining = [c for c in all_stowed if c not in target_set]
+        self._stowed_columns = remaining
         self._apply_stow_saved_widths(snap)
-        self._stow_saved_widths = {}
+        if not remaining:
+            self._stow_saved_widths = {}
         try:
             key = self._layout_mode_key()
             if hasattr(self, "_mode_stowed_columns") and self._mode_stowed_columns is not None:
-                self._mode_stowed_columns[key] = []
+                self._mode_stowed_columns[key] = list(remaining)
             if hasattr(self, "_mode_stow_saved_widths") and self._mode_stow_saved_widths is not None:
-                self._mode_stow_saved_widths[key] = {}
+                if remaining:
+                    self._mode_stow_saved_widths[key] = dict(self._stow_saved_widths or {})
+                else:
+                    self._mode_stow_saved_widths[key] = {}
             if hasattr(self, "_mode_preferred_widths") and self._mode_preferred_widths is not None:
                 self._mode_preferred_widths[key] = dict(self._preferred_widths or {})
         except Exception:
             pass
-        if self._layout_mode_key() == "normal":
+        if not remaining and self._layout_mode_key() == "normal":
             self._clear_persisted_stowed_state()
+        else:
+            try:
+                self._persist_stowed_state()
+            except Exception:
+                pass
         self._update_boundary_visibility()
         self.hide_boundary_actions()
         self._update_stow_restore_rail()
@@ -12601,42 +12545,54 @@ class MainWindow(QMainWindow):
         self._scroll_layout.invalidate()
         self._scroll_layout.activate()
 
-    def _restore_knob_local_rect(self) -> QRect | None:
-        rail = getattr(self, "_stow_restore_rail", None)
-        stowed = getattr(self, "_stowed_columns", None) or []
-        if rail is None or not stowed or not rail.isVisible():
-            return None
-        try:
-            return QRect(rail.geometry())
-        except Exception:
-            return None
-
     def _point_on_restore_knob(self, local_x: int, local_y: int) -> bool:
-        r = self._restore_knob_local_rect()
-        return bool(r is not None and r.contains(local_x, local_y))
+        return self._restore_knob_side_at(local_x, local_y) is not None
+
+    def _restore_knob_side_at(self, local_x: int, local_y: int) -> str | None:
+        mapping = (
+            ("_stow_restore_rail", "right"),
+            ("_stow_restore_rail_left", "left"),
+        )
+        for name, side in mapping:
+            rail = getattr(self, name, None)
+            if rail is None:
+                continue
+            try:
+                if not rail.isVisible():
+                    continue
+                if QRect(rail.geometry()).contains(local_x, local_y):
+                    return side
+            except Exception:
+                continue
+        return None
 
     def _try_dispatch_restore_from_global(self, event) -> bool:
-        rail = getattr(self, "_stow_restore_rail", None)
+        # Dock 有効かつ未展開のときだけグローバル restore を無効化（展開中は通常と同じ経路へ）
+        if getattr(self, "_edge_dock_enabled", False) and not getattr(
+            self, "_edge_dock_revealed", False
+        ):
+            return False
         stowed = getattr(self, "_stowed_columns", None) or []
-        if rail is None or not stowed or not rail.isVisible():
+        if not stowed:
             return False
         try:
             gp = event.globalPosition().toPoint()
         except Exception:
             return False
         local = self.mapFromGlobal(gp)
-        hit = self._point_on_restore_knob(local.x(), local.y())
-        print(
-            f"[RestoreUI] press local=({local.x()},{local.y()}) hit={hit}",
-            flush=True,
-        )
-        if not hit:
+        side = self._restore_knob_side_at(local.x(), local.y())
+        if not side:
             return False
-        print("[RestoreUI] click → Restore", flush=True)
-        self._restore_stowed_columns()
+        self._restore_stowed_columns(side=side)
         return True
 
     def _update_restore_knob_cursor_from_global(self, event) -> None:
+        # Dock 有効かつ未展開のときだけカーソル処理を無効化（展開中は通常と同じ経路へ）
+        if getattr(self, "_edge_dock_enabled", False) and not getattr(
+            self, "_edge_dock_revealed", False
+        ):
+            self._clear_restore_hand_cursor()
+            return
         on = False
         try:
             gp = event.globalPosition().toPoint()
@@ -12666,8 +12622,78 @@ class MainWindow(QMainWindow):
                 pass
             self._restore_hand_cursor = False
 
+
+    def _stow_index_groups(self) -> tuple[list, list, list, list]:
+        cols = list(getattr(self, "_columns", None) or [])
+        stowed = list(getattr(self, "_stowed_columns", None) or [])
+        if not stowed:
+            return cols, [], [], []
+        stowed_set = set(stowed)
+        vis_idxs = []
+        stow_idxs = []
+        for i, c in enumerate(cols):
+            if c in stowed_set:
+                stow_idxs.append(i)
+            else:
+                try:
+                    if c.isVisible():
+                        vis_idxs.append(i)
+                except Exception:
+                    vis_idxs.append(i)
+        return cols, stowed, vis_idxs, stow_idxs
+
+    def _stowed_columns_for_side(self, side: str) -> list:
+        cols, stowed, vis_idxs, stow_idxs = self._stow_index_groups()
+        if not stow_idxs:
+            return []
+        if not vis_idxs:
+            mid = max(1, len(cols)) / 2.0
+            if side == "left":
+                return [cols[i] for i in stow_idxs if i < mid]
+            return [cols[i] for i in stow_idxs if i >= mid]
+        vmin = min(vis_idxs)
+        vmax = max(vis_idxs)
+        if side == "left":
+            return [cols[i] for i in stow_idxs if i < vmin]
+        return [cols[i] for i in stow_idxs if i > vmax]
+
+    def _stow_side_flags(self) -> tuple[bool, bool]:
+        cols, stowed, vis_idxs, stow_idxs = self._stow_index_groups()
+        if not stow_idxs:
+            return False, False
+        if not vis_idxs:
+            # 全収納時は列順の前後で左右を分ける（両方固定表示にしない）
+            mid = max(1, len(cols)) / 2.0
+            has_left = any(i < mid for i in stow_idxs)
+            has_right = any(i >= mid for i in stow_idxs)
+            if not has_left and not has_right:
+                has_right = True
+            return has_left, has_right
+        vmin = min(vis_idxs)
+        vmax = max(vis_idxs)
+        has_left = any(i < vmin for i in stow_idxs)
+        has_right = any(i > vmax for i in stow_idxs)
+        if not has_left and not has_right:
+            has_right = True
+        return has_left, has_right
+
     def _update_stow_restore_rail(self) -> None:
         rail = getattr(self, "_stow_restore_rail", None)
+        # Dock 収納中（未展開）だけ隠す。展開中は通常と同じく左右 Knob を出す
+        if getattr(self, "_edge_dock_enabled", False) and not getattr(
+            self, "_edge_dock_revealed", False
+        ):
+            left_rail = getattr(self, "_stow_restore_rail_left", None)
+            self._clear_restore_hand_cursor()
+            for r in (rail, left_rail):
+                if r is None:
+                    continue
+                try:
+                    r.hide()
+                    r.setGeometry(-2000, -2000, 1, 1)
+                except Exception:
+                    pass
+            return
         stowed = getattr(self, "_stowed_columns", None) or []
         has = bool(stowed)
         if has and rail is None:
@@ -12678,9 +12704,10 @@ class MainWindow(QMainWindow):
                 _ICON = 14
                 _MARGIN = 6
 
-                def __init__(self, owner):
+                def __init__(self, owner, side: str = "right"):
                     super().__init__(owner)
                     self._owner = owner
+                    self._side = "left" if side == "left" else "right"
                     self._hover = False
                     self._shape_t = 0.0
                     self._highlight = 0.0
@@ -12693,8 +12720,12 @@ class MainWindow(QMainWindow):
                     self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
                     self.setMouseTracking(True)
                     try:
-                        from src.ui.icons import make_expand_left_icon
-                        self._icon = make_expand_left_icon("#c5d0e6", self._ICON)
+                        if self._side == "left":
+                            from src.ui.icons import make_stow_right_icon
+                            self._icon = make_stow_right_icon("#c5d0e6", self._ICON)
+                        else:
+                            from src.ui.icons import make_expand_left_icon
+                            self._icon = make_expand_left_icon("#c5d0e6", self._ICON)
                     except Exception:
                         self._icon = None
                     try:
@@ -12711,7 +12742,6 @@ class MainWindow(QMainWindow):
                     self._hl_timer.setInterval(40)
                     self._hl_timer.timeout.connect(self._on_hl_tick)
                     self._hl_timer.start()
-                    print("[RestoreUI] highlight begin", flush=True)
 
                 def _on_shape_t(self, v) -> None:
                     try:
@@ -12721,10 +12751,7 @@ class MainWindow(QMainWindow):
                     self.update()
 
                 def _on_shape_finished(self) -> None:
-                    print(
-                        f"[RestoreUI] hover animation finished shape_t={self._shape_t:.3f}",
-                        flush=True,
-                    )
+                    pass
 
                 def _on_hl_tick(self) -> None:
                     if self._hover or float(self._shape_t) > 0.15:
@@ -12749,14 +12776,11 @@ class MainWindow(QMainWindow):
                         return
                     self._hover = on
                     if on:
-                        print("[RestoreUI] hover enter", flush=True)
                         self._highlight = 0.0
                         self._animate_shape(1.0)
                     else:
-                        print("[RestoreUI] hover leave", flush=True)
                         self._animate_shape(0.0)
                         self._hl_phase = 0.0
-                        print("[RestoreUI] highlight begin", flush=True)
 
                 def enterEvent(self, event) -> None:
                     self.set_app_hover(True)
@@ -12769,8 +12793,8 @@ class MainWindow(QMainWindow):
                 def mousePressEvent(self, event) -> None:
                     if event.button() == Qt.MouseButton.LeftButton:
                         event.accept()
-                        print("[RestoreUI] click → Restore", flush=True)
-                        self._owner._restore_stowed_columns()
+                        side = getattr(self, "_side", "right")
+                        self._owner._restore_stowed_columns(side=side)
                         return
                     super().mousePressEvent(event)
 
@@ -12806,15 +12830,22 @@ class MainWindow(QMainWindow):
                         edge = _QC(er, eg, eb)
                         s = float(self._VISUAL)
                         r = s / 2.0
-                        cx = (self.width() - 1.0) - t * r
+                        if getattr(self, "_side", "right") == "left":
+                            cx = t * r
+                        else:
+                            cx = (self.width() - 1.0) - t * r
                         cy = self.height() / 2.0
                         path = _QPP()
                         if t >= 0.995:
                             path.addEllipse(cx - r, cy - r, 2 * r, 2 * r)
                         else:
                             span = 180.0 + 180.0 * t
-                            path.moveTo(cx, cy - r)
-                            path.arcTo(cx - r, cy - r, 2 * r, 2 * r, 90.0, span)
+                            if getattr(self, "_side", "right") == "left":
+                                path.moveTo(cx, cy - r)
+                                path.arcTo(cx - r, cy - r, 2 * r, 2 * r, 90.0, -span)
+                            else:
+                                path.moveTo(cx, cy - r)
+                                path.arcTo(cx - r, cy - r, 2 * r, 2 * r, 90.0, span)
                             path.closeSubpath()
                         p.setPen(_QPen(edge, 1.2))
                         p.setBrush(face)
@@ -12831,8 +12862,8 @@ class MainWindow(QMainWindow):
                                         pm,
                                     )
                                     p.setOpacity(1.0)
-                    except Exception as e:
-                        print(f"[RestoreUI] paint ERROR: {e}", flush=True)
+                    except Exception:
+                        pass
                     finally:
                         p.end()
 
@@ -12868,8 +12899,41 @@ class MainWindow(QMainWindow):
 
                 def _reposition(self) -> None:
                     host = self._owner
+                    # Dock 未展開時だけ隠す。展開中は通常と同じ配置へ進む
+                    if getattr(host, "_edge_dock_enabled", False) and not getattr(
+                        host, "_edge_dock_revealed", False
+                    ):
+                        try:
+                            self.hide()
+                            self.setGeometry(-2000, -2000, 1, 1)
+                        except Exception:
+                            pass
+                        return
+                    side = getattr(self, "_side", "right")
+                    # 遅延呼び出し時に side 状態が変わっていても古い表示を出さない
+                    try:
+                        has_left, has_right = host._stow_side_flags()
+                    except Exception:
+                        has_left, has_right = False, False
+                    if side == "left" and not has_left:
+                        try:
+                            self.hide()
+                            self.setGeometry(-2000, -2000, 1, 1)
+                        except Exception:
+                            pass
+                        return
+                    if side != "left" and not has_right:
+                        try:
+                            self.hide()
+                            self.setGeometry(-2000, -2000, 1, 1)
+                        except Exception:
+                            pass
+                        return
                     self.setParent(host)
-                    x = max(0, host.width() - self._HIT)
+                    if side == "left":
+                        x = 0
+                    else:
+                        x = max(0, host.width() - self._HIT)
                     y = self._stow_y_like_boundary(host)
                     y = min(y, max(8, host.height() - self._HIT - 8))
                     self.setGeometry(x, y, self._HIT, self._HIT)
@@ -12880,30 +12944,47 @@ class MainWindow(QMainWindow):
                         wid = int(self.winId())
                     except Exception:
                         wid = 0
-                    print(
-                        f"[RestoreUI] reposition geometry=({x},{y},{self._HIT},{self._HIT}) "
-                        f"visible={self.isVisible()} winId={wid}",
-                        flush=True,
-                    )
 
-            rail = _StowRestoreKnob(self)
+            rail = _StowRestoreKnob(self, side="right")
             self._stow_restore_rail = rail
+            self._StowRestoreKnobClass = _StowRestoreKnob
         rail = getattr(self, "_stow_restore_rail", None)
         if rail is None:
             return
-        if not has:
-            self._clear_restore_hand_cursor()
-            print("[RestoreUI] hide (no stowed columns)", flush=True)
-            rail.hide()
+        has_left, has_right = self._stow_side_flags()
+        left_rail = getattr(self, "_stow_restore_rail_left", None)
+        cls = getattr(self, "_StowRestoreKnobClass", None)
+        if has_left and left_rail is None and cls is not None:
+            left_rail = cls(self, side="left")
+            self._stow_restore_rail_left = left_rail
+        left_rail = getattr(self, "_stow_restore_rail_left", None)
+
+        def _hide_rail(r) -> None:
+            if r is None:
+                return
             try:
-                rail.setGeometry(-2000, -2000, 1, 1)
+                r.hide()
+                r.setGeometry(-2000, -2000, 1, 1)
             except Exception:
                 pass
+
+        if not has:
+            self._clear_restore_hand_cursor()
+            _hide_rail(rail)
+            _hide_rail(left_rail)
             return
-        print(f"[RestoreUI] stowed={len(stowed)} → show knob", flush=True)
-        rail._reposition()
-        QTimer.singleShot(0, rail._reposition)
-        QTimer.singleShot(100, rail._reposition)
+        if has_right:
+            rail._reposition()
+            QTimer.singleShot(0, rail._reposition)
+            QTimer.singleShot(100, rail._reposition)
+        else:
+            _hide_rail(rail)
+        if has_left and left_rail is not None:
+            left_rail._reposition()
+            QTimer.singleShot(0, left_rail._reposition)
+            QTimer.singleShot(100, left_rail._reposition)
+        else:
+            _hide_rail(left_rail)
 
     def _fit_columns_after_restore(self, *, _attempt: int = 0) -> None:
         try:
@@ -12934,7 +13015,26 @@ class MainWindow(QMainWindow):
         if not visible:
             return
 
-        viewport_width = self._scroll.viewport().width()
+        viewport_width = 0
+        try:
+            viewport_width = int(self._scroll.viewport().width())
+        except Exception:
+            viewport_width = 0
+        # Dock 展開直後は viewport がまだ古い幅のことがある。scroll / root 幅で補う
+        if getattr(self, "_edge_dock_enabled", False) and getattr(self, "_edge_dock_revealed", False):
+            try:
+                sw = int(self._scroll.width()) if self._scroll is not None else 0
+            except Exception:
+                sw = 0
+            if sw > viewport_width:
+                viewport_width = sw
+            if viewport_width <= 0:
+                root = getattr(self, "_edge_dock_root", None)
+                if root is not None:
+                    try:
+                        viewport_width = max(1, int(root.width()))
+                    except Exception:
+                        pass
         if viewport_width <= 0:
             return
 
@@ -13008,6 +13108,12 @@ class MainWindow(QMainWindow):
             col.set_boundary_enabled(False)
             if hasattr(col, "_boundary_right_col"):
                 col._boundary_right_col = None
+        if len(visible) >= 2:
+            # 可視カラムの geometry が決まってから境界を付ける
+            try:
+                self._scroll_layout.activate()
+            except Exception:
+                pass
         for i in range(max(0, len(visible) - 1)):
             left = visible[i]
             right = visible[i + 1]
@@ -13094,6 +13200,7 @@ class MainWindow(QMainWindow):
         except Exception:
             stowed = set()
         pref = dict(getattr(self, "_preferred_widths", None) or {})
+        snap = dict(getattr(self, "_stow_saved_widths", None) or {})
         widths = {}
         by_account: dict[str, list[int]] = {}
         for col in self._columns:
@@ -13105,12 +13212,14 @@ class MainWindow(QMainWindow):
             if not cid:
                 continue
             if col in stowed:
-                w = int(pref.get(cid) or 0)
+                w = int(snap.get(cid) or pref.get(cid) or 0)
                 if w <= 0:
                     try:
                         w = int(col.get_width() or 0)
                     except Exception:
                         w = 0
+            elif cid in snap and int(snap.get(cid) or 0) > 0:
+                w = int(snap[cid])
             else:
                 try:
                     w = int(col.get_width() or 0)
@@ -13191,7 +13300,7 @@ class MainWindow(QMainWindow):
         self._settings_manager.save_accounts(accounts)
         self._save_columns()
 
-    def _serialize_column_state(self, col, position: int) -> dict:
+    def _serialize_column_state(self, col, position: int, for_mode: str | None = None) -> dict:
         from src.core.models import migrate_column_type
         from uuid import uuid4
         aid = col.get_account_id()
@@ -13237,14 +13346,20 @@ class MainWindow(QMainWindow):
             pass
         stowed = False
         try:
-            stowed_list = getattr(self, "_stowed_columns", None) or []
-            stowed = col in stowed_list
+            # 対象 mode の収納だけを見る（他 mode の収納を現在モードへ混ぜない）
+            key = for_mode or self._layout_mode_key()
+            if key == self._layout_mode_key():
+                stowed = col in (getattr(self, "_stowed_columns", None) or [])
+            else:
+                stowed = col in (
+                    (getattr(self, "_mode_stowed_columns", None) or {}).get(key) or []
+                )
         except Exception:
             stowed = False
         width_out = max(1, int(col.get_width() or 0))
         try:
             snap = getattr(self, "_stow_saved_widths", None) or {}
-            if stowed and cid in snap and int(snap[cid]) > 0:
+            if cid in snap and int(snap[cid]) > 0:
                 width_out = int(snap[cid])
         except Exception:
             pass
@@ -13267,13 +13382,13 @@ class MainWindow(QMainWindow):
         if getattr(self, "_restoring_session", False):
             return
 
-        def _pack_to_list(cols) -> list:
+        def _pack_to_list(cols, mode: str) -> list:
             out = []
             seen = set()
             pos = 0
             for col in list(cols or []):
                 try:
-                    entry = self._serialize_column_state(col, pos)
+                    entry = self._serialize_column_state(col, pos, for_mode=mode)
                 except Exception:
                     continue
                 cid = (entry.get("column_id") or "").strip()
@@ -13304,7 +13419,7 @@ class MainWindow(QMainWindow):
                 cols = list(self._columns)
             if not cols and mode != "normal":
                 continue
-            data = _pack_to_list(cols)
+            data = _pack_to_list(cols, mode)
             try:
                 if hasattr(self._settings_manager, "save_columns_for_mode"):
                     self._settings_manager.save_columns_for_mode(mode, data)
@@ -13317,9 +13432,6 @@ class MainWindow(QMainWindow):
             self._persist_stowed_state()
         except Exception:
             pass
-
-    def _open_url_overlay(self) -> None:
-        self._open_url_overlay_for(self._active_column)
 
     def _open_url_overlay_for(self, column: AccountColumn | None) -> None:
         import time as _time

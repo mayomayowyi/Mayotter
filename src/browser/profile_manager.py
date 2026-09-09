@@ -5,7 +5,6 @@ import shutil
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator as TypingIterator
 from typing import Literal
 
 from src.core.paths import APP_BASE_DIR, PROFILES_DIR

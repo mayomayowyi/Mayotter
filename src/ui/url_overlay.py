@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import time
-from PySide6.QtWidgets import QProxyStyle, QStyle, QStyleOptionComboBox, QToolButton
 from PySide6.QtCore import Qt, QEvent, Signal, QTimer, QRectF, QSize, QPointF
-from PySide6.QtGui import QKeyEvent, QMouseEvent, QPainter, QColor, QPen, QBrush, QFont, QPainterPath, QRegion, QIcon
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QPainter, QColor, QPen, QBrush, QFont, QRegion
 from src.ui.icons import make_close_icon, make_folder_icon, make_trash_icon, make_file_open_icon, make_download_icon
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -83,39 +82,6 @@ def _overlay_outside_press_should_close(overlay, event, trigger_names: set[str])
             break
     return True
 
-def _log_outside_diag(overlay, event, obj, label: str) -> None:
-    try:
-        gp = event.globalPosition().toPoint()
-    except Exception:
-        gp = None
-    try:
-        w = QApplication.widgetAt(gp) if gp is not None else None
-    except Exception:
-        w = None
-    try:
-        on = str(getattr(w, "objectName", lambda: "")() or "") if w is not None else ""
-    except Exception:
-        on = ""
-    try:
-        pgeo = overlay.geometry().getRect()
-    except Exception:
-        pgeo = None
-    popup_contains = False
-    trigger_contains = on in ("add_column_btn", "download_icon_btn", "add_twitter_btn")
-    if gp is not None:
-        try:
-            popup_contains = overlay.rect().contains(overlay.mapFromGlobal(gp))
-        except Exception:
-            pass
-    print(
-        f"[DockPopup] OUTSIDE DIAG label={label} "
-        f"obj={type(obj).__name__ if obj is not None else None} "
-        f"under={type(w).__name__ if w is not None else None} objectName={on!r} "
-        f"global={None if gp is None else (gp.x(), gp.y())} "
-        f"popup_geo={pgeo} popup_contains={popup_contains} trigger_hit={trigger_contains} "
-        f"visible={overlay.isVisible()} fading={bool(getattr(overlay, '_mayotter_fading_out', False))}",
-        flush=True,
-    )
 
 def _promote_overlay_tool(widget: QWidget, parent: QWidget | None) -> None:
     from PySide6.QtCore import QPoint
@@ -165,39 +131,6 @@ def _promote_overlay_tool(widget: QWidget, parent: QWidget | None) -> None:
         except Exception:
             pass
 
-def _log_popup_stack_diag(widget: QWidget, label: str) -> None:
-    try:
-        wh = None
-        try:
-            wh = widget.windowHandle()
-        except Exception:
-            wh = None
-        tp = None
-        try:
-            tp = wh.transientParent() if wh is not None else None
-        except Exception:
-            tp = None
-        exposed = None
-        try:
-            exposed = bool(wh.isExposed()) if wh is not None else None
-        except Exception:
-            exposed = None
-        parent = widget.parentWidget()
-        print(
-            f"[DockPopup] STACK DIAG label={label} "
-            f"name={widget.objectName()!r} class={type(widget).__name__} "
-            f"winId={int(widget.winId()) if widget.testAttribute(Qt.WidgetAttribute.WA_WState_Created) or True else 0} "
-            f"parent={type(parent).__name__ if parent else None} "
-            f"flags={hex(int(widget.windowFlags()))} "
-            f"visible={widget.isVisible()} isActive={widget.isActiveWindow()} "
-            f"isExposed={exposed} "
-            f"transient={tp is not None} "
-            f"staysOnTop={bool(widget.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)} "
-            f"geo={widget.geometry().getRect()} opacity={float(widget.windowOpacity()):.2f}",
-            flush=True,
-        )
-    except Exception as e:
-        print(f"[DockPopup] STACK DIAG failed: {e}", flush=True)
 
 def _demote_overlay_child(widget: QWidget) -> None:
     parent = getattr(widget, "_mayotter_tool_parent", None)
@@ -1078,18 +1011,11 @@ class ColumnAddOverlay(QWidget):
             from PySide6.QtCore import QTimer
             def _chk(ms, w=self):
                 try:
-                    print(
-                        f"[DockPopup] ColumnAdd STATE +{ms}ms visible={w.isVisible()} "
-                        f"opacity={w.windowOpacity():.2f} geo={w.geometry().getRect()}",
-                        flush=True,
-                    )
                     if w.isVisible() and float(w.windowOpacity()) < 0.5:
                         w.setWindowOpacity(1.0)
                         w.raise_()
-                    _log_popup_stack_diag(w, f"ColumnAdd+{ms}ms")
                 except Exception:
                     pass
-            QTimer.singleShot(0, lambda: _log_popup_stack_diag(self, "ColumnAdd+0ms"))
             QTimer.singleShot(50, lambda: _chk(50))
             QTimer.singleShot(150, lambda: _chk(150))
         except Exception:
@@ -1198,13 +1124,10 @@ class ColumnAddOverlay(QWidget):
                 if _overlay_outside_press_should_close(
                     self, event, {"add_column_btn"}
                 ):
-                    _log_outside_diag(self, event, obj, "ColumnAdd-close")
                     self.close_overlay()
                 else:
                     try:
                         gp = event.globalPosition().toPoint()
-                        if not self.rect().contains(self.mapFromGlobal(gp)):
-                            _log_outside_diag(self, event, obj, "ColumnAdd-ignore")
                     except Exception:
                         pass
         return False
@@ -2211,18 +2134,11 @@ class DownloadOverlay(QWidget):
             from PySide6.QtCore import QTimer
             def _chk(ms, w=self):
                 try:
-                    print(
-                        f"[DockPopup] Download STATE +{ms}ms visible={w.isVisible()} "
-                        f"opacity={w.windowOpacity():.2f} geo={w.geometry().getRect()}",
-                        flush=True,
-                    )
                     if w.isVisible() and float(w.windowOpacity()) < 0.5:
                         w.setWindowOpacity(1.0)
                         w.raise_()
-                    _log_popup_stack_diag(w, f"Download+{ms}ms")
                 except Exception:
                     pass
-            QTimer.singleShot(0, lambda: _log_popup_stack_diag(self, "Download+0ms"))
             QTimer.singleShot(50, lambda: _chk(50))
             QTimer.singleShot(150, lambda: _chk(150))
         except Exception:
@@ -2269,13 +2185,10 @@ class DownloadOverlay(QWidget):
                 if _overlay_outside_press_should_close(
                     self, event, {"download_icon_btn"}
                 ):
-                    _log_outside_diag(self, event, obj, "Download-close")
                     self.close_overlay()
                 else:
                     try:
                         gp = event.globalPosition().toPoint()
-                        if not self.rect().contains(self.mapFromGlobal(gp)):
-                            _log_outside_diag(self, event, obj, "Download-ignore")
                     except Exception:
                         pass
         return False

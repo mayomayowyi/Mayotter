@@ -11,7 +11,6 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
-    QPolygonF,
 )
 
 _COLOR_SECONDARY = "#aeb6c5"
@@ -327,6 +326,9 @@ def make_file_open_icon(color: str = _COLOR_SECONDARY, size: int = 14) -> QIcon:
     return QIcon(pm)
 
 def make_chevron_left_icon(color: str = _COLOR_SECONDARY, size: int = 12) -> QIcon:
+    return make_back_icon(color, size)
+
+def make_stow_left_icon(color: str = _COLOR_SECONDARY, size: int = 12) -> QIcon:
     return make_back_icon(color, size)
 
 def make_stow_right_icon(color: str = _COLOR_SECONDARY, size: int = 12) -> QIcon:

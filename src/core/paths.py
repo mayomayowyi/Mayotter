@@ -38,7 +38,6 @@ LOGS_DIR = DATA_DIR / "logs"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 AUDIO_VISUAL_DIR = _audio_visual_for_edition(APP_BASE_DIR, _EDITION)
 SETTINGS_FILE = CONFIG_DIR / "app.json"
-UPDATE_TMP_DIR = APP_BASE_DIR / "update_tmp"
 
 def default_recordings_dir() -> Path:
     return RECORDINGS_DIR

@@ -14,11 +14,11 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 from PySide6.QtCore import (
-    QSize, Qt, Signal, QEvent, QTimer, Property,
-    QPropertyAnimation, QEasingCurve, QVariantAnimation,
+    QSize, Qt, Signal, QEvent, QTimer,
+    QEasingCurve, QVariantAnimation,
 )
 from PySide6.QtGui import (
-    QMouseEvent, QResizeEvent, QColor, QIcon, QPainter, QPixmap, QPolygonF,
+    QMouseEvent, QResizeEvent, QColor, QIcon, QPainter,
     QPen, QPainterPath, QPaintEvent,
 )
 from PySide6.QtCore import QPointF, QRectF
@@ -29,7 +29,6 @@ from src.ui.icons import (
     make_back_icon,
     make_forward_icon,
 )
-from src.ui import resize_debug as _rzdbg
 
 _INTERNAL_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
@@ -284,17 +283,9 @@ class _BoundaryHandle(QWidget):
             or local.y() < m or local.y() >= top.height() - m
         )
         if not near_edge:
-            _rzdbg.log(
-                "boundary_press",
-                action="column_resize",
-                local=(local.x(), local.y()),
-                window_size=(top.width(), top.height()),
-                margin=m,
-            )
             return False
         wh = top.windowHandle()
         if wh is None:
-            _rzdbg.log("boundary_yield_fail", reason="no_window_handle")
             return False
         edges = Qt.Edges(0)
         if local.x() < m:
@@ -306,14 +297,6 @@ class _BoundaryHandle(QWidget):
         elif local.y() >= top.height() - m:
             edges |= Qt.Edge.BottomEdge
         ok = wh.startSystemResize(edges)
-        _rzdbg.log(
-            "startSystemResize",
-            source="boundary_yield",
-            edges=int(edges),
-            ok=bool(ok),
-            local=(local.x(), local.y()),
-            window_size=(top.width(), top.height()),
-        )
         return True
 
     def _try_boundary_action_click(self, event: QMouseEvent) -> bool:
@@ -327,27 +310,26 @@ class _BoundaryHandle(QWidget):
             if hasattr(ov, "_refresh_action_rects"):
                 ov._refresh_action_rects()
             local = ov.mapFromGlobal(event.globalPosition().toPoint())
-            stow = getattr(ov, "_stow_rect", None)
+            stow_left = getattr(ov, "_stow_left_rect", None)
+            stow_right = getattr(ov, "_stow_right_rect", None) or getattr(ov, "_stow_rect", None)
             reset = getattr(ov, "_reset_rect", None)
-            print(
-                f"[ResizeHandle] press global→overlay local=({local.x()},{local.y()}) "
-                f"stow={stow} reset={reset}",
-                flush=True,
-            )
-            if stow is not None and stow.contains(local):
-                print("[ResizeHandle] hit=STOW → dispatch Stow (not Resize)", flush=True)
+            if stow_left is not None and stow_left.contains(local):
+                fn = getattr(win, "_on_boundary_stow_left_clicked", None)
+                if callable(fn):
+                    fn()
+                return True
+            if stow_right is not None and stow_right.contains(local):
                 fn = getattr(win, "_on_boundary_stow_clicked", None)
                 if callable(fn):
                     fn()
                 return True
             if reset is not None and reset.contains(local):
-                print("[ResizeHandle] hit=RESET → dispatch Reset (not Resize)", flush=True)
                 fn = getattr(win, "_on_boundary_reset_clicked", None)
                 if callable(fn):
                     fn()
                 return True
-        except Exception as e:
-            print(f"[ResizeHandle] boundary action check failed: {e}", flush=True)
+        except Exception:
+            return False
         return False
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -363,8 +345,6 @@ class _BoundaryHandle(QWidget):
             if abs(local_x - cx) > self._RESIZE_HIT_HALF + 1:
                 event.accept()
                 return
-            print("[ResizeHandle] mousePress → column Resize drag", flush=True)
-            _rzdbg.log("boundary_press", action="column_drag_start")
             self._active = True
             self._expand_anim.stop()
             self._actions_visible = False
@@ -432,10 +412,13 @@ class _BoundaryHandle(QWidget):
             if hasattr(ov, "_refresh_action_rects"):
                 ov._refresh_action_rects()
             local = ov.mapFromGlobal(event.globalPosition().toPoint())
-            stow = getattr(ov, "_stow_rect", None)
+            stow_left = getattr(ov, "_stow_left_rect", None)
+            stow_right = getattr(ov, "_stow_right_rect", None) or getattr(ov, "_stow_rect", None)
             reset = getattr(ov, "_reset_rect", None)
-            if (stow is not None and stow.contains(local)) or (
-                reset is not None and reset.contains(local)
+            if (
+                (stow_left is not None and stow_left.contains(local))
+                or (stow_right is not None and stow_right.contains(local))
+                or (reset is not None and reset.contains(local))
             ):
                 self.setCursor(Qt.CursorShape.PointingHandCursor)
                 return True
@@ -1376,6 +1359,12 @@ class AccountColumn(QWidget):
         if enabled:
             self._resize_handle.setFixedWidth(self.RESIZE_HANDLE_WIDTH)
             self._resize_handle.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+            # Dock 切替直後は body の layout が未確定で handle 高さが 0 のことがある
+            body = getattr(self, "_body", None)
+            if body is not None:
+                lay = body.layout()
+                if lay is not None:
+                    lay.activate()
             self._position_resize_handles()
 
     def _toggle_enabled(self) -> None:
