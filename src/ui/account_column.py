@@ -4,7 +4,6 @@ import re
 
 from PySide6.QtWidgets import (
     QWidget,
-    QMenu,
     QVBoxLayout,
     QHBoxLayout,
     QLineEdit,
@@ -12,22 +11,25 @@ from PySide6.QtWidgets import (
     QFrame,
     QPushButton,
     QSizePolicy,
+    QLabel,
+    QGraphicsOpacityEffect,
 )
 from PySide6.QtCore import (
-    QSize, Qt, Signal, QEvent, QTimer,
+    QSize, Qt, Signal, QEvent, QTimer, QPoint, QPointF, QRectF,
     QEasingCurve, QVariantAnimation,
 )
 from PySide6.QtGui import (
     QMouseEvent, QResizeEvent, QColor, QIcon, QPainter,
-    QPen, QPainterPath, QPaintEvent,
+    QPen, QPainterPath, QPaintEvent, QFont, QFontMetrics,
 )
-from PySide6.QtCore import QPointF, QRectF
 
 from src.browser.webview import XWebView
 from src.ui.icons import (
     make_home_icon,
     make_back_icon,
     make_forward_icon,
+    make_chevron_down_icon,
+    make_expand_h_icon,
 )
 
 _INTERNAL_ID_RE = re.compile(r"^[0-9a-f]{8}$")
@@ -87,7 +89,7 @@ class _UrlBar(QLineEdit):
         act_redo = QAction("やり直す", menu)
         act_cut = QAction("切り取り", menu)
         act_copy = QAction("コピー", menu)
-        act_paste = QAction("貼り付け", menu)
+        act_paste = QAction("貼り付けて検索", menu)
         act_sel = QAction("すべて選択", menu)
         act_undo.setEnabled(can_edit and bool(getattr(self, "isUndoAvailable", lambda: False)()))
         act_redo.setEnabled(can_edit and bool(getattr(self, "isRedoAvailable", lambda: False)()))
@@ -121,19 +123,126 @@ class _UrlBar(QLineEdit):
 
     def _paste_url_text(self) -> None:
         from PySide6.QtWidgets import QApplication
+        from src.browser.webview import normalize_user_input_url
         clip = (QApplication.clipboard().text() or "").strip()
         if not clip:
             return
-        self.setText(clip)
-        self.setToolTip(clip)
-        self.clicked.emit()
+        url = normalize_user_input_url(clip)
+        if not url:
+            return
+        col = self.parentWidget()
+        while col is not None and not hasattr(col, "navigate"):
+            col = col.parentWidget()
+        if col is not None:
+            col.navigate(url)
+
+class _SharedUiHoverStrip(QWidget):
+    """共有UI（←→🔁）用の透明ホバー帯。境界の2pxリサイズとは別。"""
+
+    WIDTH = 8
+
+    def __init__(self, parent: QWidget, column: "AccountColumn") -> None:
+        super().__init__(parent)
+        self._column = column
+        self.setObjectName("shared_ui_hover_strip")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setMouseTracking(True)
+        self._release_gen = 0
+
+    def paintEvent(self, event) -> None:
+        return
+
+    def enterEvent(self, event) -> None:
+        win = self.window()
+        if win is not None and getattr(win, "_boundary_dragging", False):
+            super().enterEvent(event)
+            return
+        self._release_gen += 1
+        h = getattr(self._column, "_resize_handle", None)
+        if h is not None and h.isVisible():
+            try:
+                h._show_actions(True)
+            except Exception:
+                pass
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._release_gen += 1
+        gen = self._release_gen
+        QTimer.singleShot(30, lambda g=gen: self._maybe_release_shared_ui(g))
+        super().leaveEvent(event)
+
+    def _maybe_release_shared_ui(self, gen: int = 0) -> None:
+        if gen and gen != getattr(self, "_release_gen", 0):
+            return
+        from PySide6.QtGui import QCursor
+        pos = QCursor.pos()
+        h = getattr(self._column, "_resize_handle", None)
+        if h is not None and h.isVisible():
+            try:
+                if h.rect().contains(h.mapFromGlobal(pos)):
+                    return
+            except Exception:
+                pass
+        try:
+            if self.isVisible() and self.rect().contains(self.mapFromGlobal(pos)):
+                return
+        except Exception:
+            pass
+        win = self.window()
+        on_knob = getattr(win, "boundary_action_knobs_contain_global", None) if win is not None else None
+        if callable(on_knob) and on_knob(pos):
+            return
+        if h is not None:
+            try:
+                h._show_actions(False)
+            except Exception:
+                pass
+
+
+class _BoundaryHintBar(QWidget):
+    """通常境界の hover ハイライト専用バー。
+
+    通常時は何も描かず（親の暗い背景＝既存の藍色相当が透ける）。
+    hover 時だけ薄い青を paintEvent で描く。stylesheet に頼らないことで、
+    leave 後に色が残る残像を防ぐ。
+    """
+
+    def __init__(self, handle: QWidget) -> None:
+        super().__init__(handle)
+        self._handle = handle
+        self.setObjectName("boundary_hint_bar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self.setAutoFillBackground(False)
+        # 親ハンドルと同じ resize 可能判定 → SizeHor（子が Arrow に戻さない）
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        # グローバル stylesheet の background 指定を無効化
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def paintEvent(self, event) -> None:
+        # 毎フレーム Source で塗り直す（非 hover 時は透明クリア＝残像防止）
+        p = QPainter(self)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        active = bool(getattr(self._handle, "_hint", False))
+        if active:
+            p.fillRect(self.rect(), QColor(122, 158, 218, 46))  # ≈ rgba(122,158,218,0.18)
+        else:
+            p.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        p.end()
+
 
 class _BoundaryHandle(QWidget):
 
     stow_right_clicked = Signal()
     reset_widths_clicked = Signal()
 
-    _IDLE_WIDTH = 5
+    # 通常境界の visual / resize hit は常に 2px（共有UI hover 幅とは分離）
+    _IDLE_WIDTH = 2
     _RESIZE_HIT_HALF = 1
 
     def __init__(self, parent: QWidget) -> None:
@@ -143,9 +252,8 @@ class _BoundaryHandle(QWidget):
         self.setCursor(Qt.CursorShape.SizeHorCursor)
         self.setMouseTracking(True)
         self.setFixedWidth(self._IDLE_WIDTH)
-        self._bar = QWidget(self)
-        self._bar.setObjectName("boundary_hint_bar")
         self._hint = False
+        self._bar = _BoundaryHintBar(self)
         self._active = False
         self._actions_visible = False
         self._expand = 0.0
@@ -157,6 +265,8 @@ class _BoundaryHandle(QWidget):
         self._expand_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._expand_anim.valueChanged.connect(self._on_expand_changed)
         self._expand_anim.finished.connect(self._on_expand_finished)
+        # 最後に確定した hover 目標（True→1.0 / False→0.0）。半透明停止を防ぐ。
+        self._expand_target = 0.0
 
     def _on_expand_changed(self, value) -> None:
         try:
@@ -166,30 +276,122 @@ class _BoundaryHandle(QWidget):
         self._apply_expand_layout()
 
     def set_hint(self, active: bool) -> None:
-        if active != self._hint:
-            self._hint = active
+        """青ハイライトの唯一の書き込み口。
+
+        state を更新したうえで _bar を再 paint する。
+        色は stylesheet ではなく _BoundaryHintBar.paintEvent が描く。
+        """
+        active = bool(active)
+        changed = active != self._hint
+        self._hint = active
+        # 互換のため property も更新（stylesheet 側は transparent 固定）
+        try:
             self.setProperty("hint", active)
-            style = self.style()
-            style.unpolish(self)
-            style.polish(self)
-            style.unpolish(self._bar)
-            style.polish(self._bar)
-            self._bar.update()
+        except Exception:
+            pass
+        if changed or not active:
+            try:
+                self._bar.update()
+                self.update()
+            except Exception:
+                pass
+        if active:
+            win = self.window()
+            ensure = getattr(win, "_ensure_boundary_hover_poll", None) if win is not None else None
+            if callable(ensure):
+                try:
+                    ensure()
+                except Exception:
+                    pass
 
     def _position_bar(self) -> None:
-        bw = 1
-        self._bar.setGeometry((self.width() - bw) // 2, 0, bw, self.height())
+        # 通常境界: ハンドル実幅(=2px)全体が visual + resize hit
+        # 個別収納フル幅: 中央ヒント線なし
+        owner = self._owner_column()
+        stowed = owner is not None and getattr(
+            owner, "is_individually_stowed", lambda: False
+        )()
+        if stowed:
+            try:
+                self._bar.hide()
+            except Exception:
+                pass
+            if self._actions_visible:
+                self._apply_expand_layout()
+            return
+        try:
+            self._bar.show()
+        except Exception:
+            pass
+        bw = max(1, min(2, self.width()))
+        self._bar.setGeometry(0, 0, bw, self.height())
         if self._actions_visible:
             self._apply_expand_layout()
+
+    def _local_in_resize_hit(self, local_x: int | float) -> bool:
+        """通常境界の resize 判定: ハンドル内全体（幅 2px）。"""
+        try:
+            x = int(local_x)
+            return 0 <= x < max(1, self.width())
+        except Exception:
+            return False
 
     def _boundary_pivot_in_window(self):
         win = self.window()
         if win is None:
             return None
-        c = self.mapTo(win, self.rect().center())
-        top = self.mapTo(win, self.rect().topLeft())
-        bot = self.mapTo(win, self.rect().bottomLeft())
-        return win, int(c.x()), int(top.y()), int(bot.y())
+        owner = self._owner_column()
+        # 個別収納: 横は隣接する連続収納領域の左右端中点、縦は通常境界と同じ body
+        if owner is not None and getattr(owner, "is_individually_stowed", lambda: False)():
+            left_edge_col = owner
+            right_edge_col = owner
+            ordered = None
+            try:
+                cols = getattr(win, "_columns", None)
+                if cols:
+                    ordered = [c for c in cols if c.isVisible()]
+            except Exception:
+                ordered = None
+            if ordered:
+                try:
+                    idx = ordered.index(owner)
+                except ValueError:
+                    idx = -1
+                if idx >= 0:
+                    li = idx
+                    while li > 0 and getattr(
+                        ordered[li - 1], "is_individually_stowed", lambda: False
+                    )():
+                        li -= 1
+                    ri = idx
+                    while ri < len(ordered) - 1 and getattr(
+                        ordered[ri + 1], "is_individually_stowed", lambda: False
+                    )():
+                        ri += 1
+                    left_edge_col = ordered[li]
+                    right_edge_col = ordered[ri]
+            # QRect.center() は偶数幅で 1px 左に寄るため、左右端から中点を取る
+            left_pt = left_edge_col.mapTo(win, QPoint(0, 0))
+            right_pt = right_edge_col.mapTo(win, QPoint(right_edge_col.width(), 0))
+            cx = (int(left_pt.x()) + int(right_pt.x())) // 2
+            body = None
+            left = getattr(owner, "_boundary_left_col", None)
+            if left is not None:
+                body = getattr(left, "_body", None)
+            if body is None or body.height() <= 0:
+                right = getattr(owner, "_boundary_right_col", None)
+                if right is not None:
+                    body = getattr(right, "_body", None)
+            if body is not None and body.height() > 0:
+                top_pt = body.mapTo(win, body.rect().topLeft())
+                bot_pt = body.mapTo(win, body.rect().bottomLeft())
+                return win, cx, int(top_pt.y()), int(bot_pt.y())
+            top = self.mapTo(win, self.rect().topLeft())
+            bot = self.mapTo(win, self.rect().bottomLeft())
+            return win, cx, int(top.y()), int(bot.y())
+        edge = self.mapTo(win, self.rect().topRight())
+        bot = self.mapTo(win, self.rect().bottomRight())
+        return win, int(edge.x()), int(edge.y()), int(bot.y())
 
     def _apply_expand_layout(self) -> None:
         pivot = self._boundary_pivot_in_window()
@@ -204,69 +406,285 @@ class _BoundaryHandle(QWidget):
         self._apply_expand_layout()
 
     def _animate_expand(self, target: float) -> None:
-        self._expand_anim.stop()
-        self._expand_anim.setStartValue(float(self._expand))
-        self._expand_anim.setEndValue(float(target))
+        """現在 opacity から target へ。途中で stop して新 target へ切り替えてよい。"""
+        target = 1.0 if float(target) >= 0.5 else 0.0
+        self._expand_target = target
+        self._expand_gen = int(getattr(self, "_expand_gen", 0) or 0) + 1
+        gen = self._expand_gen
+        try:
+            self._expand_anim.stop()
+        except Exception:
+            pass
+        try:
+            cur = float(self._expand)
+        except (TypeError, ValueError):
+            cur = 0.0
+        if abs(cur - target) < 0.01:
+            self._expand = target
+            self._apply_expand_layout()
+            self._finalize_expand_state(gen)
+            return
+        self._expand_anim.setStartValue(cur)
+        self._expand_anim.setEndValue(target)
+        # finished 時に gen を照合して古い callback を無視
+        self._expand_anim_gen = gen
         self._expand_anim.start()
 
     def _show_actions(self, show: bool) -> None:
         if self._active:
             show = False
         show = bool(show)
-        if show and self._actions_visible and float(self._expand) > 0.5:
-            return
-        if (not show) and (not self._actions_visible) and float(self._expand) < 0.05:
-            return
         self._actions_visible = show
+        self._expand_target = 1.0 if show else 0.0
         if show:
-            self._expand = 0.0
             self.set_hint(True)
-            self._apply_expand_layout()
             self._animate_expand(1.0)
         else:
+            self.set_hint(False)
             self._animate_expand(0.0)
-            QTimer.singleShot(160, self._hide_actions_if_collapsed)
 
-    def _on_expand_finished(self) -> None:
-        if self._actions_visible:
+    def _finalize_expand_state(self, gen: int | None = None) -> None:
+        """アニメ終了時に target へ明示 set。半透明の残留を禁止。"""
+        if gen is not None and gen != getattr(self, "_expand_gen", None):
             return
-        if float(self._expand) > 0.05:
+        want_show = bool(self._actions_visible)
+        try:
+            target = float(getattr(self, "_expand_target", 1.0 if want_show else 0.0))
+        except (TypeError, ValueError):
+            target = 1.0 if want_show else 0.0
+        # hover 状態と target を一致させる
+        target = 1.0 if want_show else 0.0
+        self._expand_target = target
+        self._expand = target
+        self._apply_expand_layout()
+        if want_show:
             return
         self.set_hint(False)
         win = self.window()
-        hide = getattr(win, "hide_boundary_actions", None) if win is not None else None
-        if callable(hide):
-            hide()
+        owner = self._owner_column()
+        # owner 不一致でも t=0 を反映済み。共有 overlay は owner 一致時に閉じる
+        if win is not None and getattr(win, "_boundary_action_col", None) is owner:
+            hide = getattr(win, "hide_boundary_actions", None)
+            if callable(hide):
+                try:
+                    hide()
+                except Exception:
+                    pass
 
-    def _hide_actions_if_collapsed(self) -> None:
-        self._on_expand_finished()
+    def _on_expand_finished(self) -> None:
+        self._finalize_expand_state(getattr(self, "_expand_anim_gen", None))
+
+    def _hide_hint_now(self) -> None:
+        """青ヒントとアクションを即クリア。共有overlayは自分がownerのときだけ閉じる。"""
+        try:
+            self._expand_anim.stop()
+        except Exception:
+            pass
+        self._actions_visible = False
+        self._expand = 0.0
+        self.set_hint(False)
+        win = self.window()
+        owner = self._owner_column()
+        if win is not None and getattr(win, "_boundary_action_col", None) is owner:
+            hide = getattr(win, "hide_boundary_actions", None)
+            if callable(hide):
+                try:
+                    hide()
+                except Exception:
+                    pass
+
+    def _clear_other_boundary_hints(self) -> None:
+        """他ハンドルのローカル hint/expand だけ消す（共有 overlay は触らない）。"""
+        win = self.window()
+        cols = getattr(win, "_columns", None) if win is not None else None
+        if not cols:
+            return
+        for c in cols:
+            h = getattr(c, "_resize_handle", None)
+            if h is None or h is self:
+                continue
+            try:
+                if getattr(h, "_hint", False) or getattr(h, "_actions_visible", False):
+                    try:
+                        h._expand_anim.stop()
+                    except Exception:
+                        pass
+                    h._actions_visible = False
+                    h._expand = 0.0
+                    h.set_hint(False)
+            except Exception:
+                pass
 
     def enterEvent(self, event) -> None:
         if self._active:
             super().enterEvent(event)
             return
+        win = self.window()
+        if win is not None and getattr(win, "_boundary_dragging", False):
+            super().enterEvent(event)
+            return
+        owner = self._owner_column()
+        stowed = owner is not None and getattr(
+            owner, "is_individually_stowed", lambda: False
+        )()
+        if stowed:
+            # 収納領域全体: SizeHor + 共有UI。個別展開↔はカラム側。
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            sync = getattr(win, "_sync_column_resize_cursor", None) if win is not None else None
+            if callable(sync):
+                try:
+                    sync()
+                except Exception:
+                    pass
+            self._ensure_stowed_shared_ui()
+            super().enterEvent(event)
+            return
+        # 通常 2px handle 上 = resize 可能 → SizeHor。共有UI も表示
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        sync = getattr(win, "_sync_column_resize_cursor", None) if win is not None else None
+        if callable(sync):
+            try:
+                sync()
+            except Exception:
+                pass
+        self._clear_other_boundary_hints()
         if not self._actions_visible:
             self.set_hint(True)
             self._show_actions(True)
         super().enterEvent(event)
 
+    def _ensure_stowed_shared_ui(self) -> None:
+        """収納領域上の共有UI。既に出ているなら hide/show し直さない。"""
+        if self._active:
+            return
+        win = self.window()
+        if win is not None and getattr(win, "_boundary_dragging", False):
+            return
+        owner = self._owner_column()
+        left = getattr(owner, "_boundary_left_col", None) if owner is not None else None
+        right = getattr(owner, "_boundary_right_col", None) if owner is not None else None
+        # 同一収納領域のどれかで既に共有UIが出ていれば、それを維持（再 show しない）
+        cols = getattr(win, "_columns", None) if win is not None else None
+        if cols and left is not None and right is not None:
+            for c in cols:
+                try:
+                    if not getattr(c, "is_individually_stowed", lambda: False)():
+                        continue
+                    if getattr(c, "_boundary_left_col", None) is not left:
+                        continue
+                    if getattr(c, "_boundary_right_col", None) is not right:
+                        continue
+                    h = getattr(c, "_resize_handle", None)
+                    if h is None:
+                        continue
+                    if getattr(h, "_actions_visible", False) and float(getattr(h, "_expand", 0.0)) > 0.5:
+                        # このハンドルをアクティブ owner として layout だけ同期
+                        if not self._actions_visible:
+                            self._actions_visible = True
+                            self._expand = float(h._expand)
+                            self._apply_expand_layout()
+                        return
+                except Exception:
+                    continue
+        if self._actions_visible and float(getattr(self, "_expand", 0.0)) > 0.5:
+            return
+        self._show_actions(True)
+
+    def _cursor_on_boundary_session(self) -> bool:
+        """session 内: 2px handle / Shared strip / 実ボタン上。overlay 64px 全体は除外。"""
+        if self._active:
+            return True
+        from PySide6.QtGui import QCursor
+        pos = QCursor.pos()
+        try:
+            if self.rect().contains(self.mapFromGlobal(pos)):
+                return True
+        except Exception:
+            pass
+        owner = self._owner_column()
+        if owner is not None:
+            strip = getattr(owner, "_shared_ui_hover_strip", None)
+            if strip is not None and strip.isVisible():
+                try:
+                    if strip.rect().contains(strip.mapFromGlobal(pos)):
+                        return True
+                except Exception:
+                    pass
+        win = self.window()
+        if win is None:
+            return False
+        if getattr(win, "_boundary_action_col", None) is not owner:
+            return False
+        # 実ボタン矩形のみ（64px overlay 全体では session 維持しない）
+        over = getattr(win, "boundary_action_knobs_contain_global", None)
+        try:
+            if callable(over) and over(pos):
+                return True
+        except Exception:
+            pass
+        return False
+
     def leaveEvent(self, event) -> None:
-        QTimer.singleShot(40, self._maybe_hide_actions)
+        # leave で Arrow に落とさない。隣接 resize 領域へ移る瞬間も SizeHor 維持。
+        win = self.window()
+        sync = getattr(win, "_sync_column_resize_cursor", None) if win is not None else None
+        if callable(sync):
+            try:
+                sync()
+            except Exception:
+                pass
+        owner = self._owner_column()
+        stowed = owner is not None and getattr(
+            owner, "is_individually_stowed", lambda: False
+        )()
+        if stowed:
+            # 同じ収納領域（同一 left/right 通常カラム）内なら共有UIを維持
+            QTimer.singleShot(0, self._maybe_hide_stowed_shared_ui)
+            super().leaveEvent(event)
+            return
+        # handle → overlay への移動では session を終了しない。
+        QTimer.singleShot(30, self._maybe_hide_actions)
         super().leaveEvent(event)
 
-    def _maybe_hide_actions(self) -> None:
+    def _maybe_hide_stowed_shared_ui(self) -> None:
         if self._active:
             return
         from PySide6.QtGui import QCursor
         pos = QCursor.pos()
-        if self.rect().contains(self.mapFromGlobal(pos)):
-            return
+        owner = self._owner_column()
+        left = getattr(owner, "_boundary_left_col", None) if owner is not None else None
+        right = getattr(owner, "_boundary_right_col", None) if owner is not None else None
         win = self.window()
+        # 同一収納領域の他スロット上なら共有UI維持
+        cols = getattr(win, "_columns", None) if win is not None else None
+        if cols and left is not None and right is not None:
+            for c in cols:
+                try:
+                    if not getattr(c, "is_individually_stowed", lambda: False)():
+                        continue
+                    if getattr(c, "_boundary_left_col", None) is not left:
+                        continue
+                    if getattr(c, "_boundary_right_col", None) is not right:
+                        continue
+                    h = getattr(c, "_resize_handle", None)
+                    if h is not None and h.isVisible():
+                        if h.rect().contains(h.mapFromGlobal(pos)):
+                            return
+                    if c.rect().contains(c.mapFromGlobal(pos)):
+                        return
+                except Exception:
+                    continue
         over = getattr(win, "boundary_actions_contain_global", None) if win is not None else None
         if callable(over) and over(pos):
             return
-        self.set_hint(False)
-        self._show_actions(False)
+        self._hide_hint_now()
+
+    def _maybe_hide_actions(self) -> None:
+        if self._active:
+            return
+        if self._cursor_on_boundary_session():
+            return
+        self._hide_hint_now()
 
     _WINDOW_EDGE_MARGIN = 2
 
@@ -296,7 +714,7 @@ class _BoundaryHandle(QWidget):
             edges |= Qt.Edge.TopEdge
         elif local.y() >= top.height() - m:
             edges |= Qt.Edge.BottomEdge
-        ok = wh.startSystemResize(edges)
+        wh.startSystemResize(edges)
         return True
 
     def _try_boundary_action_click(self, event: QMouseEvent) -> bool:
@@ -340,20 +758,30 @@ class _BoundaryHandle(QWidget):
             if self._try_boundary_action_click(event):
                 event.accept()
                 return
-            local_x = event.position().toPoint().x()
-            cx = self.width() // 2
-            if abs(local_x - cx) > self._RESIZE_HIT_HALF + 1:
-                event.accept()
-                return
+            owner = self._owner_column()
+            stowed = owner is not None and getattr(
+                owner, "is_individually_stowed", lambda: False
+            )()
+            # 通常境界: resize 開始は中央 2px のみ（共有UI hover 幅とは分離）
+            # 個別収納: スロット全体で同一カラム幅調整を開始できる。
+            if not stowed:
+                local_x = event.position().toPoint().x()
+                if not self._local_in_resize_hit(local_x):
+                    event.accept()
+                    return
             self._active = True
             self._expand_anim.stop()
             self._actions_visible = False
             self._expand = 0.0
             win = self.window()
+            # ドラッグ中は共有UI・展開↔・hover をすべて抑制
             hide = getattr(win, "hide_boundary_actions", None) if win is not None else None
             if callable(hide):
                 hide()
-            self.set_hint(True)
+            suppress = getattr(win, "_suppress_all_boundary_hover_ui", None)
+            if callable(suppress):
+                suppress()
+            self.set_hint(False)
             self._position_bar()
             self._press_x = event.globalPosition().x()
             self.raise_()
@@ -372,7 +800,10 @@ class _BoundaryHandle(QWidget):
         hide = getattr(win, "hide_boundary_actions", None) if win is not None else None
         if callable(hide):
             hide()
-        self.set_hint(True)
+        suppress = getattr(win, "_suppress_all_boundary_hover_ui", None)
+        if callable(suppress):
+            suppress()
+        self.set_hint(False)
         self._position_bar()
         self._press_x = float(global_x)
         self.raise_()
@@ -398,6 +829,7 @@ class _BoundaryHandle(QWidget):
         if self._try_boundary_action_hover_cursor(event):
             event.accept()
             return
+        # この handle 上 = resize 可能 → SizeHor（通常は 2px、収納はフル幅）
         self.setCursor(Qt.CursorShape.SizeHorCursor)
         super().mouseMoveEvent(event)
 
@@ -439,6 +871,22 @@ class _BoundaryHandle(QWidget):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        # 収納同士の 1px 区切りは親カラム paint が描くが、フル幅ハンドルが
+        # 覆うため左端に同じ 1px を描く（hit ではない・hover ではない）
+        owner = self._owner_column()
+        if owner is None:
+            return
+        if not getattr(owner, "is_individually_stowed", lambda: False)():
+            return
+        left_fn = getattr(owner, "_left_stowed_neighbor", None)
+        if not callable(left_fn) or left_fn() is None:
+            return
+        p = QPainter(self)
+        p.fillRect(0, 0, 1, max(1, self.height()), QColor("#2a3140"))
+        p.end()
 
 class _ColumnDragHandle(QWidget):
 
@@ -802,6 +1250,8 @@ class AccountColumn(QWidget):
     boundary_dragged = Signal(int)
     boundary_drag_finished = Signal()
     stow_right_requested = Signal(object)
+    stow_self_requested = Signal(object)
+    restore_self_requested = Signal(object)
     reset_widths_requested = Signal()
     reorder_requested = Signal(float)
     reorder_drag_moved = Signal(float)
@@ -813,8 +1263,9 @@ class AccountColumn(QWidget):
     new_tab_requested = Signal(str)
     url_edit_requested = Signal()
 
-    RESIZE_HANDLE_WIDTH = 3
+    RESIZE_HANDLE_WIDTH = 2
     MIN_WIDTH = 200
+    STOWED_WIDTH = 10
     DEFAULT_WIDTH = 400
     LONG_PRESS_MS = 500
     DRAG_ABORT_PX = 8
@@ -909,6 +1360,19 @@ class AccountColumn(QWidget):
         self._col_drag_handle.cancelled_drag.connect(self._on_col_grip_cancelled)
         nav_bar.addWidget(self._col_drag_handle, 0)
 
+        self._stow_btn = QToolButton()
+        self._stow_btn.setIcon(make_chevron_down_icon("#aeb6c5", 14))
+        self._stow_btn.setIconSize(QSize(14, 14))
+        self._stow_btn.setText("")
+        self._stow_btn.setFixedSize(26, 26)
+        self._stow_btn.setObjectName("stow_self_btn")
+        self._stow_btn.setToolTip("このカラムを収納")
+        self._stow_btn.setAutoRaise(True)
+        self._stow_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._stow_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._stow_btn.clicked.connect(self._on_stow_self_clicked)
+        nav_bar.addWidget(self._stow_btn)
+
         self._url_bar = _UrlBar()
         self._url_bar.setObjectName("url_bar")
         self._url_bar.setPlaceholderText("URL または検索キーワード")
@@ -922,11 +1386,21 @@ class AccountColumn(QWidget):
         close_btn.setToolTip("カラムを閉じる")
         close_btn.clicked.connect(self._on_close)
         nav_bar.addWidget(close_btn)
+        self._close_btn = close_btn
 
         layout.addWidget(nav_frame)
 
         self._body = QWidget(self)
         self._body.setObjectName("column_body")
+        try:
+            from PySide6.QtGui import QColor
+            self._body.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+            self._body.setAutoFillBackground(True)
+            bp = self._body.palette()
+            bp.setColor(self._body.backgroundRole(), QColor("#0b111f"))
+            self._body.setPalette(bp)
+        except Exception:
+            pass
         body_row = QHBoxLayout(self._body)
         body_row.setContentsMargins(0, 0, 0, 0)
         body_row.setSpacing(0)
@@ -942,6 +1416,9 @@ class AccountColumn(QWidget):
         self._resize_handle.reset_widths_clicked.connect(self.reset_widths_requested.emit)
         self._resize_handle.hide()
         body_row.addWidget(self._resize_handle, 0)
+        # 共有UI専用の透明ホバー帯（resize 2px とは別。描画なし）
+        self._shared_ui_hover_strip = _SharedUiHoverStrip(self._body, self)
+        self._shared_ui_hover_strip.hide()
         layout.addWidget(self._body, 1)
 
         for nav_btn in (
@@ -952,6 +1429,10 @@ class AccountColumn(QWidget):
             close_btn,
         ):
             nav_btn.pressed.connect(self.activated)
+        # stow は pressed→activated でレイアウトが動くと clicked が落ちるので入れない
+
+        self._individually_stowed = False
+        self._stowed_restore_btn = None
 
         if hasattr(webview, 'url_changed'):
             webview.url_changed.connect(
@@ -1231,23 +1712,11 @@ class AccountColumn(QWidget):
     def _on_col_grip_pressed(self) -> None:
         self.activated.emit()
         self._drag_armed = False
-        try:
-            import os
-            if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                print(f"[REORDER] press column={getattr(self, 'get_column_id', lambda: '?')()}", flush=True)
-        except Exception:
-            pass
 
     def _on_col_grip_moved(self, global_x: float) -> None:
         if not self._drag_armed:
             self._drag_armed = True
             self._arm_drag()
-            try:
-                import os
-                if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                    print(f"[REORDER] drag_start x={global_x}", flush=True)
-            except Exception:
-                pass
         try:
             self.reorder_drag_moved.emit(float(global_x))
         except Exception:
@@ -1256,12 +1725,6 @@ class AccountColumn(QWidget):
     def _on_col_grip_released(self, global_x: float) -> None:
         if not self._drag_armed:
             return
-        try:
-            import os
-            if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                print(f"[REORDER] release commit x={global_x}", flush=True)
-        except Exception:
-            pass
         try:
             self.reorder_requested.emit(float(global_x))
         except Exception:
@@ -1273,12 +1736,6 @@ class AccountColumn(QWidget):
             pass
 
     def _on_col_grip_cancelled(self) -> None:
-        try:
-            import os
-            if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                print("[REORDER] cancel (click / sub-threshold)", flush=True)
-        except Exception:
-            pass
         was = self._drag_armed
         self._disarm_drag(emit_finished=False)
         if was:
@@ -1346,21 +1803,113 @@ class AccountColumn(QWidget):
                 pass
 
     def eventFilter(self, obj, event: QEvent) -> bool:
+        if not self.is_individually_stowed():
+            return False
+        win = self.window()
+        if win is not None and getattr(win, "_boundary_dragging", False):
+            return False
+        btn = getattr(self, "_stowed_restore_btn", None)
+        h = getattr(self, "_resize_handle", None)
+        et = event.type()
+        if btn is not None and obj is btn:
+            if et == QEvent.Type.Leave:
+                QTimer.singleShot(0, self._maybe_release_stowed_hover)
+            elif et == QEvent.Type.Enter:
+                self._hide_other_stowed_restore_btns()
+                self._show_stowed_restore_btn()
+                self._show_stowed_name_label()
+            return False
+        if h is not None and obj is h:
+            # 収納スロット全体がハンドル → 個別展開↔を中継
+            # 共有UIはハンドル enterEvent の _ensure_stowed_shared_ui
+            if et == QEvent.Type.Enter:
+                self._hide_other_stowed_restore_btns()
+                self._show_stowed_restore_btn()
+                self._show_stowed_name_label()
+            elif et == QEvent.Type.Leave:
+                QTimer.singleShot(0, self._maybe_release_stowed_hover)
+            return False
         return False
 
     def _position_resize_handles(self) -> None:
-        if not self._resize_handle.isVisible():
+        h = self._resize_handle
+        if not h.isVisible():
             return
-        self._resize_handle.setFixedWidth(self.RESIZE_HANDLE_WIDTH)
-        self._resize_handle._position_bar()
+        if self.is_individually_stowed():
+            # 太い収納領域全体 = resize 可能 → SizeHor（カーソル判定 = resize 判定）
+            w = max(1, int(self.width()) or self.STOWED_WIDTH)
+            h.setFixedWidth(w)
+            h.setGeometry(0, 0, w, max(1, int(self.height())))
+            h.setCursor(Qt.CursorShape.SizeHorCursor)
+            h._position_bar()
+            h.raise_()
+            return
+        # 通常境界: visual / resize / cursor はすべて 2px ハンドル
+        h.setFixedWidth(self.RESIZE_HANDLE_WIDTH)
+        h.setCursor(Qt.CursorShape.SizeHorCursor)
+        h._position_bar()
+        self._position_shared_ui_hover_strip()
+
+    def _position_shared_ui_hover_strip(self) -> None:
+        """共有UI用の透明帯を 2px 境界中心に配置（描画なし・resize ではない）。"""
+        strip = getattr(self, "_shared_ui_hover_strip", None)
+        h = getattr(self, "_resize_handle", None)
+        body = getattr(self, "_body", None)
+        if strip is None or h is None or body is None:
+            return
+        if self.is_individually_stowed() or not h.isVisible():
+            strip.hide()
+            return
+        try:
+            hg = h.geometry()
+            cx = int(hg.x() + hg.width() / 2)
+            w = int(_SharedUiHoverStrip.WIDTH)
+            strip.setGeometry(
+                max(0, cx - w // 2),
+                0,
+                w,
+                max(1, int(body.height())),
+            )
+            strip.show()
+            strip.raise_()
+            h.raise_()
+        except Exception:
+            pass
 
     def set_boundary_enabled(self, enabled: bool) -> None:
-        self._resize_handle.setVisible(enabled)
+        h = self._resize_handle
+        strip = getattr(self, "_shared_ui_hover_strip", None)
+        if self.is_individually_stowed():
+            if strip is not None:
+                strip.hide()
+            if enabled:
+                if h.parentWidget() is not self:
+                    body = getattr(self, "_body", None)
+                    if body is not None:
+                        lay = body.layout()
+                        if lay is not None:
+                            lay.removeWidget(h)
+                    h.setParent(self)
+                h.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+                h.installEventFilter(self)
+                h.show()
+                self._position_resize_handles()
+            else:
+                h.hide()
+            return
+        body = getattr(self, "_body", None)
+        if body is not None and h.parentWidget() is not body:
+            h.setParent(body)
+            lay = body.layout()
+            if lay is not None:
+                lay.addWidget(h, 0)
+        h.setVisible(enabled)
+        if strip is not None:
+            if not enabled:
+                strip.hide()
         if enabled:
-            self._resize_handle.setFixedWidth(self.RESIZE_HANDLE_WIDTH)
-            self._resize_handle.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-            # Dock 切替直後は body の layout が未確定で handle 高さが 0 のことがある
-            body = getattr(self, "_body", None)
+            h.setFixedWidth(self.RESIZE_HANDLE_WIDTH)
+            h.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
             if body is not None:
                 lay = body.layout()
                 if lay is not None:
@@ -2284,6 +2833,643 @@ class AccountColumn(QWidget):
     def _on_close(self) -> None:
         self.closed.emit()
 
+    def _on_stow_self_clicked(self, _checked: bool = False) -> None:
+        if self.is_individually_stowed():
+            return
+        # 最後の通常カラムは収納しない（MainWindow 側でも再チェック）
+        win = self.window()
+        cols = getattr(win, "_columns", None) if win is not None else None
+        if cols:
+            normals = 0
+            for c in cols:
+                try:
+                    if c.isVisible() and not getattr(c, "is_individually_stowed", lambda: False)():
+                        normals += 1
+                except Exception:
+                    pass
+            if normals <= 1:
+                return
+        self.stow_self_requested.emit(self)
+
+    def _on_restore_self_clicked(self, _checked: bool = False) -> None:
+        if not self.is_individually_stowed():
+            return
+        self.restore_self_requested.emit(self)
+
+    def is_individually_stowed(self) -> bool:
+        return bool(getattr(self, "_individually_stowed", False))
+
+    def set_individually_stowed(self, stowed: bool) -> None:
+        stowed = bool(stowed)
+        if stowed == bool(getattr(self, "_individually_stowed", False)):
+            return
+        self._individually_stowed = stowed
+        if stowed:
+            self._enter_individual_stow()
+        else:
+            self._exit_individual_stow()
+
+    def _enter_individual_stow(self) -> None:
+        # 復帰用幅。MainWindow が preferred を先に入れていればそれを優先する
+        # （個別収納中の一時再配分幅で上書きしない）
+        existing = int(getattr(self, "_width_before_individual_stow", 0) or 0)
+        live = int(getattr(self, "_current_width", 0) or self.width() or 0)
+        if existing >= self.MIN_WIDTH:
+            self._width_before_individual_stow = existing
+        else:
+            self._width_before_individual_stow = max(self.MIN_WIDTH, live)
+        # 中間状態を描画しない（全幅の暗い背景が一瞬出るのを防ぐ）
+        self.setUpdatesEnabled(False)
+        try:
+            try:
+                self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                self.setStyleSheet("background-color: #141820;")
+            except Exception:
+                pass
+            # 先にスロット幅へ固定してから中身を隠す
+            # （先に hide すると全幅の暗い矩形が1フレーム描画される）
+            self._current_width = self.STOWED_WIDTH
+            self.setMinimumWidth(self.STOWED_WIDTH)
+            self.setMaximumWidth(self.STOWED_WIDTH)
+            self.setFixedWidth(self.STOWED_WIDTH)
+            for tab in list(getattr(self, "_tabs", None) or []):
+                try:
+                    tab.hide()
+                except Exception:
+                    pass
+            try:
+                self._body.hide()
+            except Exception:
+                pass
+            try:
+                nf = getattr(self, "_nav_frame", None)
+                if nf is not None:
+                    nf.hide()
+            except Exception:
+                pass
+            for w in (
+                self._back_btn,
+                self._forward_btn,
+                self._reload_btn,
+                self._home_btn,
+                self._col_drag_handle,
+                self._stow_btn,
+                self._url_bar,
+                self._close_btn,
+            ):
+                try:
+                    w.hide()
+                except Exception:
+                    pass
+            btn = getattr(self, "_stowed_restore_btn", None)
+            if btn is None:
+                btn = QToolButton(self)
+                btn.setObjectName("stowed_restore_btn")
+                btn.setIcon(make_expand_h_icon("#c5d0e6", 14))
+                btn.setIconSize(QSize(14, 14))
+                btn.setFixedSize(22, 22)
+                # ネイティブ ToolTip「カラムを復帰」は不要（↔ボタン自体は維持）
+                btn.setToolTip("")
+                btn.setAutoRaise(False)
+                btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.clicked.connect(self._on_restore_self_clicked)
+                btn.setStyleSheet(
+                    "QToolButton#stowed_restore_btn {"
+                    " background-color: #252b38;"
+                    " border: 1px solid #3d465c;"
+                    " border-radius: 11px;"
+                    "}"
+                    "QToolButton#stowed_restore_btn:hover {"
+                    " background-color: #2a3348;"
+                    " border: 1px solid #6a8ab8;"
+                    "}"
+                    "QToolButton#stowed_restore_btn:pressed {"
+                    " background-color: #1a2740;"
+                    "}"
+                )
+                btn.installEventFilter(self)
+                self._stowed_restore_btn = btn
+            btn.hide()
+            self.setMouseTracking(True)
+            self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+            self.updateGeometry()
+        finally:
+            self.setUpdatesEnabled(True)
+
+    def _exit_individual_stow(self) -> None:
+        # 最終幅は MainWindow._fit_columns が決める。
+        # body/WebView はまだ出さない（10px のまま show すると surface が一度小さいサイズで作られる）。
+        self.setUpdatesEnabled(False)
+        try:
+            btn = getattr(self, "_stowed_restore_btn", None)
+            if btn is not None:
+                anim = getattr(self, "_stowed_restore_anim", None)
+                if anim is not None:
+                    try:
+                        anim.stop()
+                    except Exception:
+                        pass
+                btn.hide()
+            try:
+                self._hide_stowed_name_label_now()
+            except Exception:
+                pass
+            self.setMinimumWidth(self.MIN_WIDTH)
+            self.setMaximumWidth(16777215)
+            try:
+                self.setStyleSheet("")
+            except Exception:
+                pass
+            try:
+                nf = getattr(self, "_nav_frame", None)
+                if nf is not None:
+                    nf.show()
+            except Exception:
+                pass
+            for wdg in (
+                self._back_btn,
+                self._forward_btn,
+                self._reload_btn,
+                self._home_btn,
+                self._col_drag_handle,
+                self._stow_btn,
+                self._url_bar,
+                self._close_btn,
+            ):
+                try:
+                    wdg.show()
+                except Exception:
+                    pass
+            self.updateGeometry()
+        finally:
+            self.setUpdatesEnabled(True)
+
+    def reveal_after_restore(self) -> None:
+        # fit で最終幅が付いたあとで body/WebView を出す
+        try:
+            self._body.show()
+        except Exception:
+            pass
+        try:
+            self._enforce_single_visible_tab()
+        except Exception:
+            try:
+                idx = int(getattr(self, "_current_tab", 0) or 0)
+                tabs = list(getattr(self, "_tabs", None) or [])
+                for i, tab in enumerate(tabs):
+                    if i == idx:
+                        tab.show()
+                    else:
+                        tab.hide()
+            except Exception:
+                pass
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        win = self.window()
+        if win is not None and getattr(win, "_boundary_dragging", False):
+            return
+        if self.is_individually_stowed():
+            # 境界有効なら収納群全体が resize 可能 → SizeHor
+            h = getattr(self, "_resize_handle", None)
+            if h is not None and h.isVisible():
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                h.setCursor(Qt.CursorShape.SizeHorCursor)
+            # 個別展開↔のみ（共有UIはハンドル側で領域単位管理）
+            self._hide_other_stowed_restore_btns()
+            self._show_stowed_restore_btn()
+            self._show_stowed_name_label()
+
+    def mouseMoveEvent(self, event) -> None:
+        win = self.window()
+        if win is not None and getattr(win, "_boundary_dragging", False):
+            super().mouseMoveEvent(event)
+            return
+        if self.is_individually_stowed():
+            h = getattr(self, "_resize_handle", None)
+            if h is not None and h.isVisible():
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+                h.setCursor(Qt.CursorShape.SizeHorCursor)
+            # すでに表示中なら毎移動で再表示しない
+            btn = getattr(self, "_stowed_restore_btn", None)
+            if btn is None or not btn.isVisible():
+                self._hide_other_stowed_restore_btns()
+                self._show_stowed_restore_btn()
+                self._show_stowed_name_label()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        # Widget 境界跨ぎで一瞬 Arrow にしない（ウィンドウ側で SizeHor 維持）
+        win = self.window()
+        sync = getattr(win, "_sync_column_resize_cursor", None) if win is not None else None
+        if callable(sync):
+            try:
+                sync()
+            except Exception:
+                pass
+        super().leaveEvent(event)
+        if not self.is_individually_stowed():
+            return
+        if self._cursor_over_stowed_restore_btn() or self._cursor_over_stowed_column():
+            QTimer.singleShot(0, self._maybe_release_stowed_hover)
+            return
+        self._fade_stowed_restore_btn(False)
+        self._fade_stowed_name_label(False)
+        QTimer.singleShot(0, self._maybe_release_stowed_hover)
+
+    def _cursor_over_stowed_restore_btn(self) -> bool:
+        btn = getattr(self, "_stowed_restore_btn", None)
+        if btn is None or not btn.isVisible():
+            return False
+        try:
+            from PySide6.QtGui import QCursor
+            return btn.rect().contains(btn.mapFromGlobal(QCursor.pos()))
+        except Exception:
+            return False
+
+    def _cursor_over_stowed_column(self) -> bool:
+        try:
+            from PySide6.QtGui import QCursor
+            return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+        except Exception:
+            return False
+
+    def _left_normal_neighbor(self):
+        win = self.window()
+        cols = list(getattr(win, "_columns", None) or [])
+        try:
+            idx = cols.index(self)
+        except ValueError:
+            return None
+        for j in range(idx - 1, -1, -1):
+            c = cols[j]
+            try:
+                if not c.isVisible():
+                    continue
+                if getattr(c, "is_individually_stowed", lambda: False)():
+                    continue
+            except Exception:
+                continue
+            return c
+        return None
+
+    def _maybe_release_stowed_hover(self) -> None:
+        if not self.is_individually_stowed():
+            return
+        if self._cursor_over_stowed_column() or self._cursor_over_stowed_restore_btn():
+            return
+        self._fade_stowed_restore_btn(False)
+        self._fade_stowed_name_label(False)
+
+    def _hide_stowed_restore_btn_now(self) -> None:
+        btn = getattr(self, "_stowed_restore_btn", None)
+        if btn is None:
+            return
+        anim = getattr(self, "_stowed_restore_anim", None)
+        if anim is not None:
+            try:
+                anim.stop()
+            except Exception:
+                pass
+        eff = getattr(self, "_stowed_restore_effect", None)
+        if eff is not None:
+            try:
+                eff.setOpacity(0.0)
+            except Exception:
+                pass
+        try:
+            btn.hide()
+        except Exception:
+            pass
+
+    def _hide_other_stowed_restore_btns(self) -> None:
+        """他の個別収納の↔・名前を消す（自分だけ表示）。"""
+        win = self.window()
+        cols = getattr(win, "_columns", None) if win is not None else None
+        if not cols:
+            return
+        for c in cols:
+            if c is self:
+                continue
+            try:
+                if not getattr(c, "is_individually_stowed", lambda: False)():
+                    continue
+                # 即 clear で A→B 移動時の重なり残留を防ぐ（fade は自分の leave で）
+                c._hide_stowed_restore_btn_now()
+                c._hide_stowed_name_label_now()
+            except Exception:
+                pass
+
+    def _stowed_profile_label_text(self) -> str:
+        name = ""
+        try:
+            name = (self.get_display_name() or "").strip()
+        except Exception:
+            name = ""
+        if not name:
+            try:
+                name = (self.get_title() or "").strip()
+            except Exception:
+                name = ""
+        if not name:
+            name = (getattr(self, "_account_id", "") or "").strip() or "カラム"
+        return name
+
+    def _ensure_stowed_name_label(self):
+        lbl = getattr(self, "_stowed_name_lbl", None)
+        if lbl is not None:
+            return lbl
+        host = self.parentWidget() or self
+        lbl = QLabel(host)
+        lbl.setObjectName("stowed_name_hover_lbl")
+        lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = QFont(lbl.font())
+        try:
+            f.setPointSize(max(8, int(f.pointSize()) - 1))
+        except Exception:
+            pass
+        lbl.setFont(f)
+        # 黒文字禁止。既存 UI の淡いテキスト色に合わせる
+        lbl.setStyleSheet(
+            "QLabel#stowed_name_hover_lbl {"
+            " color: #c5d0e6;"
+            " background-color: rgba(18, 24, 36, 0.94);"
+            " border: 1px solid #3d465c;"
+            " border-radius: 6px;"
+            " padding: 2px 7px;"
+            "}"
+        )
+        eff = QGraphicsOpacityEffect(lbl)
+        eff.setOpacity(0.0)
+        lbl.setGraphicsEffect(eff)
+        self._stowed_name_effect = eff
+        anim = QVariantAnimation(self)
+        anim.setDuration(140)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.valueChanged.connect(self._on_stowed_name_anim_value)
+        anim.finished.connect(self._on_stowed_name_anim_finished)
+        self._stowed_name_anim = anim
+        self._stowed_name_lbl = lbl
+        self._stowed_name_base_pos = QPoint(0, 0)
+        lbl.hide()
+        return lbl
+
+    def _on_stowed_name_anim_value(self, value) -> None:
+        try:
+            t = float(value)
+        except (TypeError, ValueError):
+            t = 0.0
+        eff = getattr(self, "_stowed_name_effect", None)
+        if eff is not None:
+            try:
+                eff.setOpacity(max(0.0, min(1.0, t)))
+            except Exception:
+                pass
+        lbl = getattr(self, "_stowed_name_lbl", None)
+        base = getattr(self, "_stowed_name_base_pos", None)
+        if lbl is not None and base is not None:
+            # わずかな浮上: 開始は +4px 下、t=1 で base
+            lift = int(round(4 * (1.0 - t)))
+            try:
+                lbl.move(base.x(), base.y() + lift)
+            except Exception:
+                pass
+
+    def _on_stowed_name_anim_finished(self) -> None:
+        lbl = getattr(self, "_stowed_name_lbl", None)
+        eff = getattr(self, "_stowed_name_effect", None)
+        if lbl is None or eff is None:
+            return
+        try:
+            if float(eff.opacity()) < 0.05:
+                lbl.hide()
+        except Exception:
+            pass
+
+    def _place_stowed_name_label(self) -> None:
+        """個別収納 geometry 基準で固定配置（cursor 座標には追従しない）。"""
+        lbl = self._ensure_stowed_name_label()
+        host = lbl.parentWidget() or self.parentWidget() or self
+        if lbl.parentWidget() is not host:
+            lbl.setParent(host)
+        raw = self._stowed_profile_label_text()
+        fm = QFontMetrics(lbl.font())
+        max_w = 120
+        elided = fm.elidedText(raw, Qt.TextElideMode.ElideRight, max_w)
+        lbl.setText(elided)
+        tw = min(max_w + 14, fm.horizontalAdvance(elided) + 16)
+        th = max(18, fm.height() + 6)
+        lbl.setFixedSize(tw, th)
+        # カラム中心 X・上寄り固定 Y（カーソル Y は使わない）
+        top_left = self.mapTo(host, QPoint(0, 0))
+        x = int(top_left.x() + (self.width() - tw) / 2)
+        y = int(top_left.y() + max(8, (self.height() // 2) - th - 28))
+        try:
+            x = max(2, min(x, max(2, host.width() - tw - 2)))
+            y = max(2, min(y, max(2, host.height() - th - 2)))
+        except Exception:
+            pass
+        self._stowed_name_base_pos = QPoint(x, y)
+        # 既に表示中なら位置を動かさない（mouseMove での再配置を防ぐ）
+        try:
+            eff = getattr(self, "_stowed_name_effect", None)
+            if eff is not None and float(eff.opacity()) > 0.15 and lbl.isVisible():
+                return
+        except Exception:
+            pass
+        lbl.move(x, y + 4)
+
+    def _fade_stowed_name_label(self, show: bool) -> None:
+        """プロフィール名の fade-in / fade-out。現在 opacity から目標へ遷移。"""
+        if show and not self.is_individually_stowed():
+            return
+        lbl = self._ensure_stowed_name_label()
+        anim = self._stowed_name_anim
+        eff = self._stowed_name_effect
+        if show:
+            self._place_stowed_name_label()
+            lbl.show()
+            lbl.raise_()
+            win = self.window()
+            cols = getattr(win, "_columns", None) if win is not None else None
+            if cols:
+                for c in cols:
+                    if c is self:
+                        continue
+                    try:
+                        c._hide_stowed_name_label_now()
+                    except Exception:
+                        pass
+        try:
+            cur = float(eff.opacity())
+        except Exception:
+            cur = 0.0
+        target = 1.0 if show else 0.0
+        if abs(cur - target) < 0.02:
+            try:
+                eff.setOpacity(target)
+            except Exception:
+                pass
+            if not show:
+                try:
+                    lbl.hide()
+                except Exception:
+                    pass
+            return
+        # 途中の opacity から再開（半透明で止まらない）
+        anim.stop()
+        anim.setStartValue(cur)
+        anim.setEndValue(target)
+        anim.start()
+
+    def _show_stowed_name_label(self) -> None:
+        # 既に表示中なら再配置・再アニメしない（位置固定・点滅防止）
+        try:
+            eff = getattr(self, "_stowed_name_effect", None)
+            if (
+                eff is not None
+                and float(eff.opacity()) > 0.95
+                and getattr(self, "_stowed_name_lbl", None) is not None
+                and self._stowed_name_lbl.isVisible()
+            ):
+                return
+        except Exception:
+            pass
+        self._fade_stowed_name_label(True)
+
+    def _hide_stowed_name_label_now(self) -> None:
+        """プロフィール名 hover を即座に非表示（グループ切替時の残留防止）。"""
+        lbl = getattr(self, "_stowed_name_lbl", None)
+        if lbl is None:
+            return
+        anim = getattr(self, "_stowed_name_anim", None)
+        if anim is not None:
+            try:
+                anim.stop()
+            except Exception:
+                pass
+        eff = getattr(self, "_stowed_name_effect", None)
+        if eff is not None:
+            try:
+                eff.setOpacity(0.0)
+            except Exception:
+                pass
+        try:
+            lbl.hide()
+        except Exception:
+            pass
+
+    def _ensure_stowed_restore_anim(self) -> None:
+        btn = getattr(self, "_stowed_restore_btn", None)
+        if btn is None:
+            return
+        from PySide6.QtWidgets import QGraphicsOpacityEffect
+        if getattr(self, "_stowed_restore_effect", None) is None:
+            eff = QGraphicsOpacityEffect(btn)
+            eff.setOpacity(0.0)
+            btn.setGraphicsEffect(eff)
+            self._stowed_restore_effect = eff
+        if getattr(self, "_stowed_restore_anim", None) is None:
+            anim = QVariantAnimation(self)
+            anim.setDuration(180)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.valueChanged.connect(self._on_stowed_restore_opacity)
+            anim.finished.connect(self._on_stowed_restore_anim_finished)
+            self._stowed_restore_anim = anim
+
+    def _on_stowed_restore_opacity(self, value) -> None:
+        eff = getattr(self, "_stowed_restore_effect", None)
+        if eff is not None:
+            try:
+                eff.setOpacity(float(value))
+            except Exception:
+                pass
+
+    def _on_stowed_restore_anim_finished(self) -> None:
+        btn = getattr(self, "_stowed_restore_btn", None)
+        eff = getattr(self, "_stowed_restore_effect", None)
+        if btn is None or eff is None:
+            return
+        try:
+            if float(eff.opacity()) < 0.05:
+                btn.hide()
+        except Exception:
+            pass
+
+    def _fade_stowed_restore_btn(self, show: bool) -> None:
+        btn = getattr(self, "_stowed_restore_btn", None)
+        if btn is None:
+            return
+        self._ensure_stowed_restore_anim()
+        anim = self._stowed_restore_anim
+        eff = self._stowed_restore_effect
+        try:
+            cur = float(eff.opacity())
+        except Exception:
+            cur = 0.0
+        target = 1.0 if show else 0.0
+        if show:
+            host = self.parentWidget() or self
+            if btn.parentWidget() is not host:
+                btn.setParent(host)
+            self._place_stowed_restore_btn()
+            btn.show()
+            btn.raise_()
+        if abs(cur - target) < 0.02:
+            try:
+                eff.setOpacity(target)
+            except Exception:
+                pass
+            if not show:
+                btn.hide()
+            return
+        anim.stop()
+        anim.setStartValue(cur)
+        anim.setEndValue(target)
+        anim.start()
+
+    def _show_stowed_restore_btn(self) -> None:
+        self._fade_stowed_restore_btn(True)
+
+    def _place_stowed_restore_btn(self) -> None:
+        btn = getattr(self, "_stowed_restore_btn", None)
+        if btn is None:
+            return
+        host = btn.parentWidget()
+        if host is None:
+            host = self.parentWidget() or self
+            btn.setParent(host)
+        center = self.mapTo(host, self.rect().center())
+        bw = int(btn.width())
+        x = int(center.x() - bw / 2)
+        y = int(center.y() - btn.height() / 2)
+        # 見切れるときだけ最小限補正（host は window の子孫なので mapFrom を使う）
+        win = self.window()
+        if win is not None and host is not win:
+            left = int(host.mapFrom(win, QPoint(0, 0)).x())
+            right = int(host.mapFrom(win, QPoint(win.width(), 0)).x())
+            if x < left:
+                x = left
+            if x + bw > right:
+                x = right - bw
+            # 端に接しているときだけ中央側へ 1px
+            if x <= left:
+                x = left + 1
+            elif x + bw >= right:
+                x = right - bw - 1
+        elif win is not None:
+            if x < 0:
+                x = 0
+            if x + bw > win.width():
+                x = win.width() - bw
+            if x <= 0:
+                x = 1
+            elif x + bw >= win.width():
+                x = win.width() - bw - 1
+        btn.move(x, y)
+
     def _on_back(self) -> None:
         self.current_webview().go_back()
         QTimer.singleShot(0, self._update_nav_history_buttons)
@@ -2393,8 +3579,22 @@ class AccountColumn(QWidget):
         super().mousePressEvent(event)
 
     def set_width(self, width: int, emit_signal: bool = True) -> None:
+        # 個別収納中はスロット幅を維持（通常幅へ上書きしない）
+        if self.is_individually_stowed():
+            self._current_width = self.STOWED_WIDTH
+            self.setMinimumWidth(self.STOWED_WIDTH)
+            self.setMaximumWidth(self.STOWED_WIDTH)
+            self.setFixedWidth(self.STOWED_WIDTH)
+            self.updateGeometry()
+            return
         self._current_width = max(self.MIN_WIDTH, int(width))
-        self.setMinimumWidth(self.MIN_WIDTH)
+        # fit_columns と同じ契約: min=max=確定幅。layout が余白を作らない。
+        # （旧: min=MIN_WIDTH, max=tw → Preferred+stretch0 で client 未充填の黒帯）
+        self.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.setMinimumWidth(self._current_width)
         self.setMaximumWidth(self._current_width)
         self.resize(self._current_width, self.height() if self.height() > 0 else 100)
         self.updateGeometry()
@@ -2404,11 +3604,17 @@ class AccountColumn(QWidget):
     def sizeHint(self):
         from PySide6.QtCore import QSize
         h = self.minimumHeight() if self.minimumHeight() > 0 else 400
+        if self.is_individually_stowed():
+            return QSize(self.STOWED_WIDTH, h)
         return QSize(self._current_width, h)
 
     def minimumSizeHint(self):
         from PySide6.QtCore import QSize
-        return QSize(self.MIN_WIDTH, 100)
+        if self.is_individually_stowed():
+            return QSize(self.STOWED_WIDTH, 100)
+        # min=max 契約と一致させ、layout が MIN_WIDTH へ戻さない
+        w = max(self.MIN_WIDTH, int(getattr(self, "_current_width", 0) or self.MIN_WIDTH))
+        return QSize(w, 100)
 
     def get_width(self) -> int:
         return self._current_width
@@ -2418,6 +3624,36 @@ class AccountColumn(QWidget):
         self._enforce_single_visible_tab()
         super().showEvent(event)
 
+    def _left_stowed_neighbor(self):
+        win = self.window()
+        cols = getattr(win, "_columns", None) if win is not None else None
+        if not cols:
+            return None
+        ordered = [c for c in cols if c.isVisible()]
+        try:
+            idx = ordered.index(self)
+        except ValueError:
+            return None
+        if idx <= 0:
+            return None
+        left = ordered[idx - 1]
+        if getattr(left, "is_individually_stowed", lambda: False)():
+            return left
+        return None
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        # 収納同士の境界だけ常時 1px（hover/resize 用ではない）
+        if not self.is_individually_stowed():
+            return
+        if self._left_stowed_neighbor() is None:
+            return
+        p = QPainter(self)
+        p.fillRect(0, 0, 1, max(1, self.height()), QColor("#2a3140"))
+        p.end()
+
     def resizeEvent(self, event: QResizeEvent) -> None:
         self._position_resize_handles()
+        if self.is_individually_stowed():
+            self._place_stowed_restore_btn()
         super().resizeEvent(event)

@@ -5,7 +5,14 @@ from __future__ import annotations
 import time
 from PySide6.QtCore import Qt, QEvent, Signal, QTimer, QRectF, QSize, QPointF
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QPainter, QColor, QPen, QBrush, QFont, QRegion
-from src.ui.icons import make_close_icon, make_folder_icon, make_trash_icon, make_file_open_icon, make_download_icon
+from src.ui.icons import (
+    make_close_icon,
+    make_folder_icon,
+    make_trash_icon,
+    make_file_open_icon,
+    make_download_icon,
+    make_forward_icon,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -274,6 +281,10 @@ class UrlOverlay(QWidget):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(0)
 
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
         self._input = QLineEdit()
         self._input.setObjectName("url_overlay_input")
         self._input.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -282,7 +293,18 @@ class UrlOverlay(QWidget):
         self._input.returnPressed.connect(self._navigate)
         self._input.installEventFilter(self)
         install_dark_lineedit_menu(self._input)
-        layout.addWidget(self._input)
+        row.addWidget(self._input, 1)
+
+        self._go_btn = QToolButton()
+        self._go_btn.setObjectName("url_go_btn")
+        self._go_btn.setIcon(make_forward_icon("#aeb6c5", 14))
+        self._go_btn.setIconSize(QSize(14, 14))
+        self._go_btn.setFixedSize(28, 28)
+        self._go_btn.setToolTip("移動")
+        self._go_btn.clicked.connect(self._navigate)
+        row.addWidget(self._go_btn)
+
+        layout.addLayout(row)
 
         self.hide()
 
@@ -344,9 +366,9 @@ class UrlOverlay(QWidget):
                 self.close_overlay()
                 return True
         elif etype == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
-            if (event.button() == Qt.MouseButton.LeftButton and
-                    not self.rect().contains(self.mapFromGlobal(event.globalPosition().toPoint()))):
-                self.close_overlay()
+            if event.button() == Qt.MouseButton.LeftButton:
+                if _overlay_outside_press_should_close(self, event, {"url_bar"}):
+                    self.close_overlay()
         return False
 
     def _navigate(self) -> None:
@@ -1125,11 +1147,6 @@ class ColumnAddOverlay(QWidget):
                     self, event, {"add_column_btn"}
                 ):
                     self.close_overlay()
-                else:
-                    try:
-                        gp = event.globalPosition().toPoint()
-                    except Exception:
-                        pass
         return False
 
     def _set_source_type(self, source_type: str) -> None:
@@ -1596,12 +1613,6 @@ class ColumnAddOverlay(QWidget):
     def _search_body_target_h(self) -> int:
         return int(self._SEARCH_INPUT_ROW_H) + int(self._SEARCH_FILTER_H) + int(self._SEARCH_BODY_GAP)
 
-    def _search_input_row_target_height(self) -> int:
-        return int(self._SEARCH_INPUT_ROW_H)
-
-    def _filter_natural_height(self) -> int:
-        return int(self._SEARCH_FILTER_H)
-
     def _insert_search_operator(self, token: str) -> None:
         edit = self._dynamic_input
         try:
@@ -1835,11 +1846,6 @@ class DownloadOverlay(QWidget):
             self._list.setProperty("showDecorationSelected", False)
         except Exception:
             pass
-        try:
-            from src.ui.theme import RADIUS_MD
-            r = int(RADIUS_MD)
-        except Exception:
-            r = 8
         self._list.setStyleSheet(
             self._list.styleSheet()
             + f"""
@@ -1916,7 +1922,7 @@ class DownloadOverlay(QWidget):
         return out
 
     def _create_item_widget(self, item: DownloadItem) -> QWidget:
-        from src.ui.theme import TEXT, TEXT_MUTED, BORDER
+        from src.ui.theme import TEXT, TEXT_MUTED
 
         widget = QWidget()
         widget.setObjectName("download_item_row")
@@ -2186,11 +2192,6 @@ class DownloadOverlay(QWidget):
                     self, event, {"download_icon_btn"}
                 ):
                     self.close_overlay()
-                else:
-                    try:
-                        gp = event.globalPosition().toPoint()
-                    except Exception:
-                        pass
         return False
 
 class DownloadIconButton(QPushButton):

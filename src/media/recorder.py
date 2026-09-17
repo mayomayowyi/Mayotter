@@ -1,7 +1,6 @@
 
 from __future__ import annotations
 
-import os
 import struct
 import wave
 from pathlib import Path
@@ -616,7 +615,6 @@ class AudioRecorder(QObject):
             _rec_log(f"readyRead error: {exc!r}")
 
     def _to_int16_pcm(self, raw: bytes) -> bytes:
-        nch = self._channels
         sf = self._sample_format
         try:
             if sf == QAudioFormat.SampleFormat.Int16:

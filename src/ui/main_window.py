@@ -21,11 +21,9 @@ from PySide6.QtWidgets import (
     QToolButton,
     QLabel,
     QMenu,
-    QGraphicsOpacityEffect,
 )
 from PySide6.QtCore import (
     Qt,
-    QUrl,
     QEvent,
     QTimer,
     QPropertyAnimation,
@@ -35,7 +33,6 @@ from PySide6.QtCore import (
     QRect,
     QSize,
     Signal,
-    QObject,
     QAbstractNativeEventFilter,
 )
 from PySide6.QtGui import (
@@ -45,8 +42,6 @@ from PySide6.QtGui import (
     QRegion,
     QColor,
     QPainter,
-    QPen,
-    QPixmap,
     QKeySequence,
     QShortcut,
 )
@@ -145,7 +140,7 @@ class _ServiceMenu(QFrame):
         self.setObjectName("service_menu")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         try:
-            from src.ui.theme import overlay_stylesheet, SURFACE, BORDER, TEXT, TEXT_SECONDARY, RADIUS_MD
+            from src.ui.theme import overlay_stylesheet, SURFACE, BORDER, TEXT, RADIUS_MD
             self.setStyleSheet(
                 overlay_stylesheet()
                 + f"""
@@ -349,13 +344,6 @@ class _ServiceMenu(QFrame):
             self.rename_requested.emit(account)
         elif chosen == delete_act:
             self.delete_requested.emit(account)
-
-    def clear_profiles(self) -> None:
-        for row in self._rows:
-            self._profile_layout.removeWidget(row)
-            _dispose_widget_no_toplevel(row)
-        self._rows.clear()
-        self._profile_accounts.clear()
 
 class _TabChip(QWidget):
 
@@ -771,8 +759,7 @@ class _TabStrip(QWidget):
         others = [c for i, c in enumerate(self._chips) if i != src]
         insert_index = max(0, min(insert_index, len(others)))
         while self._layout.count():
-            item = self._layout.takeAt(0)
-            w = item.widget()
+            self._layout.takeAt(0)
         for i, c in enumerate(others):
             if i == insert_index:
                 self._layout.addWidget(ph)
@@ -932,11 +919,21 @@ class _RootHitTestFilter(QAbstractNativeEventFilter):
             w = self._window
             if w is not None:
                 w._os_sizing = True
+                try:
+                    if hasattr(w, "_resize_diag_emit"):
+                        w._resize_diag_emit("os_resize_begin", force=True)
+                except Exception:
+                    pass
             return False, 0
         if msg.message == _WM_EXITSIZEMOVE:
             w = self._window
             if w is not None and getattr(w, "_os_sizing", False):
                 w._os_sizing = False
+                try:
+                    if hasattr(w, "_resize_diag_emit"):
+                        w._resize_diag_emit("os_resize_end_before_sync", force=True)
+                except Exception:
+                    pass
                 try:
                     if getattr(w, "_edge_dock_enabled", False):
                         w._sync_dock_after_os_resize()
@@ -949,6 +946,11 @@ class _RootHitTestFilter(QAbstractNativeEventFilter):
                         w._update_window_mask()
                         if hasattr(w, "_fit_columns"):
                             w._fit_columns()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(w, "_resize_diag_emit"):
+                        w._resize_diag_emit("os_resize_end_after_sync", force=True)
                 except Exception:
                     pass
             return False, 0
@@ -991,8 +993,6 @@ class _RootHitTestFilter(QAbstractNativeEventFilter):
                 return True, _HTCLIENT
             return True, resize_code
 
-        m = _RESIZE_MARGIN
-        w, h = self._window.width(), self._window.height()
         return False, 0
 
 class _DockNotifySphereWidget(QWidget):
@@ -1250,6 +1250,12 @@ class MainWindow(QMainWindow):
 
         self._edge_dock_enabled = False
         self._edge_dock_direction = "right"
+        self._edge_dock_edge_offsets = {
+            "left": 0.5,
+            "right": 0.5,
+            "top": 0.5,
+            "bottom": 0.5,
+        }
         self._edge_dock_edge_offset = 0.5
         self._edge_dock_revealed = False
         self._edge_dock_column_count = 1
@@ -1280,6 +1286,12 @@ class MainWindow(QMainWindow):
 
         self._edge_dock_reveal_progress = 0.0
         self._edge_dock_animating = False
+        # 方向切替 / Dock ON/OFF の離散 state 置換中。
+        # True の間は resizeEvent が mask/fit を走らせない（表示中 morph を禁止する）。
+        self._edge_dock_switching = False
+        # 黒帯診断（計測のみ・挙動変更なし）。方向切替中だけスナップショットを stderr へ出す。
+        self._dock_blackband_diag = False
+        self._dock_blackband_diag_switch = ""
         self._dock_geom_reenter = False
         self._dock_slide_proxy: QLabel | None = None
         self._dock_slide_use_proxy = False
@@ -1339,7 +1351,10 @@ class MainWindow(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         self.setContentsMargins(1, 1, 1, 1)
-        self.setMinimumSize(320, 240)
+        # MainWindow 最小サイズ: top_bar(32) + margins + 典型2カラム相当(AccountColumn.MIN_WIDTH=200×2)
+        # + スクロール/chrome 余裕。560x480 は既存 UI 要素から算出し、UI 破綻を防ぐ。
+        # Dock 手動リサイズ下限(240x200)とは独立（Dock 中は setMinimumSize(1,1) に一時切替）。
+        self.setMinimumSize(560, 480)
 
         self.resize(1280, 800)
         try:
@@ -1372,6 +1387,172 @@ class MainWindow(QMainWindow):
         self._hibernation_timer.setInterval(60_000)
         self._hibernation_timer.timeout.connect(self._check_hibernation)
         self._hibernation_timer.start()
+
+
+    # リサイズ診断（通常 OFF。調査時のみ True）
+    _RESIZE_DIAG_ENABLED = False
+    _resize_diag_seq = 0
+    _resize_diag_last_sig = ""
+    _resize_diag_throttle_n = 0
+
+    def _resize_diag_path(self) -> str:
+        if getattr(self, "_boundary_dragging", False) or getattr(self, "_boundary_pending", None) is not None:
+            return "boundary"
+        if getattr(self, "_edge_dock_resizing", False):
+            return "manual"
+        if getattr(self, "_os_sizing", False):
+            return "os"
+        return "other"
+
+    def _resize_diag_log_path(self):
+        """診断ログファイル（プロジェクトルートの resize_diag.log）。"""
+        try:
+            from pathlib import Path
+            # src/ui/main_window.py -> parents[2] == プロジェクトルート
+            return Path(__file__).resolve().parents[2] / "resize_diag.log"
+        except Exception:
+            from pathlib import Path
+            return Path.cwd() / "resize_diag.log"
+
+    def _resize_diag_append_line(self, line: str) -> None:
+        """stderr に加えてファイルへ1行追記。初回のみファイルを新規作成（前回ログ消去）。"""
+        try:
+            import sys
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        try:
+            p = self._resize_diag_log_path()
+            # プロセス内で一度だけ truncate
+            if not getattr(type(self), "_resize_diag_file_ready", False):
+                try:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                with open(p, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(line + "\n")
+                type(self)._resize_diag_file_ready = True
+                type(self)._resize_diag_file_path = str(p)
+            else:
+                with open(p, "a", encoding="utf-8", newline="\n") as f:
+                    f.write(line + "\n")
+        except Exception:
+            pass
+
+    def _resize_diag_emit(self, phase: str, *, force: bool = False, extra: str = "") -> None:
+        """1行ログ。force=False のとき同一署名は間引き。挙動は変更しない。
+
+        出力先: stderr および プロジェクトルート/resize_diag.log
+        """
+        if not getattr(self, "_RESIZE_DIAG_ENABLED", False):
+            return
+        try:
+            import time
+            from datetime import datetime
+            path = self._resize_diag_path()
+            mw_w, mw_h = int(self.width() or 0), int(self.height() or 0)
+            clip = getattr(self, "_edge_dock_clip", None)
+            root = getattr(self, "_edge_dock_root", None)
+            if clip is not None:
+                cg = clip.geometry()
+                clip_s = f"{cg.x()},{cg.y()},{cg.width()}x{cg.height()}"
+            else:
+                clip_s = "None"
+            if root is not None:
+                rg = root.geometry()
+                root_s = f"{rg.x()},{rg.y()},{rg.width()}x{rg.height()}"
+            else:
+                root_s = "None"
+            vp_s = "None"
+            try:
+                if self._scroll is not None and self._scroll.viewport() is not None:
+                    vp = self._scroll.viewport()
+                    vp_s = f"{vp.width()}x{vp.height()}"
+            except Exception:
+                pass
+            cols = []
+            wvs = []
+            for col in list(getattr(self, "_columns", None) or []):
+                try:
+                    col_vis = bool(col.isVisible())
+                except Exception:
+                    col_vis = False
+                if not col_vis:
+                    continue
+                try:
+                    cid = str(col.get_column_id() or "")[-8:]
+                    g = col.geometry()
+                    cw = int(getattr(col, "_current_width", 0) or 0)
+                    cols.append(f"{cid}:{g.x()},{g.width()}x{g.height()}/cw={cw}")
+                    for wi, wv in enumerate(getattr(col, "webviews", lambda: [])() or []):
+                        if wv is None:
+                            continue
+                        try:
+                            vis = int(bool(wv.isVisible()))
+                        except Exception:
+                            vis = -1
+                        try:
+                            ue = int(bool(wv.updatesEnabled()))
+                        except Exception:
+                            ue = -1
+                        try:
+                            wg = wv.geometry()
+                            wvs.append(
+                                f"{cid}[{wi}]:{wg.x()},{wg.width()}x{wg.height()}"
+                                f"/vis={vis}/ue={ue}"
+                            )
+                        except Exception:
+                            wvs.append(f"{cid}[{wi}]:ERR/vis={vis}/ue={ue}")
+                except Exception:
+                    continue
+            # mask 診断（読み取りのみ）
+            mask_empty = -1
+            mask_br = "None"
+            try:
+                mk = self.mask()
+                mask_empty = int(bool(mk.isEmpty()))
+                br = mk.boundingRect()
+                mask_br = f"{br.x()},{br.y()},{br.width()}x{br.height()}"
+            except Exception:
+                pass
+            mw_rect = f"0,0,{mw_w}x{mw_h}"
+            sig = (
+                f"{path}|{mw_w}x{mw_h}|{clip_s}|{root_s}|{vp_s}|"
+                f"{mask_empty}|{mask_br}|{'|'.join(cols)}|{'|'.join(wvs)}"
+            )
+            self._resize_diag_throttle_n = int(getattr(self, "_resize_diag_throttle_n", 0) or 0) + 1
+            if not force and sig == getattr(self, "_resize_diag_last_sig", None):
+                return
+            # 連続リサイズ中は同一 geometry 署名以外でも 3 回に 1 回は出す（途中フレーム）
+            if not force and self._resize_diag_throttle_n % 3 != 1:
+                if sig == getattr(self, "_resize_diag_last_sig", None):
+                    return
+            self._resize_diag_last_sig = sig
+            self._resize_diag_seq = int(getattr(self, "_resize_diag_seq", 0) or 0) + 1
+            seq = self._resize_diag_seq
+            t = time.monotonic()
+            wall = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            line = (
+                f"[RESIZE_DIAG] wall={wall} t={t:.4f} seq={seq} path={path} phase={phase} "
+                f"os={int(bool(getattr(self,'_os_sizing',False)))} "
+                f"manual={int(bool(getattr(self,'_edge_dock_resizing',False)))} "
+                f"revealed={int(bool(getattr(self,'_edge_dock_revealed',False)))} "
+                f"anim={int(bool(getattr(self,'_edge_dock_animating',False)))} "
+                f"dock={int(bool(getattr(self,'_edge_dock_enabled',False)))} "
+                f"mw={mw_w}x{mw_h} clip={clip_s} root={root_s} vp={vp_s} "
+                f"mask_empty={mask_empty} mask_br={mask_br} mw_rect={mw_rect} "
+                f"cols=[{';'.join(cols)}] wvs=[{';'.join(wvs)}]"
+            )
+            if extra:
+                line = line + " " + extra
+            self._resize_diag_append_line(line)
+        except Exception as exc:
+            try:
+                self._resize_diag_append_line(f"[RESIZE_DIAG] LOG_ERROR {exc!r}")
+            except Exception:
+                pass
+
+
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -1439,7 +1620,7 @@ class MainWindow(QMainWindow):
                             ):
                                 return
                         else:
-                            ok = wh.startSystemResize(edges)
+                            wh.startSystemResize(edges)
                             return
                 if self._edge_dock_enabled:
                     try:
@@ -1575,7 +1756,7 @@ class MainWindow(QMainWindow):
         self._win_min_btn.setIconSize(QSize(12, 12))
         self._win_min_btn.setFixedSize(24, 24)
         self._win_min_btn.setToolTip("最小化")
-        self._win_min_btn.clicked.connect(self.showMinimized)
+        self._win_min_btn.clicked.connect(self._minimize_window)
         top_bar_layout.addWidget(self._win_min_btn)
 
         self._win_max_btn = QToolButton()
@@ -1709,11 +1890,11 @@ class MainWindow(QMainWindow):
             #column_resize_handle {
                 background-color: transparent;
             }
-            #column_resize_handle[hint="true"] #boundary_hint_bar {
-                background-color: rgba(122, 158, 218, 0.18);
-            }
+            /* hover 色は _BoundaryHintBar.paintEvent が描く。stylesheet で色を重ねない */
+            #column_resize_handle[hint="true"] #boundary_hint_bar,
             #boundary_hint_bar {
                 background-color: transparent;
+                border: none;
             }
             #url_bar {
                 background-color: #181c26;
@@ -1723,13 +1904,13 @@ class MainWindow(QMainWindow):
                 color: #f1f3f7;
                 selection-background-color: #2f517d;
             }
-            #back_btn, #forward_btn, #reload_btn, #home_btn {
+            #back_btn, #forward_btn, #reload_btn, #home_btn, #stow_self_btn {
                 background-color: transparent;
                 border: none;
                 color: #93a5c4;
                 border-radius: 4px;
             }
-            #back_btn:hover, #forward_btn:hover, #reload_btn:hover, #home_btn:hover {
+            #back_btn:hover, #forward_btn:hover, #reload_btn:hover, #home_btn:hover, #stow_self_btn:hover {
                 background-color: rgba(148, 178, 230, 0.1);
             }
             #close_btn {
@@ -2264,10 +2445,35 @@ class MainWindow(QMainWindow):
         h = min(max(180, int(h)), screen.height())
         return QSize(w, h)
 
+    def _get_edge_offset(self, edge: str | None = None) -> float:
+        edge = edge or self._edge_dock_direction
+        offsets = getattr(self, "_edge_dock_edge_offsets", None)
+        if not isinstance(offsets, dict):
+            offsets = {}
+        try:
+            v = float(offsets.get(edge, getattr(self, "_edge_dock_edge_offset", 0.5)))
+        except (TypeError, ValueError):
+            v = 0.5
+        return max(0.0, min(1.0, v))
+
+    def _set_edge_offset(self, offset: float, edge: str | None = None) -> None:
+        edge = edge or self._edge_dock_direction
+        try:
+            offset = max(0.0, min(1.0, float(offset)))
+        except (TypeError, ValueError):
+            offset = 0.5
+        if not isinstance(getattr(self, "_edge_dock_edge_offsets", None), dict):
+            self._edge_dock_edge_offsets = {
+                "left": 0.5, "right": 0.5, "top": 0.5, "bottom": 0.5,
+            }
+        self._edge_dock_edge_offsets[edge] = offset
+        if edge == self._edge_dock_direction:
+            self._edge_dock_edge_offset = offset
+
     def _expanded_geometry_for_edge(self, edge: str, size: QSize | None = None) -> QRect:
         screen = self._get_screen_geometry()
         size = size or self._panel_size_for_edge(edge)
-        offset = float(self._edge_dock_edge_offset)
+        offset = self._get_edge_offset(edge)
         if edge in ("left", "right"):
             usable = max(0, screen.height() - size.height())
             y = screen.top() + int(usable * offset)
@@ -2303,7 +2509,7 @@ class MainWindow(QMainWindow):
         screen = self._get_screen_geometry()
         size = self._panel_size()
         edge = self._edge_dock_direction
-        offset = float(self._edge_dock_edge_offset)
+        offset = self._get_edge_offset(edge)
         ind = self.EDGE_DOCK_INDICATOR_WIDTH
 
         if edge in ("left", "right"):
@@ -2322,6 +2528,48 @@ class MainWindow(QMainWindow):
         else:
             y = screen.bottom() - ind + 1
         return QRect(x, y, size.width(), ind)
+
+    def _local_strip_rect(
+        self,
+        edge: str | None = None,
+        fw: int | None = None,
+        fh: int | None = None,
+    ) -> QRect:
+        """Window-local indicator strip. Never store global screen coords in
+        _dock_slide_strip_geom — mask/reveal math is always local to the HWND."""
+        edge = edge or self._edge_dock_direction
+        ind = max(1, int(self.EDGE_DOCK_INDICATOR_WIDTH))
+        if fw is None:
+            fw = max(1, int(self.width()))
+        if fh is None:
+            fh = max(1, int(self.height()))
+        fw, fh = max(1, int(fw)), max(1, int(fh))
+        if edge == "bottom":
+            return QRect(0, max(0, fh - ind), fw, ind)
+        if edge == "top":
+            return QRect(0, 0, fw, ind)
+        if edge == "right":
+            return QRect(max(0, fw - ind), 0, ind, fh)
+        return QRect(0, 0, ind, fh)
+
+
+    def _slide_offscreen_geometry(self, full: QRect, edge: str | None = None) -> QRect:
+        """開始/終了位置。
+        Right/Left/Top: フルサイズのまま画面外へ位置スライド。
+        Bottom: サイズ変更禁止（native surface 安定）。full と同じ geometry を返す。
+        Bottom の stow は mask reveal で表現する（Taskbar 非侵入 + HWND 非 resize）。
+        """
+        edge = edge or self._edge_dock_direction
+        ind = max(1, int(self.EDGE_DOCK_INDICATOR_WIDTH))
+        fw, fh = max(1, full.width()), max(1, full.height())
+        if edge == "right":
+            return QRect(full.x() + fw - ind, full.y(), fw, fh)
+        if edge == "left":
+            return QRect(full.x() - fw + ind, full.y(), fw, fh)
+        if edge == "bottom":
+            # 位置スライド不可（Taskbar 侵入）。full のまま返し、reveal は mask で行う。
+            return QRect(full)
+        return QRect(full.x(), full.y() - fh + ind, fw, fh)
 
     def _panel_global_rect(self) -> QRect:
         full = self._expanded_geometry()
@@ -2407,15 +2655,14 @@ class MainWindow(QMainWindow):
         saved_direction = self._edge_dock_direction
         if saved_direction not in ("left", "right", "top", "bottom"):
             saved_direction = "right"
-        saved_offset = float(self._edge_dock_edge_offset)
-        saved_offset = max(0.0, min(1.0, saved_offset))
+        saved_offset = self._get_edge_offset(saved_direction)
         saved_monitor = int(getattr(self, "_edge_dock_monitor_index", 0) or 0)
 
         g = self.geometry()
         self._edge_dock_normal_geometry = QRect(g.x(), g.y(), g.width(), g.height())
         self._edge_dock_enabled = True
         self._edge_dock_direction = saved_direction
-        self._edge_dock_edge_offset = saved_offset
+        self._set_edge_offset(saved_offset, saved_direction)
         self._edge_dock_monitor_index = saved_monitor
         self._edge_dock_animating = False
         self._edge_dock_revealed = True
@@ -2428,10 +2675,21 @@ class MainWindow(QMainWindow):
         full = self._expanded_geometry()
         self.setMinimumSize(1, 1)
         self.setMaximumSize(16777215, 16777215)
-        self.setGeometry(full)
         self._dock_shape_mask_key = None
-        self._apply_dock_shape_mask(full.width(), full.height())
-        self._apply_reveal_mask(1.0)
+        full = self._apply_dock_toplevel_geometry(full)
+        self._dock_slide_full_geom = QRect(full)
+        try:
+            self._dock_slide_strip_geom = self._local_strip_rect(
+                self._edge_dock_direction, full.width(), full.height()
+            )
+        except Exception:
+            self._dock_slide_strip_geom = QRect(self._collapsed_geometry())
+        self._apply_dock_shape_mask(full.width(), full.height(), force=True)
+        try:
+            self._set_dock_content_updates(True)
+            self.setUpdatesEnabled(True)
+        except Exception:
+            pass
 
         self._setup_edge_detector()
         if self._edge_detector:
@@ -2462,6 +2720,54 @@ class MainWindow(QMainWindow):
 
         self._update_edge_dock_ui()
 
+
+    def _apply_dock_toplevel_geometry(self, target: QRect, *, sync_children: bool = True) -> QRect:
+        """Dock の top-level geometry と clip/root を同一更新単位で揃える。
+
+        実機ログ: setGeometry(MW) だけ先に走ると root/vp が前モードサイズのまま
+        の中間フレームが描画され黒ゴーストになる。
+
+        - 縮小方向: 先に clip/root を目標サイズへ → その後 MW
+        - 拡大方向: 親制約上 MW を先に広げる必要がある → 直後に clip/root
+        いずれの場合も、このメソッドを抜けた時点で mw と root の目標サイズは一致する。
+        """
+        target = QRect(target)
+        fw = max(1, int(target.width()))
+        fh = max(1, int(target.height()))
+        target.setWidth(fw)
+        target.setHeight(fh)
+        cur = QRect(self.geometry())
+        clip = getattr(self, "_edge_dock_clip", None)
+        root = getattr(self, "_edge_dock_root", None)
+
+        def _sync_clip_root() -> None:
+            if not sync_children:
+                return
+            cg = QRect(0, 0, fw, fh)
+            if clip is not None and clip.geometry() != cg:
+                clip.setGeometry(cg)
+            if root is not None:
+                if not root.isVisible():
+                    try:
+                        root.show()
+                    except Exception:
+                        pass
+                if root.geometry() != cg:
+                    root.setGeometry(cg)
+
+        shrinking = fw <= max(1, cur.width()) and fh <= max(1, cur.height())
+        if shrinking:
+            _sync_clip_root()
+            if cur != target:
+                self.setGeometry(target)
+            # setGeometry 中の resizeEvent 副作用後も目標に戻す
+            _sync_clip_root()
+        else:
+            if cur != target:
+                self.setGeometry(target)
+            _sync_clip_root()
+        return QRect(self.geometry())
+
     def _start_edge_dock(self) -> None:
         if self._edge_dock_enabled:
             return
@@ -2477,9 +2783,10 @@ class MainWindow(QMainWindow):
         g = self.geometry()
         self._edge_dock_normal_geometry = QRect(g.x(), g.y(), g.width(), g.height())
         self._edge_dock_enabled = True
-        self._edge_dock_revealed = False
-        self._edge_dock_reveal_progress = 0.0
         self._edge_dock_animating = False
+        # ON 時点から展開済み（収納 strip を経由しない）
+        self._edge_dock_revealed = True
+        self._edge_dock_reveal_progress = 1.0
         try:
             self._update_stow_restore_rail()
         except Exception:
@@ -2487,42 +2794,93 @@ class MainWindow(QMainWindow):
 
         if self._edge_dock_direction not in ("left", "right", "top", "bottom"):
             self._edge_dock_direction = self._detect_edge_dock_direction()
-        self._edge_dock_edge_offset = self._calculate_edge_offset()
+        # 最後にドラッグで決めた方向別オフセットをそのまま使う（ウィンドウ中心から再計算しない）
+        self._edge_dock_edge_offset = self._get_edge_offset(self._edge_dock_direction)
 
         full = self._expanded_geometry()
-        self.setGeometry(full)
+        self.setMinimumSize(1, 1)
+        self.setMaximumSize(16777215, 16777215)
+        # Main→Dock isolation: hide/show ではなく opacity で旧 Main を消し、Dock 最終状態を commit
+        self._edge_dock_switching = True
+        self._transition_isolate_begin()
         try:
-            self.setWindowOpacity(1.0)
+            self._dock_shape_mask_key = None
+            full = self._apply_dock_toplevel_geometry(full)
+            self._dock_slide_full_geom = QRect(full)
+            self._dock_slide_strip_geom = QRect(self._collapsed_geometry())
+            fw, fh = max(1, full.width()), max(1, full.height())
+
+            self._setup_edge_detector()
+            if self._edge_detector:
+                self._edge_detector.set_pinned_open(True)
+                self._edge_detector.set_state(PanelState.EXPANDED)
+                self._edge_detector.start()
+
+            self._set_interactive(True)
+            self._set_window_opaque(True)
+            self._settle_layout_and_webengines(dock_mode=True)
+            self._apply_dock_content_insets()
+            try:
+                self._apply_dock_shape_mask(fw, fh, force=True)
+            except Exception:
+                pass
+            self._apply_edge_dock_always_on_top()
+            self._apply_edge_dock_zoom()
+        finally:
+            self._edge_dock_switching = False
+            self._transition_isolate_commit_visible(apply_mask=True)
+        # Dock ON 完了コミット（ログ根拠）:
+        # - 直後に mask_br が旧 Main (例: 2273x1303) のまま残る
+        # - 可視 WE が vis=1 / updatesEnabled=0 のまま残る
+        # isolate_begin で False にした updates と、切替前の window mask が
+        # settle/commit だけでは確実に戻らない実機ケースがあるため、
+        # ON 完了時点で現行 Dock geometry の shape mask を force 適用し、
+        # コンテンツ updates を明示的に再有効化する。
+        # resizeEvent / 手動リサイズの毎フレーム経路には触れない。
+        try:
+            fw = max(1, int(self.width() or 0))
+            fh = max(1, int(self.height() or 0))
+            self._dock_shape_mask_key = None
+            if fw > 1 and fh > 1:
+                self._apply_dock_shape_mask(fw, fh, force=True)
         except Exception:
             pass
-        self._dock_shape_mask_key = None
-        self._apply_dock_shape_mask(full.width(), full.height())
-
-        self._setup_edge_detector()
-
-        if self._edge_detector:
-            self._edge_detector.set_pinned_open(True)
-        self._expand_edge_dock()
-        QTimer.singleShot(1500, self._end_edge_dock_reveal_grace)
-
-        self._edge_detector.start()
-
         try:
-            self._ensure_dock_notify_timer()
+            self._set_dock_content_updates(True)
+        except Exception:
+            pass
+        try:
+            self.setUpdatesEnabled(True)
+        except Exception:
+            pass
+        QTimer.singleShot(1500, self._end_edge_dock_reveal_grace)
+        try:
             self._ensure_edge_dock_fs_timer()
         except Exception:
             pass
         try:
+            self._ensure_dock_notify_timer()
             self._schedule_dock_notify_refresh()
         except Exception:
             pass
-
         self._update_edge_dock_ui()
-        self._save_edge_dock_settings()
+        try:
+            self._save_edge_dock_settings()
+        except Exception:
+            pass
 
     def _end_edge_dock_reveal_grace(self) -> None:
-        if self._edge_dock_enabled and self._edge_detector:
-            self._edge_detector.set_pinned_open(False)
+        if not self._edge_dock_enabled or self._edge_detector is None:
+            return
+        # Dock ON 直後の 1.5s grace が、ユーザーが既にウィンドウドラッグ中の
+        # タイミングで発火すると pinned が外れ、keep-zone 誤判定→自動収納→
+        # 細い strip だけが動く状態になる。ドラッグ/リサイズ中は pin を維持し、
+        # mouseRelease 側で通常どおり unpin する。
+        if getattr(self, "_edge_dock_dragging", False) or getattr(
+            self, "_edge_dock_resizing", False
+        ):
+            return
+        self._edge_detector.set_pinned_open(False)
 
     def _detect_edge_dock_direction(self) -> str:
         screen = QGuiApplication.screenAt(self.pos())
@@ -2544,26 +2902,18 @@ class MainWindow(QMainWindow):
         }
         return min(distances, key=distances.get)
 
-    def _calculate_edge_offset(self) -> float:
-        screen = QGuiApplication.screenAt(self.pos())
-        if not screen:
-            screen = QGuiApplication.primaryScreen()
-        geom = screen.availableGeometry()
-        center = self.geometry().center()
-
-        direction = self._edge_dock_direction
-        if direction == "left":
-            return (center.y() - geom.top()) / geom.height()
-        elif direction == "right":
-            return (center.y() - geom.top()) / geom.height()
-        elif direction == "top":
-            return (center.x() - geom.left()) / geom.width()
-        else:
-            return (center.x() - geom.left()) / geom.width()
-
     def _stop_edge_dock(self) -> None:
         if not self._edge_dock_enabled:
             return
+
+        # OFF 前に現在方向の展開サイズを lr/tb プロファイルへ確定（次回 ON/方向復帰用）
+        try:
+            if self._edge_dock_revealed and not self._edge_dock_animating:
+                self._store_live_size(
+                    self.width(), self.height(), self._edge_dock_direction
+                )
+        except Exception:
+            pass
 
         try:
             self._save_columns()
@@ -2572,6 +2922,31 @@ class MainWindow(QMainWindow):
                 self._settings_manager.save_window_geometry_dock(self.saveGeometry())
         except Exception:
             pass
+
+        # Dock OFF 後の normal pack へ渡す個別収納スナップショット
+        # （bind の転写が account/type 不一致で落ちても維持する）
+        dock_indiv_snap: list[tuple[str, str, int]] = []
+        try:
+            for col in list(getattr(self, "_columns", None) or []):
+                try:
+                    if not getattr(col, "is_individually_stowed", lambda: False)():
+                        continue
+                    aid = str(col.get_account_id() or "")
+                    if not aid:
+                        continue
+                    try:
+                        ctype = str(col.get_column_type() or "")
+                    except Exception:
+                        ctype = str(getattr(col, "_column_type", "") or "")
+                    try:
+                        pw = int(getattr(col, "_width_before_individual_stow", 0) or 0)
+                    except Exception:
+                        pw = 0
+                    dock_indiv_snap.append((aid, ctype, pw))
+                except Exception:
+                    continue
+        except Exception:
+            dock_indiv_snap = []
 
         self._edge_dock_enabled = False
         self._edge_dock_revealed = False
@@ -2594,6 +2969,10 @@ class MainWindow(QMainWindow):
         try:
             self.setUpdatesEnabled(False)
             self._set_dock_content_updates(False)
+            try:
+                self._set_dock_webengines_visible(False)
+            except Exception:
+                pass
         except Exception:
             pass
         try:
@@ -2609,18 +2988,43 @@ class MainWindow(QMainWindow):
                 try:
                     raw = self._settings_manager.get_window_geometry_normal()
                     if raw:
-
                         self.restoreGeometry(raw)
                         g = None
                 except Exception:
                     g = None
             if g is not None:
-
                 try:
                     self.setGeometry(g.x(), g.y(), g.width(), g.height())
                 except Exception:
                     pass
-            self._apply_mode_column_visibility()
+            # geometry 確定後に column/WE を共通経路で起こす（方向切替・Dock ON と同じ順序）
+            # MainWindow 復帰時は WebView を parent.rect で強制しない（境界ハンドルを覆うため）
+            try:
+                self._apply_mode_column_visibility()
+            except Exception:
+                pass
+            # bind 後も個別収納が付いていなければスナップショットから再適用
+            if dock_indiv_snap:
+                try:
+                    self._reapply_individual_stow_from_snap(dock_indiv_snap)
+                except Exception:
+                    pass
+            try:
+                if self._scroll is not None:
+                    slay = self._scroll.layout()
+                    if slay is not None:
+                        slay.invalidate()
+                        slay.activate()
+            except Exception:
+                pass
+            try:
+                self._fit_columns()
+            except Exception:
+                pass
+            try:
+                self._set_dock_content_updates(True)
+            except Exception:
+                pass
             try:
                 self._set_dock_webengines_visible(True)
             except Exception:
@@ -2650,6 +3054,8 @@ class MainWindow(QMainWindow):
                 pass
 
         self._update_edge_dock_ui()
+        # layout セットル後に境界ハンドルの状態を最終確定する
+        QTimer.singleShot(0, self._update_boundary_visibility)
         try:
             self._ensure_dock_notify_timer()
             self._update_dock_notify_visual()
@@ -2744,64 +3150,239 @@ class MainWindow(QMainWindow):
         if chosen in dir_actions:
             self._set_edge_dock_direction(dir_actions[chosen])
 
-    def _set_edge_dock_direction(self, direction: str) -> None:
-        if direction not in ("left", "right", "top", "bottom"):
-            return
-        if self._edge_animator is not None:
-            self._edge_animator.stop()
-        self._edge_dock_animating = False
-        self._edge_dock_profile_lock = True
-        self._edge_dock_geom_start = None
-        self._edge_dock_geom_end = None
-        self._edge_dock_direction = direction
-        if self._edge_detector:
-            self._edge_detector.set_params(edge=direction)
-        if self._edge_dock_enabled:
-            self._dock_shape_mask_key = None
-            self._clear_collapse_slide_proxy()
-            root = getattr(self, "_edge_dock_root", None)
-            if root is not None and not root.isVisible():
-                root.show()
-            if self._edge_dock_revealed:
-                size = self._panel_size_for_edge(direction)
-                full = self._expanded_geometry_for_edge(direction, size)
-                profile = "TB" if direction in ("top", "bottom") else "LR"
-                self.setGeometry(full)
-                self._edge_dock_anim_cw = max(1, full.width())
-                self._edge_dock_anim_ch = max(1, full.height())
-                if root is not None:
-                    root.setGeometry(0, 0, full.width(), full.height())
-                clip = getattr(self, "_edge_dock_clip", None)
-                if clip is not None:
-                    clip.setGeometry(0, 0, full.width(), full.height())
-                self._edge_dock_reveal_progress = 1.0
-                self._apply_reveal_mask(1.0)
-                self._fit_columns()
-            else:
-                collapsed = self._collapsed_geometry()
-                self.setGeometry(collapsed)
-                self._edge_dock_reveal_progress = 0.0
-                root = getattr(self, "_edge_dock_root", None)
-                clip = getattr(self, "_edge_dock_clip", None)
-                if root is not None and clip is not None:
-                    cg = QRect(0, 0, max(1, collapsed.width()), max(1, collapsed.height()))
-                    clip.setGeometry(cg)
-                    root.setGeometry(cg)
-        self._edge_dock_column_count = self._column_count_for_edge(direction)
-        if self._edge_dock_revealed:
-            self._update_edge_dock_column_visibility()
+    def _transition_isolate_begin(self) -> None:
+        """切替 isolation 開始（軽量版）。
+
+        禁止した手法とその実機結果:
+          - hide()/show() … DWM 再マップで黒帯
+          - opacity=0 … ウィンドウ全体が暗転（黒帯の移動）
+          - WE setVisible(False) … 復帰後に一部カラムの native surface が描画されない
+
+        本実装は updates だけ止め、geometry/mask を同一 HWND 上で commit する。
+        WE は非表示にしない（描画継続）。
+        """
+        self.setUpdatesEnabled(False)
+        try:
+            self._set_dock_content_updates(False)
+        except Exception:
+            pass
+
+    def _transition_isolate_commit_visible(self, *, apply_mask: bool = True) -> None:
+        """最終 mask を確定してから updates を戻し、可視 WE の geometry を同期する。"""
+        try:
+            self._set_dock_content_updates(True)
+        except Exception:
+            pass
+        if apply_mask:
             try:
-                self._set_dock_content_updates(True)
-                self._set_dock_webengines_visible(True)
+                if self._edge_dock_enabled:
+                    if self._edge_dock_revealed:
+                        self._apply_dock_shape_mask(force=True)
+                    elif self._edge_dock_direction == "bottom":
+                        self._apply_reveal_mask(0.0)
+                    else:
+                        self._apply_dock_shape_mask(force=True)
+                else:
+                    self._update_window_mask()
             except Exception:
                 pass
+        if not self.isVisible():
+            try:
+                self.show()
+            except Exception:
+                pass
+            if apply_mask:
+                try:
+                    if self._edge_dock_enabled:
+                        if self._edge_dock_revealed:
+                            self._apply_dock_shape_mask(force=True)
+                        elif self._edge_dock_direction == "bottom":
+                            self._apply_reveal_mask(0.0)
+                        else:
+                            self._apply_dock_shape_mask(force=True)
+                    else:
+                        self._update_window_mask()
+                except Exception:
+                    pass
+        self.setUpdatesEnabled(True)
+        # 過去 isolation で opacity=0 のまま残っていた場合の復帰
+        try:
+            if abs(float(self.windowOpacity()) - 1.0) > 0.01:
+                self.setWindowOpacity(1.0)
+        except Exception:
+            pass
+        # WE は切替中も visible のまま。geometry だけ親に合わせて再同期し、
+        # setVisible トグルによる native surface 喪失を避ける。
+        try:
+            self._sync_visible_webengine_geometries()
+        except Exception:
+            pass
+        try:
+            self.update()
+        except Exception:
+            pass
+
+    def _sync_visible_webengine_geometries(self) -> None:
+        """可視 WE の再描画を促す。
+
+        Mayotter1 方針: WebView は body layout 配下なので parent.rect への
+        明示 setGeometry はしない（境界ハンドルを覆い、幅調節を壊すため）。
+        geometry は layout / fit_columns に任せ、update のみ行う。
+        """
+        for col in list(getattr(self, "_columns", None) or []):
+            try:
+                if not col.isVisible():
+                    continue
+            except Exception:
+                continue
+            for wv in getattr(col, "webviews", lambda: [])() or []:
+                try:
+                    if wv is None:
+                        continue
+                    if not wv.isVisible():
+                        # pack 切替で新たに起こした列のみ表示
+                        wv.setVisible(True)
+                    wv.update()
+                except Exception:
+                    pass
+
+
+
+    def _layout_safe_webview_geometry(self, wv) -> None:
+        """WE を body layout と境界ハンドルを壊さない範囲で親に合わせる。
+
+        parent.rect 全埋めは resize handle を覆うため禁止（Mayotter1 方針）。
+        handle が visible ならその幅を除いた矩形だけを適用する。
+        """
+        if wv is None:
+            return
+        parent = wv.parentWidget()
+        if parent is None or not parent.size().isValid():
+            return
+        _diag_before = None
+        try:
+            if getattr(self, "_RESIZE_DIAG_ENABLED", False):
+                _diag_before = (int(wv.x()), int(wv.y()), int(wv.width()), int(wv.height()),
+                                int(parent.width()), int(parent.height()))
+        except Exception:
+            _diag_before = None
+        handle_w = 0
+        # findChildren 探索はしない。既存の AccountColumn._resize_handle を直接参照。
+        try:
+            w = parent
+            while w is not None:
+                if type(w).__name__ == "AccountColumn":
+                    h = getattr(w, "_resize_handle", None)
+                    if h is not None and h.isVisible():
+                        handle_w = max(0, int(h.width() or 0))
+                    break
+                w = w.parentWidget()
+        except Exception:
+            handle_w = 0
+        pw = max(1, parent.width())
+        ph = max(1, parent.height())
+        ww = max(1, pw - max(0, handle_w))
+        r = QRect(0, 0, ww, ph)
+        if wv.geometry() != r:
+            wv.setGeometry(r)
+        try:
+            if getattr(self, "_RESIZE_DIAG_ENABLED", False) and _diag_before is not None:
+                after = (int(wv.x()), int(wv.y()), int(wv.width()), int(wv.height()))
+                cid = ""
+                try:
+                    w = parent
+                    while w is not None:
+                        if type(w).__name__ == "AccountColumn":
+                            cid = str(w.get_column_id() or "")[-8:]
+                            break
+                        w = w.parentWidget()
+                except Exception:
+                    pass
+                self._resize_diag_emit(
+                    "layout_safe_wv",
+                    force=False,
+                    extra=(
+                        f"cid={cid} handle_w={handle_w} "
+                        f"parent={pw}x{ph} before={_diag_before[2]}x{_diag_before[3]} "
+                        f"after={after[2]}x{after[3]} applied={int(wv.geometry()==r)}"
+                    ),
+                )
+        except Exception:
+            pass
+
+
+    def _commit_dock_container_geometry(
+        self, full: QRect, *, revealed: bool, keep_updates_off: bool = False
+    ) -> None:
+        """方向切替・サイズ確定。Container と top-level geometry を分離して commit する。
+
+        1) updates を止めたまま目標 geometry へ直接 setGeometry
+        2) 最終 mask を適用（clearMask しない）
+        3) WE は非表示にしない（暗転の主因だった）
+        4) keep_updates_off=True のときは呼び出し側が updates を戻す
+        """
+        self.setUpdatesEnabled(False)
+        try:
+            full = self._apply_dock_toplevel_geometry(QRect(full))
+            fw, fh = max(1, full.width()), max(1, full.height())
+            self._dock_slide_full_geom = QRect(full)
+            self._dock_slide_strip_geom = self._local_strip_rect(
+                self._edge_dock_direction, fw, fh
+            )
+            self._edge_dock_reveal_progress = 1.0 if revealed else 0.0
+            self._last_reveal_mask_rect = None
             self._dock_shape_mask_wh = None
-            self._apply_dock_shape_mask()
-        self._edge_dock_profile_lock = False
-        self._save_edge_dock_settings()
-        self._update_edge_dock_ui()
-        self._apply_edge_dock_always_on_top()
-        self._apply_edge_dock_zoom()
+            self._dock_shape_mask_key = None
+            edge = self._edge_dock_direction
+            if revealed:
+                try:
+                    self._apply_dock_shape_mask(fw, fh, force=True)
+                except Exception:
+                    pass
+            elif edge == "bottom":
+                self._apply_reveal_mask(0.0)
+            else:
+                try:
+                    self._apply_dock_shape_mask(fw, fh, force=True)
+                except Exception:
+                    pass
+        finally:
+            if not keep_updates_off:
+                self.setUpdatesEnabled(True)
+
+    def _set_edge_dock_direction(self, direction: str) -> None:
+        """方向切替の公開入口。通常 expand/collapse アニメは通らない。
+
+        Dock OFF 時は state だけ更新。ON 時は _apply_edge_direction_discrete
+        （hide → 最終 geometry/layout/mask/WE 確定 → show）のみを使う。
+        size-lerp / 中間 geometry / union は一切行わない。
+        """
+        if direction not in ("left", "right", "top", "bottom"):
+            return
+        if direction == getattr(self, "_edge_dock_direction", None) and self._edge_dock_enabled:
+            # 同一方向の再適用は hide/show を伴う切替をしない
+            return
+        if self._edge_animator is not None:
+            try:
+                self._edge_animator.stop()
+            except Exception:
+                pass
+        self._edge_dock_animating = False
+        self._edge_dock_geom_start = None
+        self._edge_dock_geom_end = None
+
+        if not self._edge_dock_enabled:
+            self._edge_dock_direction = direction
+            self._edge_dock_edge_offset = self._get_edge_offset(direction)
+            self._edge_dock_column_count = self._column_count_for_edge(direction)
+            if self._edge_detector:
+                self._edge_detector.set_params(edge=direction)
+            self._save_edge_dock_settings()
+            self._update_edge_dock_ui()
+            return
+
+        self._clear_collapse_slide_proxy()
+        self._apply_edge_direction_discrete(direction)
 
     def _toggle_edge_dock(self) -> None:
         if self._edge_dock_enabled:
@@ -2828,10 +3409,11 @@ class MainWindow(QMainWindow):
         p = QPainter(self)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         dirty = event.rect()
-        if self._edge_dock_animating and getattr(self, "_dock_window_lerp", False):
+        if self._edge_dock_animating or getattr(self, "_dock_collapse_we_active", False):
+            p.fillRect(dirty, bg_color)
             p.end()
             return
-        if getattr(self, "_edge_dock_opaque_fill", False) or self._edge_dock_revealed or self._edge_dock_animating:
+        if getattr(self, "_edge_dock_opaque_fill", False) or self._edge_dock_revealed:
             p.fillRect(dirty, bg_color)
         else:
             ind = self.EDGE_DOCK_INDICATOR_WIDTH
@@ -2848,6 +3430,33 @@ class MainWindow(QMainWindow):
             p.fillRect(r.intersected(dirty), bg_color)
         p.end()
 
+    def _mask_region_for_reveal_rect(self, r: QRect) -> QRegion:
+        """見える矩形に角丸を付けた region（ウィンドウ座標）。"""
+        if r.width() <= 0 or r.height() <= 0:
+            return QRegion()
+        try:
+            radius = int(getattr(self, "_corner_radius", 12) or 12)
+        except Exception:
+            radius = 12
+        local = self._dock_outer_round_region(r.width(), r.height(), radius)
+        return local.translated(r.x(), r.y())
+
+    def _reveal_visible_rect(self, t: float, full: QRect, strip: QRect) -> QRect:
+        edge = self._edge_dock_direction
+        fw, fh = max(1, full.width()), max(1, full.height())
+        t = max(0.0, min(1.0, float(t)))
+        if edge in ("right", "left"):
+            sw = max(1, min(strip.width(), fw))
+            vis = max(1, int(sw + t * (fw - sw)))
+            if edge == "right":
+                return QRect(fw - vis, 0, vis, fh)
+            return QRect(0, 0, vis, fh)
+        sh = max(1, min(strip.height(), fh))
+        vis = max(1, int(sh + t * (fh - sh)))
+        if edge == "bottom":
+            return QRect(0, fh - vis, fw, vis)
+        return QRect(0, 0, fw, vis)
+
     def _apply_reveal_mask(self, t: float) -> None:
         t = max(0.0, min(1.0, float(t)))
         self._edge_dock_reveal_progress = t
@@ -2857,9 +3466,9 @@ class MainWindow(QMainWindow):
         if root is None or clip is None:
             return
 
-        ind = self.EDGE_DOCK_INDICATOR_WIDTH
-        edge = self._edge_dock_direction
-
+        # window_lerp: Right/Left/Top の position-slide（サイズ固定）
+        # サイズは変わらないので角丸 shape mask を毎フレーム維持する。
+        # clearMask は角を黒い四角に見せるため使わない
         if self._edge_dock_animating and getattr(self, "_dock_window_lerp", False):
             full = getattr(self, "_dock_slide_full_geom", None)
             strip = getattr(self, "_dock_slide_strip_geom", None)
@@ -2879,44 +3488,54 @@ class MainWindow(QMainWindow):
                         self.setGeometry(g)
                     finally:
                         self._dock_geom_reenter = False
-                    if abs(cg.width() - g.width()) >= 3 or abs(cg.height() - g.height()) >= 3:
-                        self._apply_dock_shape_mask(g.width(), g.height())
                     try:
-                        import time as _time
-                        n = int(getattr(self, "_dock_anim_frame_n", 0)) + 1
-                        self._dock_anim_frame_n = n
-                        t0 = float(getattr(self, "_dock_anim_t0", 0.0) or 0.0)
-                        if t0 <= 0.0:
-                            self._dock_anim_t0 = _time.monotonic()
-                        elif n % 8 == 0:
-                            elapsed = _time.monotonic() - t0
+                        self._dock_anim_frame_n = int(getattr(self, "_dock_anim_frame_n", 0)) + 1
                     except Exception:
                         pass
-                fw, fh = max(1, g.width()), max(1, g.height())
-                if clip.geometry() != QRect(0, 0, fw, fh):
-                    clip.setGeometry(0, 0, fw, fh)
+                gw, gh = max(1, g.width()), max(1, g.height())
+                if clip.geometry() != QRect(0, 0, gw, gh):
+                    clip.setGeometry(0, 0, gw, gh)
                 if not root.isVisible():
                     root.show()
-                if root.geometry() != QRect(0, 0, fw, fh):
-                    root.setGeometry(0, 0, fw, fh)
-            if getattr(self, "_dock_expand_we_pending", False) and t >= 0.40:
-                self._dock_expand_we_pending = False
+                if root.geometry() != QRect(0, 0, gw, gh):
+                    root.setGeometry(0, 0, gw, gh)
+                # サイズ固定の position-slide: 角丸 mask を維持（clearMask 禁止）
                 try:
-                    if max(1, self.width()) > self.EDGE_DOCK_INDICATOR_WIDTH * 4:
-                        self._fit_columns()
+                    self._apply_dock_shape_mask(gw, gh, force=True)
                 except Exception:
                     pass
-                self._set_dock_content_updates(True)
-                self._set_dock_webengines_visible(True)
-                self._apply_edge_dock_zoom()
             return
 
+        # mask reveal: Bottom（常時 full geometry + strip→full mask）
+        # および非 animating 時のフォールバック
         fw = max(1, self.width())
         fh = max(1, self.height())
         if clip.geometry() != QRect(0, 0, fw, fh):
             clip.setGeometry(0, 0, fw, fh)
         if root.size() != QSize(fw, fh) or root.pos() != QPoint(0, 0):
             root.setGeometry(0, 0, fw, fh)
+        if not root.isVisible():
+            root.show()
+        strip = getattr(self, "_dock_slide_strip_geom", None)
+        if strip is None:
+            ind = max(1, int(self.EDGE_DOCK_INDICATOR_WIDTH))
+            edge = self._edge_dock_direction
+            if edge == "bottom":
+                strip = QRect(0, max(0, fh - ind), fw, ind)
+            elif edge == "top":
+                strip = QRect(0, 0, fw, ind)
+            elif edge == "right":
+                strip = QRect(max(0, fw - ind), 0, ind, fh)
+            else:
+                strip = QRect(0, 0, ind, fh)
+        local_full = QRect(0, 0, fw, fh)
+        local_strip = QRect(
+            max(0, strip.x()), max(0, strip.y()),
+            max(1, min(strip.width(), fw)), max(1, min(strip.height(), fh)),
+        )
+        r = self._reveal_visible_rect(t, local_full, local_strip)
+        self.setMask(self._mask_region_for_reveal_rect(r))
+
     def _clear_collapse_slide_proxy(self) -> None:
         self._dock_slide_use_proxy = False
         self._dock_collapse_chrome = False
@@ -2927,6 +3546,7 @@ class MainWindow(QMainWindow):
         self._dock_anim_t0 = 0.0
         self._dock_slide_full_geom = None
         self._dock_slide_strip_geom = None
+        self._last_reveal_mask_rect = None
         proxy = getattr(self, "_dock_slide_proxy", None)
         self._dock_slide_proxy = None
         if proxy is not None:
@@ -2934,6 +3554,11 @@ class MainWindow(QMainWindow):
 
     def _expand_edge_dock(self) -> None:
         if self._edge_dock_revealed or self._edge_dock_animating:
+            return
+        # 方向切替中は通常展開アニメを開始しない（経路分離）
+        if getattr(self, "_edge_dock_switching", False) or getattr(
+            self, "_edge_dock_dir_transitioning", False
+        ):
             return
 
         if self._should_suppress_edge_expand():
@@ -2961,45 +3586,130 @@ class MainWindow(QMainWindow):
         self._clear_collapse_slide_proxy()
 
         full = self._expanded_geometry_for_edge(self._edge_dock_direction)
-        strip = QRect(self.geometry())
-        if (
-            strip.width() <= self.EDGE_DOCK_INDICATOR_WIDTH * 4
-            or strip.height() <= self.EDGE_DOCK_INDICATOR_WIDTH * 4
-        ):
-            strip = QRect(self._collapsed_geometry())
+        edge = self._edge_dock_direction
+        start = self._slide_offscreen_geometry(full, edge)
         self.setMinimumSize(1, 1)
         self.setMaximumSize(16777215, 16777215)
-        self._dock_shape_mask_wh = None
         self._dock_slide_full_geom = QRect(full)
-        self._dock_slide_strip_geom = QRect(strip)
+        # Bottom: strip は local 座標の indicator 矩形（mask 用）。他は画面外 geometry。
+        if edge == "bottom":
+            ind = max(1, int(self.EDGE_DOCK_INDICATOR_WIDTH))
+            self._dock_slide_strip_geom = QRect(0, max(0, full.height() - ind), full.width(), ind)
+            # Bottom は HWND サイズ変更禁止。mask reveal を使う。
+            self._dock_window_lerp = False
+        else:
+            self._dock_slide_strip_geom = QRect(start)
+            self._dock_window_lerp = True
         self._edge_dock_anim_cw = max(1, full.width())
         self._edge_dock_anim_ch = max(1, full.height())
-        self._dock_window_lerp = True
+        self._edge_dock_reveal_progress = 0.0
+        self._last_reveal_mask_rect = None
+
+        # 展開中は WE 非表示。finish で geometry 確定後に一度だけ表示。
         self._dock_expand_we_pending = True
+        self._dock_collapse_we_active = False
         self._dock_anim_frame_n = 0
         self._dock_anim_t0 = 0.0
         self._set_window_opaque(True)
+        try:
+            self._set_dock_webengines_visible(False)
+        except Exception:
+            pass
 
-        if not self.isVisible():
-            self.show()
-        self._edge_dock_column_count = self._column_count_for_edge()
-        count = min(self._edge_dock_column_count, max(1, len(self._columns)))
-        stowed_set = self._stowed_column_set()
-        for i, col in enumerate(self._columns):
-            if i < count and col not in stowed_set:
-                col.show()
-            else:
-                col.hide()
         root = getattr(self, "_edge_dock_root", None)
-        if root is not None and not root.isVisible():
-            root.show()
-        # WebEngine は hide せず updates だけ止める（setVisible(False) は再表示時の黒画面が長い）
-        self._set_dock_content_updates(False)
+        clip = getattr(self, "_edge_dock_clip", None)
+        fw, fh = max(1, full.width()), max(1, full.height())
+        full_c = QRect(0, 0, fw, fh)
 
-        if self.geometry() != strip:
-            self.setGeometry(strip)
-        self._apply_dock_shape_mask(strip.width(), strip.height())
-        self._apply_reveal_mask(0.0)
+        if edge == "bottom":
+            # 常時 full geometry。初回だけ strip→full へ一回リサイズする可能性があるが、
+            # 以降はサイズ固定。reveal は mask のみ。
+            self.setUpdatesEnabled(False)
+            try:
+                if self.geometry() != full:
+                    self.setGeometry(full)
+                if clip is not None and clip.geometry() != full_c:
+                    clip.setGeometry(full_c)
+                if root is not None:
+                    if root.geometry() != full_c:
+                        root.setGeometry(full_c)
+                    if not root.isVisible():
+                        root.show()
+                # strip mask を即適用（暗い全画面の露出を防ぐ）
+                r0 = self._reveal_visible_rect(0.0, full_c, self._dock_slide_strip_geom)
+                self.setMask(self._mask_region_for_reveal_rect(r0))
+            finally:
+                self.setUpdatesEnabled(True)
+        else:
+            if self.geometry() != start:
+                self.setGeometry(start)
+            if clip is not None and clip.geometry() != full_c:
+                clip.setGeometry(full_c)
+            if root is not None:
+                if root.geometry() != full_c:
+                    root.setGeometry(full_c)
+                if not root.isVisible():
+                    root.show()
+            # Right/Left/Top: サイズ固定のままスライド。角丸 mask を維持する。
+            try:
+                self._apply_dock_shape_mask(fw, fh, force=True)
+            except Exception:
+                pass
+
+        # count ベースで余分カラムを hide しない。
+        # _edge_dock_column_count と packs 長さが一時的にずれると、
+        # 既存 AccountColumn が hide されたまま「消えた」ように見える。
+        # 表示可否は stowed / _bind_active_columns に任せる。
+        stowed_set = set(getattr(self, "_stowed_columns", set()) or set())
+        for col in self._columns:
+            if col not in stowed_set:
+                try:
+                    if not col.isVisible():
+                        col.show()
+                except Exception:
+                    pass
+            else:
+                try:
+                    col.hide()
+                except Exception:
+                    pass
+        self._update_edge_dock_column_visibility()
+        try:
+            self._apply_dock_content_insets()
+        except Exception:
+            pass
+        try:
+            if root is not None:
+                lay = root.layout()
+                if lay is not None:
+                    lay.invalidate()
+                    lay.activate()
+            if self._scroll is not None:
+                slay = self._scroll.layout()
+                if slay is not None:
+                    slay.invalidate()
+                    slay.activate()
+            self._fit_columns()
+            for col in self._columns:
+                if not col.isVisible():
+                    continue
+                for wv in getattr(col, "webviews", lambda: [])():
+                    if wv is None:
+                        continue
+                    try:
+                        self._layout_safe_webview_geometry(wv)
+                    except Exception:
+                        pass
+                    try:
+                        page = wv.page()
+                        if page is not None:
+                            page.setBackgroundColor(QColor("#0b111f"))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self._set_dock_content_updates(True)
+        # WE は finish まで非表示のまま（展開開始の黒四角・native surface 露出を防ぐ）
         self._edge_animator.animate_reveal(0.0, 1.0, self._edge_animator.expand_duration, True)
 
     def _set_dock_content_updates(self, enabled: bool) -> None:
@@ -3024,6 +3734,277 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
+    def _dock_blackband_snapshot(self, phase: str) -> None:
+        """黒帯診断スナップショット（計測のみ・状態変更なし）。
+
+        visible_columns_right_edge と client_width の差分で
+        A(未充填) / B(充填済みだが黒) / C(一時不足) / D(geometry正常で合成側) を判定する材料を出す。
+        """
+        if not getattr(self, "_dock_blackband_diag", False):
+            return
+        try:
+            g = self.geometry()
+            client_w = max(0, int(self.width() or 0))
+            client_h = max(0, int(self.height() or 0))
+            clip = getattr(self, "_edge_dock_clip", None)
+            root = getattr(self, "_edge_dock_root", None)
+            scroll = getattr(self, "_scroll", None)
+            scroll_content = getattr(self, "_scroll_content", None)
+
+            def _rg(w):
+                if w is None:
+                    return "None"
+                try:
+                    r = w.geometry()
+                    return f"{r.x()},{r.y()} {r.width()}x{r.height()}"
+                except Exception:
+                    return "err"
+
+            vp_geom = "None"
+            vp_w = 0
+            try:
+                if scroll is not None and scroll.viewport() is not None:
+                    vp = scroll.viewport()
+                    vr = vp.geometry()
+                    vp_geom = f"{vr.x()},{vr.y()} {vr.width()}x{vr.height()}"
+                    vp_w = int(vr.width() or 0)
+            except Exception:
+                pass
+
+            target_w = 0
+            try:
+                target_w = int(self._column_layout_target_width() or 0)
+            except Exception:
+                target_w = -1
+
+            cols = list(getattr(self, "_columns", None) or [])
+            visible = []
+            for i, col in enumerate(cols):
+                try:
+                    if not col.isVisible():
+                        continue
+                except Exception:
+                    continue
+                try:
+                    cg = col.geometry()
+                    visible.append(
+                        {
+                            "i": i,
+                            "x": int(cg.x()),
+                            "y": int(cg.y()),
+                            "w": int(cg.width()),
+                            "h": int(cg.height()),
+                            "right": int(cg.x() + cg.width()),
+                        }
+                    )
+                except Exception:
+                    visible.append({"i": i, "err": True})
+
+            sum_w = 0
+            right_edge = 0
+            for v in visible:
+                if v.get("err"):
+                    continue
+                sum_w += int(v.get("w") or 0)
+                right_edge = max(right_edge, int(v.get("right") or 0))
+
+            # scroll_content / viewport 右端（ウィンドウローカルに近い値）
+            content_right = 0
+            try:
+                if scroll_content is not None:
+                    cr = scroll_content.geometry()
+                    content_right = int(cr.x() + cr.width())
+            except Exception:
+                pass
+            viewport_right = 0
+            try:
+                if scroll is not None and scroll.viewport() is not None:
+                    # viewport は scroll 内ローカル。scroll の x を足して client 系に近づける
+                    sx = int(scroll.geometry().x()) if scroll is not None else 0
+                    viewport_right = sx + vp_w
+            except Exception:
+                pass
+
+            gap_client = client_w - right_edge if visible else None
+            underfilled = None
+            if visible and client_w > 0:
+                underfilled = right_edge < client_w
+
+            we_info = []
+            try:
+                for v in visible:
+                    if v.get("err"):
+                        continue
+                    col = cols[int(v["i"])]
+                    for j, wv in enumerate(getattr(col, "webviews", lambda: [])()):
+                        if wv is None:
+                            continue
+                        try:
+                            wg = wv.geometry()
+                            we_info.append(
+                                f"col{v['i']}.we{j}="
+                                f"{wg.x()},{wg.y()} {wg.width()}x{wg.height()}"
+                                f" vis={wv.isVisible()}"
+                            )
+                        except Exception:
+                            we_info.append(f"col{v['i']}.we{j}=err")
+            except Exception:
+                pass
+
+            mask_info = "unknown"
+            try:
+                # Qt: mask() が空でなければ設定あり。boundingRect を取る
+                m = self.mask()
+                if m is None or m.isEmpty():
+                    mask_info = "none_or_empty"
+                else:
+                    br = m.boundingRect()
+                    mask_info = f"set bounds={br.x()},{br.y()} {br.width()}x{br.height()}"
+            except Exception:
+                mask_info = "err"
+
+            verdict = "n/a"
+            if underfilled is True:
+                verdict = "A_or_C_UNDERFILL right_edge<client_w"
+            elif underfilled is False:
+                verdict = "B_or_D_FILLED right_edge>=client_w (black may be composite/mask/WE)"
+            elif not visible:
+                verdict = "NO_VISIBLE_COLUMNS"
+
+            switch = getattr(self, "_dock_blackband_diag_switch", "")
+            parts = [
+                f"[DOCK BLACKBAND DIAG] phase={phase}",
+                f"switch={switch!r}",
+                f"direction={getattr(self, '_edge_dock_direction', None)!r}",
+                f"main_geom={g.x()},{g.y()} {g.width()}x{g.height()}",
+                f"client={client_w}x{client_h}",
+                f"clip={_rg(clip)}",
+                f"root={_rg(root)}",
+                f"scroll={_rg(scroll)}",
+                f"viewport={vp_geom}",
+                f"scroll_content={_rg(scroll_content)}",
+                f"active_col_count={len(cols)}",
+                f"visible_col_count={len(visible)}",
+                f"visible_cols={visible!r}",
+                f"sum_visible_w={sum_w}",
+                f"visible_columns_right_edge={right_edge}",
+                f"client_right_edge={client_w}",
+                f"client_minus_visible_right={gap_client}",
+                f"underfilled={underfilled}",
+                f"column_layout_target_width={target_w}",
+                f"content_right={content_right}",
+                f"viewport_right_approx={viewport_right}",
+                f"delta_lastCol_vs_client={gap_client}",
+                f"delta_content_vs_client={client_w - content_right if content_right else None}",
+                f"delta_viewport_vs_client={client_w - viewport_right if viewport_right else None}",
+                f"we={we_info!r}",
+                f"mask={mask_info}",
+                f"win_visible={self.isVisible()}",
+                f"updates_enabled={self.updatesEnabled()}",
+                f"verdict={verdict}",
+            ]
+            print(" ".join(parts), file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(
+                f"[DOCK BLACKBAND DIAG] phase={phase} SNAPSHOT_ERROR={exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _settle_layout_and_webengines(self, *, dock_mode: bool) -> None:
+        """geometry 確定後に column / WE を正しい順で起こす共通経路。
+
+        呼び出し側は setUpdatesEnabled(False) のまま呼び、この関数の後に
+        setUpdatesEnabled(True) すること。順序を崩すと黒帯・黒Windowが出る。
+
+        1) column 可視性
+        2) scroll layout activate（viewport 幅を確定）
+        3) fit_columns
+        4) 可視 column の WE geometry を parent.rect に合わせる
+        5) content updates ON
+        6) WE visible ON
+        """
+        # --- 診断: bind 前後（ロジック変更なし） ---
+        if getattr(self, "_dock_blackband_diag", False):
+            self._dock_blackband_snapshot("1_before_bind_active_columns")
+        try:
+            if dock_mode:
+                self._update_edge_dock_column_visibility()
+            else:
+                self._apply_mode_column_visibility()
+        except Exception:
+            pass
+        if getattr(self, "_dock_blackband_diag", False):
+            self._dock_blackband_snapshot("2_after_bind_active_columns")
+        # geometry 変更直後（hide 中含む）でも column が埋める幅を確定させる。
+        # root/clip を window client に合わせ、layout.activate で scroll 寸法を先に通す。
+        try:
+            root = getattr(self, "_edge_dock_root", None)
+            clip = getattr(self, "_edge_dock_clip", None)
+            if dock_mode and root is not None:
+                fw = max(1, int(self.width() or 0))
+                fh = max(1, int(self.height() or 0))
+                if fw > 1 and fh > 1:
+                    target_r = QRect(0, 0, fw, fh)
+                    if clip is not None and clip.geometry() != target_r:
+                        clip.setGeometry(target_r)
+                    if root.geometry() != target_r:
+                        root.setGeometry(target_r)
+                try:
+                    rlay = root.layout()
+                    if rlay is not None:
+                        rlay.invalidate()
+                        rlay.activate()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if self._scroll is not None:
+                slay = self._scroll.layout()
+                if slay is not None:
+                    slay.invalidate()
+                    slay.activate()
+        except Exception:
+            pass
+        if getattr(self, "_dock_blackband_diag", False):
+            self._dock_blackband_snapshot("3_before_fit_columns")
+        try:
+            self._fit_columns()
+        except Exception:
+            pass
+        if getattr(self, "_dock_blackband_diag", False):
+            self._dock_blackband_snapshot("4_after_fit_columns")
+        try:
+            # Mayotter1: fit 後は layout に任せ、WE を parent.rect で覆わない
+            # （境界ハンドルを塞ぎ幅調節不能になるのを防ぐ）
+            for col in self._columns:
+                if not col.isVisible():
+                    continue
+                for wv in getattr(col, "webviews", lambda: [])():
+                    if wv is None:
+                        continue
+                    try:
+                        wv.update()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            self._update_boundary_visibility()
+        except Exception:
+            pass
+        try:
+            self._set_dock_content_updates(True)
+        except Exception:
+            pass
+        try:
+            self._set_dock_webengines_visible(True)
+        except Exception:
+            pass
+        if getattr(self, "_dock_blackband_diag", False):
+            self._dock_blackband_snapshot("4b_after_we_visible")
+
     def _enforce_all_columns_single_tab(self) -> None:
         for col in self._columns:
             if hasattr(col, "_enforce_single_visible_tab"):
@@ -3033,26 +4014,68 @@ class MainWindow(QMainWindow):
                     pass
 
     def _set_dock_webengines_visible(self, visible: bool) -> None:
-        for col in self._columns:
+        # 複数カラムを同時に起こすとき、中間フレームで index0 だけが
+        # 未描画 surface として露出するのを避けるため root 単位で更新を止める。
+        root = getattr(self, "_edge_dock_root", None)
+        if root is not None:
             try:
-                if not visible:
-                    for wv in getattr(col, "webviews", lambda: [])():
-                        wv.setVisible(False)
-                else:
-                    if hasattr(col, "_enforce_single_visible_tab"):
-                        col._enforce_single_visible_tab()
+                root.setUpdatesEnabled(False)
+            except Exception:
+                pass
+        try:
+            for col in self._columns:
+                try:
+                    if not visible:
+                        for wv in getattr(col, "webviews", lambda: [])():
+                            wv.setVisible(False)
                     else:
+                        # 非表示 column は触らない（mode 切替で隠した列の surface を起こさない）
+                        if not col.isVisible():
+                            continue
                         tabs = list(getattr(col, "webviews", lambda: [])())
                         cur = int(getattr(col, "_current_tab", 0) or 0)
                         if tabs:
                             cur = max(0, min(cur, len(tabs) - 1))
                         for i, wv in enumerate(tabs):
-                            wv.setVisible(i == cur)
-            except Exception:
-                pass
+                            if wv is None:
+                                continue
+                            if i == cur:
+                                try:
+                                    page = wv.page()
+                                    if page is not None:
+                                        page.setBackgroundColor(QColor("#0b111f"))
+                                except Exception:
+                                    pass
+                        if hasattr(col, "_enforce_single_visible_tab"):
+                            col._enforce_single_visible_tab()
+                        else:
+                            for i, wv in enumerate(tabs):
+                                if wv is not None:
+                                    wv.setVisible(i == cur)
+                except Exception:
+                    pass
+        finally:
+            if root is not None:
+                try:
+                    root.setUpdatesEnabled(True)
+                except Exception:
+                    pass
 
     def _collapse_edge_dock(self) -> None:
         if not self._edge_dock_revealed or self._edge_dock_animating:
+            return
+        # 手動リサイズ中は EdgeDetector の should_collapse 等による収納を開始しない。
+        # ログ: 展開リサイズ中は revealed=1/cols あり → 途中で revealed=0/cols=[] へ落ちていた。
+        if getattr(self, "_edge_dock_resizing", False):
+            return
+        # ウィンドウドラッグ中も同様。Dock ON 直後の grace 解除や keep-zone
+        # 誤判定で移動中に strip 化しない（通常の自動収納自体は無効化しない）。
+        if getattr(self, "_edge_dock_dragging", False):
+            return
+        # 方向切替中は通常収納アニメを開始しない（経路分離）
+        if getattr(self, "_edge_dock_switching", False) or getattr(
+            self, "_edge_dock_dir_transitioning", False
+        ):
             return
         if hasattr(self, '_edge_cursor_forced') and self._edge_cursor_forced:
             from PySide6.QtWidgets import QApplication
@@ -3072,30 +4095,52 @@ class MainWindow(QMainWindow):
 
         self._store_live_size(self.width(), self.height(), self._edge_dock_direction)
         self._snap_to_dock_edge()
-        live = QRect(self.geometry())
-        self._dock_slide_full_geom = QRect(live)
-        self._dock_slide_strip_geom = QRect(self._collapsed_geometry())
-        self._edge_dock_anim_cw = max(1, live.width())
-        self._edge_dock_anim_ch = max(1, live.height())
-        self._dock_window_lerp = True
         self._dock_expand_we_pending = False
         self._dock_anim_frame_n = 0
         self._dock_anim_t0 = 0.0
-
         self._set_window_opaque(True)
+        self._dock_collapse_we_active = False
         self._set_dock_content_updates(False)
+
+        edge = self._edge_dock_direction
+        full = QRect(self.geometry())
+        if full.width() <= self.EDGE_DOCK_INDICATOR_WIDTH * 2 or full.height() <= self.EDGE_DOCK_INDICATOR_WIDTH * 2:
+            full = self._expanded_geometry_for_edge(edge)
+        # Right/Left/Top: position-slide (global strip/full). Bottom: full HWND + local mask.
+        if edge == "bottom":
+            if self.geometry() != full:
+                self.setGeometry(full)
+            full = QRect(self.geometry())
+            self._dock_slide_full_geom = QRect(full)
+            self._dock_slide_strip_geom = self._local_strip_rect(
+                "bottom", full.width(), full.height()
+            )
+            self._dock_window_lerp = False
+        else:
+            end = self._slide_offscreen_geometry(full, edge)
+            self._dock_slide_full_geom = QRect(full)
+            self._dock_slide_strip_geom = QRect(end)  # global for position-slide lerp
+            self._dock_window_lerp = True
+            # clearMask しない。角丸を維持したまま位置スライドする。
+
+        self._edge_dock_anim_cw = max(1, full.width())
+        self._edge_dock_anim_ch = max(1, full.height())
 
         root = getattr(self, "_edge_dock_root", None)
         clip = getattr(self, "_edge_dock_clip", None)
+        fw, fh = max(1, full.width()), max(1, full.height())
         if root is not None and not root.isVisible():
             root.show()
         if clip is not None:
-            clip.setGeometry(0, 0, live.width(), live.height())
+            clip.setGeometry(0, 0, fw, fh)
         if root is not None:
-            root.setGeometry(0, 0, live.width(), live.height())
+            root.setGeometry(0, 0, fw, fh)
+        if edge != "bottom":
+            try:
+                self._apply_dock_shape_mask(fw, fh, force=True)
+            except Exception:
+                pass
 
-        self._apply_dock_shape_mask(live.width(), live.height())
-        self._apply_reveal_mask(1.0)
         self._edge_animator.animate_reveal(1.0, 0.0, self._edge_animator.collapse_duration, False)
 
     def _on_expand_finished(self) -> None:
@@ -3127,7 +4172,14 @@ class MainWindow(QMainWindow):
             if lay is not None:
                 lay.invalidate()
                 lay.activate()
-        self._apply_reveal_mask(1.0)
+        # clearMask で矩形を一瞬出さない。最終角丸を直接適用する。
+        try:
+            self._apply_dock_shape_mask(fw, fh, force=True)
+        except Exception:
+            try:
+                self._apply_reveal_mask(1.0)
+            except Exception:
+                pass
         self._snap_to_dock_edge()
         self._store_live_size(self.width(), self.height(), self._edge_dock_direction)
         self._set_window_opaque(True)
@@ -3140,6 +4192,16 @@ class MainWindow(QMainWindow):
             lay = root.layout()
             if lay is not None:
                 lay.activate()
+        # root layout activate で scroll viewport の resize が queue されるため、
+        # scroll layout を明示 activate して viewport 幅を確定させる
+        try:
+            if self._scroll is not None:
+                slay = self._scroll.layout()
+                if slay is not None:
+                    slay.invalidate()
+                    slay.activate()
+        except Exception:
+            pass
         # WebEngine は geometry 確定後に再表示する（先に visible にすると黒画面が伸びる）
         if fw > self.EDGE_DOCK_INDICATOR_WIDTH * 4:
             self._fit_columns()
@@ -3150,17 +4212,15 @@ class MainWindow(QMainWindow):
                 for wv in getattr(col, "webviews", lambda: [])():
                     if wv is None:
                         continue
-                    parent = wv.parentWidget()
-                    if parent is None or not parent.size().isValid():
-                        continue
-                    r = parent.rect()
-                    if r.width() <= 0 or r.height() <= 0:
-                        continue
-                    if wv.geometry() != r:
-                        wv.setGeometry(r)
+                    try:
+                        self._layout_safe_webview_geometry(wv)
+                    except Exception:
+                        pass
         except Exception:
             pass
-        # bind 後の _columns (lr/tb) に対して updates / WebEngine 表示を適用する
+        # 最終外形確定後に root を出し、その後 WebEngine を一度だけ表示
+        if root is not None and not root.isVisible():
+            root.show()
         try:
             self._set_dock_content_updates(True)
         except Exception:
@@ -3181,6 +4241,8 @@ class MainWindow(QMainWindow):
                             wv.setUpdatesEnabled(True)
                     except Exception:
                         pass
+                    # native surface の再描画を促し、藍色背景が残るのを防ぐ
+                    wv.update()
         except Exception:
             pass
         # fit / WebEngine geometry 確定後に境界を再同期（切替直後の 0 高さ handle を防ぐ）
@@ -3188,7 +4250,11 @@ class MainWindow(QMainWindow):
             self._update_boundary_visibility()
         except Exception:
             pass
-        self._apply_dock_shape_mask()
+        self._apply_dock_shape_mask(force=True)
+        try:
+            self._resync_dock_after_show()
+        except Exception:
+            pass
         self._apply_edge_dock_always_on_top()
         self._apply_edge_dock_zoom()
         try:
@@ -3281,7 +4347,14 @@ class MainWindow(QMainWindow):
     def _enter_edge_dock_fs_yield(self) -> None:
         self._edge_dock_fs_yielded = True
         try:
-            if self._edge_dock_revealed and not self._edge_dock_animating:
+            # ドラッグ/リサイズ中は _collapse_edge_dock 側ガードで弾かれるが、
+            # 明示的にスキップして意図を残す。
+            if (
+                self._edge_dock_revealed
+                and not self._edge_dock_animating
+                and not getattr(self, "_edge_dock_dragging", False)
+                and not getattr(self, "_edge_dock_resizing", False)
+            ):
                 self._collapse_edge_dock()
         except Exception:
             pass
@@ -3329,10 +4402,12 @@ class MainWindow(QMainWindow):
             pass
         try:
             if not self._edge_dock_revealed:
-                collapsed = self._collapsed_geometry()
-                if self.geometry() != collapsed:
-                    self.setGeometry(collapsed)
-                self._apply_dock_shape_mask(collapsed.width(), collapsed.height())
+                full_c = self._expanded_geometry_for_edge(self._edge_dock_direction)
+                if self.geometry() != full_c:
+                    self.setGeometry(full_c)
+                self._dock_slide_full_geom = QRect(full_c)
+                self._dock_slide_strip_geom = QRect(self._collapsed_geometry())
+                self._apply_reveal_mask(0.0)
         except Exception:
             pass
         try:
@@ -3342,6 +4417,7 @@ class MainWindow(QMainWindow):
 
     def _on_collapse_finished(self) -> None:
         self._dock_window_lerp = False
+        self._dock_collapse_we_active = False
         self._dock_expand_we_pending = False
         self._clear_collapse_slide_proxy()
         self._edge_dock_animating = False
@@ -3349,29 +4425,67 @@ class MainWindow(QMainWindow):
         self._edge_dock_revealed = False
         self._edge_detector.set_state(PanelState.COLLAPSED)
         self._edge_dock_reveal_progress = 0.0
-        # 収納中も WebEngine は hide しない（再展開時の setVisible コストを避ける）
-        # updates は止めたまま。カラムも非 stow は表示したまま 4px にクリップされる
         self._set_dock_content_updates(False)
+        # Stage 8 collapse finish:
+        # スライド終了時点では Window は画面外 full にある。
+        # ここで setGeometry(full on-screen) すると、mask 適用前に
+        # 展開状態が1フレーム再露出する（残像の主因）。
+        # 内容を完全に消してから strip サイズへ確定する。
         try:
-            stowed_set = self._stowed_column_set()
+            self._set_dock_webengines_visible(False)
         except Exception:
-            stowed_set = set()
+            pass
         for col in self._columns:
-            if col in stowed_set:
+            try:
                 col.hide()
-        collapsed = self._collapsed_geometry()
-        self.setMinimumSize(1, 1)
-        self.setMaximumSize(16777215, 16777215)
-        if self.geometry() != collapsed:
-            self.setGeometry(collapsed)
+            except Exception:
+                pass
         root = getattr(self, "_edge_dock_root", None)
         clip = getattr(self, "_edge_dock_clip", None)
-        if root is not None and clip is not None:
-            cg = QRect(0, 0, max(1, collapsed.width()), max(1, collapsed.height()))
-            clip.setGeometry(cg)
-            root.setGeometry(cg)
-        self._dock_shape_mask_key = None
-        self._apply_dock_shape_mask(collapsed.width(), collapsed.height())
+        if root is not None:
+            try:
+                root.hide()
+            except Exception:
+                pass
+        full = self._expanded_geometry_for_edge(self._edge_dock_direction)
+        strip = self._collapsed_geometry()
+        edge = self._edge_dock_direction
+        self.setMinimumSize(1, 1)
+        self.setMaximumSize(16777215, 16777215)
+        self.setUpdatesEnabled(False)
+        try:
+            if edge == "bottom":
+                # Bottom: HWND は常時 full。strip mask だけ残す（次回 expand で resize 不要）。
+                if self.geometry() != full:
+                    self.setGeometry(full)
+                fw, fh = max(1, full.width()), max(1, full.height())
+                if clip is not None:
+                    clip.setGeometry(0, 0, fw, fh)
+                if root is not None:
+                    root.setGeometry(0, 0, fw, fh)
+                ind = max(1, int(self.EDGE_DOCK_INDICATOR_WIDTH))
+                local_strip = QRect(0, max(0, fh - ind), fw, ind)
+                self.setMask(self._mask_region_for_reveal_rect(local_strip))
+                self._dock_slide_strip_geom = QRect(local_strip)
+            else:
+                # 他方向: indicator サイズへ直接確定。角丸は維持。
+                if self.geometry() != strip:
+                    self.setGeometry(strip)
+                sw, sh = max(1, strip.width()), max(1, strip.height())
+                if clip is not None:
+                    clip.setGeometry(0, 0, sw, sh)
+                if root is not None:
+                    root.setGeometry(0, 0, sw, sh)
+                self._dock_slide_strip_geom = QRect(strip)
+                try:
+                    self._apply_dock_shape_mask(sw, sh, force=True)
+                except Exception:
+                    pass
+            self._dock_shape_mask_key = None
+            self._dock_slide_full_geom = QRect(full)
+            self._edge_dock_reveal_progress = 0.0
+        finally:
+            self.setUpdatesEnabled(True)
         self._set_window_opaque(True)
         self._set_interactive(False)
         try:
@@ -3381,6 +4495,14 @@ class MainWindow(QMainWindow):
                 self._update_dock_notify_visual()
             except Exception:
                 pass
+        # 収納完了後: pin解除と state 確定のうえ、トリガー上なら即展開判定
+        try:
+            det = self._edge_detector
+            if det is not None:
+                det.set_pinned_open(False)
+                det._tick()
+        except Exception:
+            pass
 
     def _force_dark_scrollbars(self, area) -> None:
         from PySide6.QtGui import QPalette, QColor
@@ -3595,7 +4717,14 @@ class MainWindow(QMainWindow):
 
     def _dock_notify_global_pos(self, d: int) -> tuple[int, int]:
         edge = str(getattr(self, "_edge_dock_direction", "right") or "right")
-        g = self.geometry()
+        # 収納中も HWND は full のままなので self.geometry() だと位置がずれる。
+        # 収納時は strip 相当の座標で置く（旧版と同じ見た目）。
+        collapsed = (
+            bool(self._edge_dock_enabled)
+            and (not bool(self._edge_dock_revealed))
+            and (not bool(getattr(self, "_edge_dock_animating", False)))
+        )
+        g = self._collapsed_geometry() if collapsed else self.geometry()
         half = max(1, d // 2)
         if edge == "right":
             x = g.x() - half
@@ -3641,7 +4770,6 @@ class MainWindow(QMainWindow):
         if sys.platform == "win32":
             try:
                 import ctypes
-                from ctypes import wintypes
                 hwnd = int(w.winId())
                 if hwnd:
                     user32 = ctypes.windll.user32
@@ -3713,6 +4841,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+
     def _layout_mode_key(self) -> str:
         # Dock 有効中は収納/展開に関わらず同一 pack を使う（追加が normal に逸れない）
         if self._edge_dock_enabled:
@@ -3777,7 +4906,6 @@ class MainWindow(QMainWindow):
 
     def _spawn_column_into_mode(self, mode: str, account_info: dict) -> None:
         from src.core.models import Account, Column as ColumnModel
-        from src.browser.webview import XWebView
 
         aid = account_info.get("account_id", "")
         if not aid:
@@ -3847,6 +4975,8 @@ class MainWindow(QMainWindow):
         column.boundary_dragged.connect(lambda delta, c=column: self._on_boundary_dragged(c, delta))
         column.boundary_drag_finished.connect(self._on_boundary_drag_finished)
         column.stow_right_requested.connect(self._stow_columns_right_of)
+        column.stow_self_requested.connect(self._stow_single_column)
+        column.restore_self_requested.connect(self._restore_single_column)
         column.reset_widths_requested.connect(self._reset_all_column_widths)
         column.reorder_requested.connect(
             lambda x, c=column: self._commit_column_reorder_at(c, x)
@@ -3913,6 +5043,84 @@ class MainWindow(QMainWindow):
                 info["column_type"] = "home" if len(lst) == 0 else "notifications"
             self._spawn_column_into_mode(mode, info)
 
+
+    def _ensure_mode_preferred_weights(self, mode: str, columns: list | None = None) -> None:
+        if not hasattr(self, "_mode_preferred_widths") or self._mode_preferred_widths is None:
+            self._mode_preferred_widths = {"normal": {}, "lr": {}, "tb": {}}
+        mode = mode or "normal"
+        dest = dict(self._mode_preferred_widths.get(mode) or {})
+        cols = list(columns if columns is not None else (getattr(self, "_columns", None) or []))
+        if not cols:
+            self._preferred_widths = dict(dest)
+            return
+
+        min_w = AccountColumn.MIN_WIDTH
+        default_w = float(AccountColumn.DEFAULT_WIDTH)
+
+        # 他モード preferred を (account_id, column_type) で索引
+        by_key: dict[tuple[str, str], float] = {}
+        try:
+            packs = self._service_packs()
+        except Exception:
+            packs = {}
+        for m, pref in list(self._mode_preferred_widths.items()):
+            if not pref:
+                continue
+            # 同一サービス pack のカラムで cid→account を解決
+            for col in list((packs or {}).get(m) or []):
+                try:
+                    cid = col.get_column_id()
+                    aid = str(col.get_account_id() or "")
+                    try:
+                        ctype = str(col.get_column_type() or "")
+                    except Exception:
+                        ctype = str(getattr(col, "_column_type", "") or "")
+                    w = float((pref or {}).get(cid) or 0)
+                    if not aid or w < min_w:
+                        continue
+                    by_key[(aid, ctype)] = w
+                    if (aid, "") not in by_key:
+                        by_key[(aid, "")] = w
+                except Exception:
+                    continue
+
+        changed = False
+        for col in cols:
+            try:
+                if getattr(col, "is_individually_stowed", lambda: False)():
+                    continue
+            except Exception:
+                pass
+            try:
+                cid = col.get_column_id()
+                aid = str(col.get_account_id() or "")
+                try:
+                    ctype = str(col.get_column_type() or "")
+                except Exception:
+                    ctype = str(getattr(col, "_column_type", "") or "")
+            except Exception:
+                continue
+            if not cid:
+                continue
+            if float(dest.get(cid) or 0) >= min_w:
+                continue
+            w = float(by_key.get((aid, ctype)) or by_key.get((aid, "")) or 0)
+            if w < min_w:
+                try:
+                    live = float(col.get_width() or 0)
+                except Exception:
+                    live = 0.0
+                if live >= min_w:
+                    w = live
+                else:
+                    w = default_w
+            dest[cid] = w
+            changed = True
+
+        if changed or not self._mode_preferred_widths.get(mode):
+            self._mode_preferred_widths[mode] = dict(dest)
+        self._preferred_widths = dict(dest)
+
     def _bind_active_columns(self, *, skip_ensure: bool = False) -> None:
         if not hasattr(self, "_twitter_packs") or not hasattr(self, "_grok_packs"):
             self._twitter_packs = {"normal": [], "lr": [], "tb": []}
@@ -3964,6 +5172,10 @@ class MainWindow(QMainWindow):
             if not hasattr(self, "_mode_preferred_widths") or self._mode_preferred_widths is None:
                 self._mode_preferred_widths = {"normal": {}, "lr": {}, "tb": {}}
             self._preferred_widths = dict(self._mode_preferred_widths.get(key) or {})
+            try:
+                self._ensure_mode_preferred_weights(key, self._columns)
+            except Exception:
+                pass
             for col in self._columns:
                 if col in stowed_set:
                     col.hide()
@@ -3983,6 +5195,33 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             return
+
+        # モード切替前に個別収納状態を順序付きで収集。
+        # pack ごとに AccountColumn 実体が別 UUID のため、column_id だけでは引き継げない。
+        # (account_id, column_type) の set だと同一 account の複数カラムが潰れるので list で持つ。
+        indiv_xfer: list[tuple[str, str, int]] = []
+        prev_list = list(getattr(self, "_columns", None) or [])
+        try:
+            for col in prev_list:
+                try:
+                    if not getattr(col, "is_individually_stowed", lambda: False)():
+                        continue
+                    aid = str(col.get_account_id() or "")
+                    if not aid:
+                        continue
+                    try:
+                        ctype = str(col.get_column_type() or "")
+                    except Exception:
+                        ctype = str(getattr(col, "_column_type", "") or "")
+                    try:
+                        pw = int(getattr(col, "_width_before_individual_stow", 0) or 0)
+                    except Exception:
+                        pw = 0
+                    indiv_xfer.append((aid, ctype, pw))
+                except Exception:
+                    continue
+        except Exception:
+            indiv_xfer = []
 
         if self._scroll_layout is not None:
             while self._scroll_layout.count():
@@ -4004,6 +5243,82 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_mode_preferred_widths") or self._mode_preferred_widths is None:
             self._mode_preferred_widths = {"normal": {}, "lr": {}, "tb": {}}
         self._preferred_widths = dict(self._mode_preferred_widths.get(key) or {})
+        try:
+            self._ensure_mode_preferred_weights(key, self._columns)
+        except Exception:
+            pass
+
+        # 新 pack へ個別収納を転写（Dock↔Main で勝手に展開しない）
+        if indiv_xfer:
+            normal_n = len(self._columns)
+            applied = 0
+            used: set[int] = set()
+
+            def _col_type(c) -> str:
+                try:
+                    return str(c.get_column_type() or "")
+                except Exception:
+                    return str(getattr(c, "_column_type", "") or "")
+
+            def _pick(aid: str, ctype: str):
+                # 1) account + type の未使用カラム
+                for i, col in enumerate(self._columns):
+                    if i in used:
+                        continue
+                    try:
+                        if str(col.get_account_id() or "") != aid:
+                            continue
+                    except Exception:
+                        continue
+                    if _col_type(col) == ctype:
+                        return i, col
+                # 2) account のみ（type 不一致・空のとき）
+                for i, col in enumerate(self._columns):
+                    if i in used:
+                        continue
+                    try:
+                        if str(col.get_account_id() or "") == aid:
+                            return i, col
+                    except Exception:
+                        continue
+                return None, None
+
+            for aid, ctype, pw in indiv_xfer:
+                if normal_n - applied <= 1:
+                    break
+                idx, col = _pick(aid, ctype)
+                if col is None:
+                    continue
+                try:
+                    if pw >= AccountColumn.MIN_WIDTH:
+                        col._width_before_individual_stow = pw
+                    if not getattr(col, "is_individually_stowed", lambda: False)():
+                        col.set_individually_stowed(True)
+                    used.add(idx)
+                    applied += 1
+                except Exception:
+                    continue
+
+            # account 対応が取れない場合: 同数なら index で引き継ぐ
+            if applied == 0 and len(prev_list) == normal_n and normal_n > 1:
+                for i, prev_col in enumerate(prev_list):
+                    if normal_n - applied <= 1:
+                        break
+                    try:
+                        if not getattr(prev_col, "is_individually_stowed", lambda: False)():
+                            continue
+                        col = self._columns[i]
+                        if i in used:
+                            continue
+                        pw = int(getattr(prev_col, "_width_before_individual_stow", 0) or 0)
+                        if pw >= AccountColumn.MIN_WIDTH:
+                            col._width_before_individual_stow = pw
+                        if not getattr(col, "is_individually_stowed", lambda: False)():
+                            col.set_individually_stowed(True)
+                        used.add(i)
+                        applied += 1
+                    except Exception:
+                        continue
 
         for col in self._columns:
             self._scroll_layout.addWidget(col)
@@ -4152,7 +5467,12 @@ class MainWindow(QMainWindow):
         else:
             self.setWindowFlags(flags & ~Qt.WindowType.WindowStaysOnTopHint)
         if self.isVisible():
+            # 黒帯診断: setWindowFlags 後の再 show は合成を再走らせうる
+            if getattr(self, "_dock_blackband_diag", False):
+                self._dock_blackband_snapshot("8a_always_on_top_before_reshow")
             self.show()
+            if getattr(self, "_dock_blackband_diag", False):
+                self._dock_blackband_snapshot("8a_always_on_top_after_reshow")
             if self._resize_filter is not None:
                 try:
                     self._resize_filter._cached_win_id = int(self.winId())
@@ -4317,27 +5637,22 @@ class MainWindow(QMainWindow):
         }
         return mapping.get(edges, Qt.CursorShape.ArrowCursor)
 
-    def _edge_target_geometry(self, edge: str, top_left: QPoint, screen: QRect) -> QRect:
-        psz = self._panel_size_for_edge(edge)
-        size = QSize(psz.width(), psz.height())
-        if edge in ("left", "right"):
-            x = screen.left() if edge == "left" else screen.right() - size.width() + 1
-            y = max(screen.top(), min(screen.bottom() - size.height() + 1, top_left.y()))
-            return QRect(x, y, size.width(), size.height())
-        y = screen.top() if edge == "top" else screen.bottom() - size.height() + 1
-        x = max(screen.left(), min(screen.right() - size.width() + 1, top_left.x()))
-        return QRect(x, y, size.width(), size.height())
-
-    def _start_edge_direction_transition(
-        self, new_edge: str, top_left: QPoint, screen: QRect
+    def _apply_edge_direction_discrete(
+        self, direction: str, target_geom: QRect | None = None
     ) -> None:
-        if getattr(self, "_edge_dock_dir_transitioning", False):
+        """方向切替（離散置換）。expand/collapse アニメは通らない。
+        opacity=0 で隔離して commit → mask 維持 → opacity=1。
+        """
+        if direction not in ("left", "right", "top", "bottom"):
             return
-        target = self._edge_target_geometry(new_edge, top_left, screen)
-        start = QRect(self.geometry())
-        if start == target:
-            self._finish_edge_direction_transition(new_edge, target)
-            return
+        if self._edge_animator is not None:
+            try:
+                self._edge_animator.stop()
+            except Exception:
+                pass
+        self._edge_dock_animating = False
+        self._edge_dock_geom_start = None
+        self._edge_dock_geom_end = None
 
         prev_anim = getattr(self, "_edge_dir_anim", None)
         if prev_anim is not None:
@@ -4348,92 +5663,195 @@ class MainWindow(QMainWindow):
             self._edge_dir_anim = None
 
         self._edge_dock_dir_transitioning = True
-        self._edge_dock_candidate_edge = new_edge
-        self._edge_dock_profile_lock = True
-        self._edge_dock_direction = new_edge
-        if self._edge_detector:
-            self._edge_detector.set_params(edge=new_edge)
-        if new_edge in ("left", "right"):
-            usable = max(1, screen.height() - target.height())
-            self._edge_dock_edge_offset = max(
-                0.0, min(1.0, (top_left.y() - screen.top()) / usable)
-            )
-        else:
-            usable = max(1, screen.width() - target.width())
-            self._edge_dock_edge_offset = max(
-                0.0, min(1.0, (top_left.x() - screen.left()) / usable)
-            )
-        self._edge_dock_column_count = self._column_count_for_edge(new_edge)
-
-        anim = QVariantAnimation(self)
-        anim.setStartValue(start)
-        anim.setEndValue(target)
-        anim.setDuration(max(120, min(280, int(self.EDGE_DOCK_ANIMATION_DURATION))))
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.valueChanged.connect(self._on_edge_direction_frame)
-        anim.finished.connect(
-            lambda e=new_edge, g=QRect(target): self._finish_edge_direction_transition(e, g)
-        )
-        self._edge_dir_anim = anim
-        anim.start()
-
-    def _on_edge_direction_frame(self, value) -> None:
-        if not isinstance(value, QRect):
-            return
-        self.setGeometry(value)
-        root = getattr(self, "_edge_dock_root", None)
-        clip = getattr(self, "_edge_dock_clip", None)
-        if clip is not None:
-            clip.setGeometry(0, 0, max(1, value.width()), max(1, value.height()))
-        if root is not None:
-            root.setGeometry(0, 0, max(1, value.width()), max(1, value.height()))
-
-    def _finish_edge_direction_transition(self, edge: str, geom: QRect) -> None:
-        self._edge_dock_direction = edge
+        self._edge_dock_switching = True
         self._edge_dock_candidate_edge = None
-        self._edge_dock_dir_transitioning = False
+        old_direction = self._edge_dock_direction
+        self._dock_blackband_diag = True
+        self._dock_blackband_diag_switch = f"{old_direction}->{direction}"
+
+        # 切替前に「現在の展開サイズ」を旧方向プロファイルへ確定する。
+        # これがないと左右系/上下系の独立記憶が、切替のたびに欠落・混線する。
+        # profile_lock は store の後で立てる（lock 中は _store_live_size が no-op）。
+        if (
+            old_direction in ("left", "right", "top", "bottom")
+            and old_direction != direction
+            and self._edge_dock_revealed
+            and not self._edge_dock_animating
+        ):
+            try:
+                self._edge_dock_profile_lock = False
+                self._store_live_size(self.width(), self.height(), old_direction)
+            except Exception:
+                pass
         self._edge_dock_profile_lock = True
+
+        # isolation: 旧方向の絵を消してから方向を切り替える
+        self._transition_isolate_begin()
+        self._edge_dock_direction = direction
+        self._edge_dock_edge_offset = self._get_edge_offset(direction)
+        if self._edge_detector:
+            self._edge_detector.set_params(edge=direction)
+
         try:
-            if self.geometry() != geom:
-                self.setGeometry(geom)
             root = getattr(self, "_edge_dock_root", None)
-            clip = getattr(self, "_edge_dock_clip", None)
-            if clip is not None:
-                clip.setGeometry(0, 0, max(1, geom.width()), max(1, geom.height()))
-            if root is not None:
-                root.setGeometry(0, 0, max(1, geom.width()), max(1, geom.height()))
-            self._apply_reveal_mask(1.0 if self._edge_dock_revealed else 0.0)
-            self._dock_shape_mask_wh = None
-            self._dock_shape_mask_key = None
-            self._apply_dock_shape_mask(geom.width(), geom.height())
+            if root is not None and not root.isVisible():
+                root.show()
+
+            self._edge_dock_column_count = self._column_count_for_edge(direction)
+
             if self._edge_dock_revealed:
-                self._apply_mode_column_visibility()
-                self._enforce_all_columns_single_tab()
+                if target_geom is not None and target_geom.isValid():
+                    full = QRect(target_geom)
+                else:
+                    size = self._panel_size_for_edge(direction)
+                    full = self._expanded_geometry_for_edge(direction, size)
+                self._edge_dock_anim_cw = max(1, full.width())
+                self._edge_dock_anim_ch = max(1, full.height())
+                self._commit_dock_container_geometry(
+                    full, revealed=True, keep_updates_off=True
+                )
+                self._settle_layout_and_webengines(dock_mode=True)
+            else:
+                full_c = self._expanded_geometry_for_edge(direction)
+                self._dock_slide_full_geom = QRect(full_c)
+                clip = getattr(self, "_edge_dock_clip", None)
+                if direction == "bottom":
+                    if self.geometry() != full_c:
+                        self.setGeometry(full_c)
+                    fw, fh = max(1, full_c.width()), max(1, full_c.height())
+                    if clip is not None:
+                        clip.setGeometry(0, 0, fw, fh)
+                    if root is not None:
+                        root.setGeometry(0, 0, fw, fh)
+                    local_strip = self._local_strip_rect("bottom", fw, fh)
+                    self._dock_slide_strip_geom = QRect(local_strip)
+                    self._edge_dock_reveal_progress = 0.0
+                    self.setMask(self._mask_region_for_reveal_rect(local_strip))
+                else:
+                    strip = self._collapsed_geometry()
+                    if self.geometry() != strip:
+                        self.setGeometry(strip)
+                    sw, sh = max(1, strip.width()), max(1, strip.height())
+                    if clip is not None:
+                        clip.setGeometry(0, 0, sw, sh)
+                    if root is not None:
+                        root.setGeometry(0, 0, sw, sh)
+                    self._dock_slide_strip_geom = self._local_strip_rect(
+                        direction, sw, sh
+                    )
+                    self._edge_dock_reveal_progress = 0.0
+                    try:
+                        self._apply_dock_shape_mask(sw, sh, force=True)
+                    except Exception:
+                        pass
         finally:
+            self._edge_dock_switching = False
+            self._edge_dock_dir_transitioning = False
+            self._dock_blackband_snapshot("5_before_isolate_commit")
+            self._transition_isolate_commit_visible(apply_mask=True)
+            self._dock_blackband_snapshot("7_after_isolate_commit")
             self._edge_dock_profile_lock = False
-        self._edge_dir_anim = None
+
         self._save_edge_dock_settings()
         self._update_edge_dock_ui()
+        # always_on_top は isolation 後に適用（setWindowFlags 再 show を避ける）
+        self._apply_edge_dock_always_on_top()
+        self._apply_edge_dock_zoom()
+        self._dock_blackband_snapshot("9_direction_switch_end")
+        self._dock_blackband_diag = False
+        self._dock_blackband_diag_switch = ""
+
+    def _resync_dock_after_show(self) -> None:
+        """show 後の client 実寸で clip/root/column/WE/mask を再確定する。
+
+        hide 中の settle/fit は QScrollArea viewport や layout が旧寸法のまま
+        終わることがあり、sum(column widths) < client の帯が残る。
+        推測調整ではなく self.size() を権威として再同期するだけ。
+        """
+        if not self._edge_dock_enabled or not self._edge_dock_revealed:
+            return
+        fw = max(1, int(self.width() or 0))
+        fh = max(1, int(self.height() or 0))
+        if fw <= 1 or fh <= 1:
+            return
+        clip = getattr(self, "_edge_dock_clip", None)
+        root = getattr(self, "_edge_dock_root", None)
+        target = QRect(0, 0, fw, fh)
+        if clip is not None and clip.geometry() != target:
+            clip.setGeometry(target)
+        if root is not None:
+            if root.geometry() != target:
+                root.setGeometry(target)
+            if not root.isVisible():
+                root.show()
+            try:
+                rlay = root.layout()
+                if rlay is not None:
+                    rlay.invalidate()
+                    rlay.activate()
+            except Exception:
+                pass
+        try:
+            if self._scroll is not None:
+                slay = self._scroll.layout()
+                if slay is not None:
+                    slay.invalidate()
+                    slay.activate()
+        except Exception:
+            pass
+        try:
+            self._apply_dock_content_insets()
+        except Exception:
+            pass
+        try:
+            self._fit_columns()
+        except Exception:
+            pass
+        try:
+            for col in list(getattr(self, "_columns", None) or []):
+                if not col.isVisible():
+                    continue
+                for wv in getattr(col, "webviews", lambda: [])():
+                    if wv is None:
+                        continue
+                    try:
+                        self._layout_safe_webview_geometry(wv)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            self._apply_dock_shape_mask(fw, fh, force=True)
+        except Exception:
+            pass
+        try:
+            self.update()
+        except Exception:
+            pass
+        self._dock_blackband_snapshot("7b_after_resync_dock_after_show")
 
     def _follow_drag(self, top_left: QPoint) -> None:
-        if getattr(self, "_edge_dock_dir_transitioning", False):
-            return
-
-        prev = self._edge_dock_direction
-        cursor = QCursor.pos()
-        sc = self._screen_at(cursor)
+        # Memoi 方式: 提案 top_left + 現在サイズの中心でエッジ判定し、
+        # ドラッグ中は現在の Dock サイズを維持したまま方向だけ切り替える。
+        size = self.size()
+        center = QPoint(top_left.x() + size.width() // 2, top_left.y() + size.height() // 2)
+        sc = self._screen_at(center)
         screen = sc.availableGeometry()
 
         screens = QGuiApplication.screens()
         if sc in screens:
             self._edge_dock_monitor_index = screens.index(sc)
 
-        dl = max(0, cursor.x() - screen.left())
-        dr = max(0, screen.right() - cursor.x())
-        dt = max(0, cursor.y() - screen.top())
-        db = max(0, screen.bottom() - cursor.y())
+        prev = self._edge_dock_direction
+        cx, cy = center.x(), center.y()
+        dl = abs(cx - screen.left())
+        dr = abs(cx - screen.right())
+        dt = abs(cy - screen.top())
+        db = abs(cy - screen.bottom())
         dists = {"left": dl, "right": dr, "top": dt, "bottom": db}
         nearest = min(dists, key=dists.get)
+
+        # 既存のヒステリシスを尊重（コーナー付近は少し厚め）
         hyst = int(getattr(self, "EDGE_SWITCH_HYSTERESIS_PX", 40))
         ordered = sorted(dists.values())
         in_corner = len(ordered) >= 2 and ordered[1] < 110
@@ -4446,11 +5864,6 @@ class MainWindow(QMainWindow):
         else:
             edge = nearest
 
-        if edge != prev:
-            self._start_edge_direction_transition(edge, top_left, screen)
-            return
-
-        size = self.size()
         self._edge_dock_profile_lock = True
         try:
             if edge in ("left", "right"):
@@ -4458,20 +5871,39 @@ class MainWindow(QMainWindow):
                 offset = (top_left.y() - screen.top()) / usable
                 x = screen.left() if edge == "left" else screen.right() - size.width() + 1
                 y = max(screen.top(), min(screen.bottom() - size.height() + 1, top_left.y()))
-                self.setGeometry(QRect(x, y, size.width(), size.height()))
             else:
                 usable = max(1, screen.width() - size.width())
                 offset = (top_left.x() - screen.left()) / usable
                 y = screen.top() if edge == "top" else screen.bottom() - size.height() + 1
                 x = max(screen.left(), min(screen.right() - size.width() + 1, top_left.x()))
-                self.setGeometry(QRect(x, y, size.width(), size.height()))
+            # geometry が実際に変わった場合だけ setGeometry を呼び、
+            # 変化しない場合は DWM 再合成をスキップしてスタッターを軽減する
+            cur = self.geometry()
+            if cur.x() != x or cur.y() != y:
+                self.move(x, y)
         finally:
             self._edge_dock_profile_lock = False
 
-        offset = max(0.0, min(1.0, offset))
-        self._edge_dock_edge_offset = offset
+        if edge != prev:
+            # 旧方向の現在サイズをプロファイルへ確定してから方向だけ切替。
+            try:
+                self._store_live_size(self.width(), self.height(), prev)
+            except Exception:
+                pass
+            # 方向だけ切替。サイズは維持（解放時に新方向の記憶サイズへ離散置換）。
+            self._edge_dock_direction = edge
+            self._edge_dock_drag_origin = QCursor.pos()
+            self._edge_dock_drag_geom = QRect(self.geometry())
+            if self._edge_detector:
+                self._edge_detector.set_params(edge=edge)
+            # マスクは角丸矩形(ww, hh, radius)で方向に依存しない。
+            # サイズ未変更なら mask key は有効のまま、不要な setMask をスキップ。
+
+        self._set_edge_offset(offset, edge)
         if self._edge_detector:
             self._edge_detector.set_params(edge=edge)
+        # move ブロックの finally で False に戻るが、方向切替後も必ず解除する
+        self._edge_dock_profile_lock = False
 
     def _update_edge_dock_ui(self) -> None:
         from PySide6.QtWidgets import QSizePolicy
@@ -4678,7 +6110,8 @@ class MainWindow(QMainWindow):
                 self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
                 self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
                 self.setMouseTracking(True)
-                self.setCursor(Qt.CursorShape.ArrowCursor)
+                # 境界上では resize 可能 → デフォルト SizeHor（ボタン上だけ PointingHand）
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
                 self.setEnabled(True)
                 self._breathe_anim = QVariantAnimation(self)
                 self._breathe_anim.setDuration(1800)
@@ -4925,19 +6358,33 @@ class MainWindow(QMainWindow):
                 event.accept()
 
             def leaveEvent(self, event) -> None:
-                self.setCursor(Qt.CursorShape.ArrowCursor)
-                QTimer.singleShot(40, self._owner._recheck_boundary_hover)
+                # Arrow 固定にしない。隣接 handle 上なら SizeHor を維持。
+                sync = getattr(self._owner, "_sync_column_resize_cursor", None)
+                if callable(sync):
+                    try:
+                        sync()
+                    except Exception:
+                        pass
+                else:
+                    self.unsetCursor()
+                QTimer.singleShot(30, self._owner._recheck_boundary_hover)
                 super().leaveEvent(event)
-
-            def contains_global(self, global_pos) -> bool:
-                if not self.isVisible() or self._t <= 0.02:
-                    return False
-                return self.rect().contains(self.mapFromGlobal(global_pos))
 
         ov = _BoundaryInteractionOverlay(self)
         ov.hide()
         self._boundary_overlay = ov
         self._boundary_action_film = ov
+
+    def _ensure_boundary_hover_poll(self) -> None:
+        """hint/session 中は leave 欠落（native WebView 等）でも poll で終了できるようにする。"""
+        timer = getattr(self, "_boundary_hover_poll", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(80)
+            timer.timeout.connect(self._recheck_boundary_hover)
+            self._boundary_hover_poll = timer
+        if not timer.isActive():
+            timer.start()
 
     def update_boundary_actions(self, cx: int, top: int, bot: int, expand: float, col) -> None:
         if getattr(self, "_boundary_dragging", False):
@@ -4948,14 +6395,8 @@ class MainWindow(QMainWindow):
             return
         self._boundary_action_col = col
         t = max(0.0, min(1.0, float(expand)))
-        timer = getattr(self, "_boundary_hover_poll", None)
-        if timer is None:
-            timer = QTimer(self)
-            timer.setInterval(80)
-            timer.timeout.connect(self._recheck_boundary_hover)
-            self._boundary_hover_poll = timer
-        if t > 0.02 and not timer.isActive():
-            timer.start()
+        if t > 0.02:
+            self._ensure_boundary_hover_poll()
 
         fixed_w = 64
         if fixed_w % 2:
@@ -5096,59 +6537,141 @@ class MainWindow(QMainWindow):
                 pass
             self._boundary_hand_cursor = False
 
-    def boundary_actions_contain_global(self, global_pos) -> bool:
+    def boundary_action_knobs_contain_global(self, global_pos) -> bool:
+        """←→🔁 の実ボタン矩形上だけ。64px overlay 全体は含めない。"""
         ov = getattr(self, "_boundary_overlay", None)
-        if ov is not None and hasattr(ov, "contains_global"):
-            if ov.contains_global(global_pos):
-                return True
         if ov is not None and ov.isVisible() and float(getattr(ov, "_t", 0.0)) > 0.02:
             try:
                 if hasattr(ov, "_refresh_action_rects"):
                     ov._refresh_action_rects()
                 local = ov.mapFromGlobal(global_pos)
-                stow = getattr(ov, "_stow_rect", None)
-                reset = getattr(ov, "_reset_rect", None)
-                if stow is not None and stow.contains(local):
-                    return True
-                if reset is not None and reset.contains(local):
-                    return True
+                for attr in ("_stow_left_rect", "_stow_right_rect", "_stow_rect", "_reset_rect"):
+                    r = getattr(ov, attr, None)
+                    if r is not None and r.contains(local):
+                        return True
             except Exception:
                 pass
         for b in (getattr(self, "_boundary_reset_btn", None), getattr(self, "_boundary_stow_btn", None)):
             if b is not None and b.isVisible():
-                if b.rect().contains(b.mapFromGlobal(global_pos)):
-                    return True
+                try:
+                    if b.rect().contains(b.mapFromGlobal(global_pos)):
+                        return True
+                except Exception:
+                    pass
         return False
 
+    def boundary_actions_contain_global(self, global_pos) -> bool:
+        """Shared UI session 維持: ボタン矩形のみ（overlay 64px 全体では維持しない）。"""
+        return self.boundary_action_knobs_contain_global(global_pos)
+
+    def _cursor_over_column_resize_region(self, global_pos=None) -> bool:
+        """実際の resize hit 上か。通常は中央 2px、収納はフル幅。共有UI hover 幅は含めない。"""
+        from PySide6.QtGui import QCursor
+        pos = global_pos if global_pos is not None else QCursor.pos()
+        for col in getattr(self, "_columns", None) or []:
+            h = getattr(col, "_resize_handle", None)
+            if h is None or not h.isVisible():
+                continue
+            try:
+                local = h.mapFromGlobal(pos)
+                if not h.rect().contains(local):
+                    continue
+                stowed = getattr(col, "is_individually_stowed", lambda: False)()
+                if stowed:
+                    return True
+                # 通常境界: 中央 2px のみ
+                hit = getattr(h, "_local_in_resize_hit", None)
+                if callable(hit):
+                    return bool(hit(local.x()))
+                cx = h.width() // 2
+                return abs(int(local.x()) - cx) <= 1
+            except Exception:
+                continue
+        return False
+
+    def _sync_column_resize_cursor(self) -> None:
+        """resize 可能座標では SizeHor を維持。Widget 跨ぎの一瞬 Arrow を防ぐ。
+
+        子 leave → 隣接 enter の隙間で child が Arrow に戻しても、
+        ウィンドウ側の cursor が SizeHor のままなので視覚的に途切れない。
+        """
+        if getattr(self, "_boundary_dragging", False):
+            try:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            except Exception:
+                pass
+            return
+        if self._cursor_over_column_resize_region():
+            try:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            except Exception:
+                pass
+            return
+        try:
+            self.unsetCursor()
+        except Exception:
+            pass
+
     def _recheck_boundary_hover(self) -> None:
+        """カーソルが handle / overlay session から完全に離れたときだけ閉じる。
+
+        QWebEngineView（native）へ入ると leaveEvent が欠けることがあるため、
+        poll からも同じ終了条件を適用する。resize/reset を待たずに青を消す。
+        """
         if getattr(self, "_boundary_dragging", False):
             return
         from PySide6.QtGui import QCursor
         pos = QCursor.pos()
-        if self.boundary_actions_contain_global(pos):
-            return
+        over_handle = None
         for col in getattr(self, "_columns", []) or []:
             h = getattr(col, "_resize_handle", None)
             if h is None or not h.isVisible():
                 continue
             try:
                 if h.rect().contains(h.mapFromGlobal(pos)):
-                    return
+                    over_handle = h
+                    break
             except Exception:
                 pass
+        over_actions = self.boundary_actions_contain_global(pos)
+        if over_handle is not None or over_actions:
+            try:
+                self._sync_column_resize_cursor()
+            except Exception:
+                pass
+            # session 継続。他ハンドルのローカル hint だけ掃除（overlay は触らない）
+            for col in getattr(self, "_columns", []) or []:
+                h = getattr(col, "_resize_handle", None)
+                if h is None or h is over_handle:
+                    continue
+                try:
+                    if getattr(h, "_hint", False) or getattr(h, "_actions_visible", False):
+                        if getattr(h, "_expand_anim", None) is not None:
+                            h._expand_anim.stop()
+                        h._actions_visible = False
+                        h._expand = 0.0
+                        h.set_hint(False)
+                except Exception:
+                    pass
+            return
+        # session 終了: 共有 overlay と全ハンドルの青を確実に消す
         self.hide_boundary_actions()
         for col in getattr(self, "_columns", []) or []:
             h = getattr(col, "_resize_handle", None)
             if h is None:
                 continue
             try:
+                if getattr(h, "_expand_anim", None) is not None:
+                    h._expand_anim.stop()
                 h._actions_visible = False
-                if float(getattr(h, "_expand", 0.0)) > 0.01:
-                    h._show_actions(False)
-                else:
-                    h.set_hint(False)
+                h._expand = 0.0
+                h.set_hint(False)
             except Exception:
                 pass
+        try:
+            self._sync_column_resize_cursor()
+        except Exception:
+            pass
 
     def _on_boundary_reset_clicked(self) -> None:
         self.hide_boundary_actions()
@@ -5244,8 +6767,8 @@ class MainWindow(QMainWindow):
             QDialog, QFormLayout, QDialogButtonBox, QCheckBox, QLineEdit,
             QVBoxLayout, QGroupBox, QRadioButton, QLabel, QHBoxLayout, QToolButton,
         )
-        from PySide6.QtGui import QPainterPath, QRegion
-        from PySide6.QtCore import QRectF, QObject, QEvent
+        from PySide6.QtGui import QRegion
+        from PySide6.QtCore import QObject, QEvent
         dlg = QDialog(self)
         dlg.setObjectName("mayotter_settings_dialog")
         dlg.setWindowTitle("設定")
@@ -6300,7 +7823,6 @@ class MainWindow(QMainWindow):
         )
 
         def _browse_crop_dir() -> None:
-            from pathlib import Path as _P
             from PySide6.QtWidgets import QFileDialog
             start = crop_path_edit.text().strip() or _crop_default
             chosen = QFileDialog.getExistingDirectory(dlg, "編集後画像の保存先", start)
@@ -6726,7 +8248,16 @@ class MainWindow(QMainWindow):
             self._settings_manager.set("edge_dock_width_tb", self._edge_dock_width_tb)
             self._settings_manager.set("edge_dock_height_tb", self._edge_dock_height_tb)
             self._settings_manager.set("edge_dock_panel_height_ratio", self._edge_dock_panel_height_ratio)
+            # 現在方向のオフセット（後方互換）と、方向ごとの最終位置
+            self._edge_dock_edge_offset = self._get_edge_offset(self._edge_dock_direction)
             self._settings_manager.set("edge_dock_edge_offset", self._edge_dock_edge_offset)
+            offsets = getattr(self, "_edge_dock_edge_offsets", None)
+            if isinstance(offsets, dict):
+                self._settings_manager.set("edge_dock_edge_offsets", {
+                    k: float(max(0.0, min(1.0, float(v))))
+                    for k, v in offsets.items()
+                    if k in ("left", "right", "top", "bottom")
+                })
             self._settings_manager.set("edge_dock_monitor_index", getattr(self, '_edge_dock_monitor_index', 0))
 
     def _load_edge_dock_settings(self) -> None:
@@ -6797,6 +8328,26 @@ class MainWindow(QMainWindow):
                 )
             except (TypeError, ValueError):
                 self._edge_dock_edge_offset = 0.5
+            self._edge_dock_edge_offset = max(0.0, min(1.0, self._edge_dock_edge_offset))
+            # 方向ごとの最終位置（なければ単一オフセットで初期化）
+            defaults = {
+                "left": self._edge_dock_edge_offset,
+                "right": self._edge_dock_edge_offset,
+                "top": self._edge_dock_edge_offset,
+                "bottom": self._edge_dock_edge_offset,
+            }
+            raw_offsets = self._settings_manager.get("edge_dock_edge_offsets", None)
+            if isinstance(raw_offsets, dict):
+                for k in ("left", "right", "top", "bottom"):
+                    if k in raw_offsets:
+                        try:
+                            defaults[k] = max(0.0, min(1.0, float(raw_offsets[k])))
+                        except (TypeError, ValueError):
+                            pass
+            self._edge_dock_edge_offsets = defaults
+            # 現在方向の値を同期
+            d = self._edge_dock_direction if self._edge_dock_direction in defaults else "right"
+            self._edge_dock_edge_offset = defaults.get(d, 0.5)
             try:
                 self._edge_dock_monitor_index = int(
                     self._settings_manager.get("edge_dock_monitor_index", 0) or 0
@@ -6823,40 +8374,89 @@ class MainWindow(QMainWindow):
         region = region.united(tr)
         return region
 
-    def _dock_outer_round_region(self, width: int, height: int, radius: int = 12) -> QRegion:
+    def _dock_outer_round_region(
+        self, width: int, height: int, radius: int = 12, edge: str | None = None
+    ) -> QRegion:
+        """Dock外形の角丸。接着面は直角、反対側の下角も直角。
+
+        - right: 左上のみ
+        - left: 右上のみ
+        - bottom: 上側のみ
+        - top: 矩形（下角を丸めない）
+        """
         w = max(1, int(width))
         h = max(1, int(height))
         r = max(0, min(int(radius), w // 2, h // 2))
-        edge = self._edge_dock_direction
         if r <= 0:
             return QRegion(0, 0, w, h)
-
+        edge = edge or getattr(self, "_edge_dock_direction", "right") or "right"
         region = QRegion(0, 0, w, h)
 
         if edge == "right":
             region = region.subtracted(QRegion(0, 0, r, r))
-            tl = QRegion(0, 0, 2 * r, 2 * r, QRegion.RegionType.Ellipse)
-            region = region.united(tl.intersected(QRegion(0, 0, r, r)))
+            region = region.united(
+                QRegion(0, 0, 2 * r, 2 * r, QRegion.RegionType.Ellipse).intersected(
+                    QRegion(0, 0, r, r)
+                )
+            )
         elif edge == "left":
             region = region.subtracted(QRegion(w - r, 0, r, r))
-            tr = QRegion(w - 2 * r, 0, 2 * r, 2 * r, QRegion.RegionType.Ellipse)
-            region = region.united(tr.intersected(QRegion(w - r, 0, r, r)))
+            region = region.united(
+                QRegion(w - 2 * r, 0, 2 * r, 2 * r, QRegion.RegionType.Ellipse).intersected(
+                    QRegion(w - r, 0, r, r)
+                )
+            )
+        elif edge == "bottom":
+            region = region.subtracted(QRegion(0, 0, r, r))
+            region = region.united(
+                QRegion(0, 0, 2 * r, 2 * r, QRegion.RegionType.Ellipse).intersected(
+                    QRegion(0, 0, r, r)
+                )
+            )
+            region = region.subtracted(QRegion(w - r, 0, r, r))
+            region = region.united(
+                QRegion(w - 2 * r, 0, 2 * r, 2 * r, QRegion.RegionType.Ellipse).intersected(
+                    QRegion(w - r, 0, r, r)
+                )
+            )
         elif edge == "top":
-            region = QRegion(0, 0, w, h)
+            return QRegion(0, 0, w, h)
         else:
-            region = QRegion(0, r, w, max(1, h - r))
-            if w > 2 * r:
-                region = region.united(QRegion(r, 0, w - 2 * r, r))
-            tl = QRegion(0, 0, 2 * r, 2 * r, QRegion.RegionType.Ellipse)
-            region = region.united(tl.intersected(QRegion(0, 0, r, r)))
-            tr = QRegion(w - 2 * r, 0, 2 * r, 2 * r, QRegion.RegionType.Ellipse)
-            region = region.united(tr.intersected(QRegion(w - r, 0, r, r)))
+            return QRegion(0, 0, w, h)
         return region
 
-    def _apply_dock_shape_mask(self, w: int | None = None, h: int | None = None) -> None:
+    def _apply_dock_shape_mask(
+        self, w: int | None = None, h: int | None = None, *, force: bool = False
+    ) -> None:
         if not self._edge_dock_enabled:
             return
-        if not self.isVisible():
+        # force=True はアニメ中でも外形マスクを維持する（Right position-slide 用）
+        if not force and not self.isVisible():
+            return
+        if not force and getattr(self, "_edge_dock_animating", False):
+            return
+        edge = getattr(self, "_edge_dock_direction", "right") or "right"
+        # 収納中: Bottom は full HWND + local strip mask。他は strip サイズ HWND。
+        if not self._edge_dock_revealed and not force:
+            full = self._expanded_geometry_for_edge(edge)
+            self._dock_slide_full_geom = QRect(full)
+            self._edge_dock_reveal_progress = 0.0
+            if edge == "bottom":
+                fw, fh = max(1, full.width()), max(1, full.height())
+                self._dock_slide_strip_geom = self._local_strip_rect("bottom", fw, fh)
+                self._apply_reveal_mask(0.0)
+            else:
+                # position-slide stowed: strip サイズでも外側角丸を維持（clearMask しない）
+                sw = max(1, self.width())
+                sh = max(1, self.height())
+                self._dock_slide_strip_geom = self._local_strip_rect(edge, sw, sh)
+                radius = max(2, min(10, min(sw, sh) // 2))
+                self.setMask(self._dock_outer_round_region(sw, sh, radius, edge=edge))
+                self._dock_shape_mask_key = (sw, sh, radius, edge)
+            try:
+                self._update_dock_notify_visual()
+            except Exception:
+                pass
             return
         ww = int(w if w is not None else self.width())
         hh = int(h if h is not None else self.height())
@@ -6864,18 +8464,19 @@ class MainWindow(QMainWindow):
             self.setMask(QRegion())
             self._dock_shape_mask_key = None
             return
-        edge = self._edge_dock_direction
-        if not self._edge_dock_revealed and not self._edge_dock_animating:
-            radius = max(2, min(8, min(ww, hh) // 2))
-        else:
-            radius = max(4, min(12, min(ww, hh) // 2))
-        key = (ww, hh, edge, radius)
-        if getattr(self, "_dock_shape_mask_key", None) == key and not self.mask().isEmpty():
+        radius = max(4, min(12, min(ww, hh) // 2))
+        # key に edge を含め、方向切替時に必ず mask を差し替える
+        key = (ww, hh, radius, edge)
+        if (
+            not force
+            and getattr(self, "_dock_shape_mask_key", None) == key
+            and not self.mask().isEmpty()
+        ):
             return
         self._dock_shape_mask_key = key
         self._dock_shape_mask_wh = (ww, hh)
 
-        self.setMask(self._dock_outer_round_region(ww, hh, min(radius, 10)))
+        self.setMask(self._dock_outer_round_region(ww, hh, min(radius, 10), edge=edge))
         try:
             self._update_dock_notify_visual()
         except Exception:
@@ -7100,10 +8701,6 @@ class MainWindow(QMainWindow):
             ov.setGeometry(x, y, width, h)
             _promote_overlay_tool(ov, parent)
             try:
-                from src.ui.theme import rounded_overlay_mask
-            except Exception:
-                rounded_overlay_mask = None
-            try:
                 from src.ui.url_overlay import rounded_overlay_mask as _rom
                 ov.setMask(_rom(ov.width(), ov.height()))
             except Exception:
@@ -7114,7 +8711,7 @@ class MainWindow(QMainWindow):
                 QApplication.instance().installEventFilter(ov)
             except Exception:
                 pass
-        except Exception as e:
+        except Exception:
             pass
 
     def _restore_download_overlay_suspended(self) -> None:
@@ -7127,7 +8724,7 @@ class MainWindow(QMainWindow):
                 dov.open_history()
             else:
                 dov.show()
-        except Exception as e:
+        except Exception:
             pass
 
     def _restore_service_menu_suspended(self) -> None:
@@ -7139,16 +8736,25 @@ class MainWindow(QMainWindow):
             if btn is not None:
                 pos = btn.mapToGlobal(btn.rect().bottomLeft())
                 menu.move(pos)
+            try:
+                self._ensure_service_menu_above_dock(menu)
+            except Exception:
+                pass
             menu.show()
             menu.raise_()
             try:
                 QApplication.instance().installEventFilter(menu)
             except Exception:
                 pass
-        except Exception as e:
+        except Exception:
             pass
 
     def eventFilter(self, obj, event):
+        if getattr(self, "_stow_geom_active", False):
+            try:
+                self._stow_geom_on_resize(obj, event)
+            except Exception:
+                pass
         try:
             chrome = (
                 getattr(self, "_add_twitter_btn", None),
@@ -7262,9 +8868,7 @@ class MainWindow(QMainWindow):
                 if not estr:
                     code = self._resize_hit_code(local.x(), local.y())
                     estr = self._edges_str_from_ht_code(code) if code else ""
-                sb_hit = False
                 if estr and self._prefer_webview_scroll_over_resize(gp, local, estr):
-                    sb_hit = True
                     estr = ""
                 if estr:
                     if self._begin_dock_manual_resize(estr, gp):
@@ -7294,6 +8898,12 @@ class MainWindow(QMainWindow):
     def _resize_hit_code(self, x: int, y: int) -> int:
 
         if self.isMaximized() or self.isFullScreen():
+            return 0
+
+        # 収納状態の細い帯はリサイズ対象にしない（展開時のみリサイズ可）
+        if getattr(self, "_edge_dock_enabled", False) and not getattr(
+            self, "_edge_dock_revealed", False
+        ):
             return 0
 
         if self._point_on_restore_knob(x, y):
@@ -7405,7 +9015,7 @@ class MainWindow(QMainWindow):
                 else:
                     wh = self.windowHandle()
                     if wh is not None:
-                        ok = wh.startSystemResize(edges)
+                        wh.startSystemResize(edges)
                         event.accept()
                         return
 
@@ -7468,11 +9078,30 @@ class MainWindow(QMainWindow):
                 super().mousePressEvent(event)
                 return
             w = w.parentWidget()
+        # 進行中の方向切替アニメがあれば止める（ドラッグ中はサイズ固定）
+        prev_anim = getattr(self, "_edge_dir_anim", None)
+        if prev_anim is not None:
+            try:
+                prev_anim.stop()
+            except Exception:
+                pass
+            self._edge_dir_anim = None
+        self._edge_dock_dir_transitioning = False
+        # 収納・展開アニメが途中なら止めて状態を揃える（終了後の hover 不能を防ぐ）
+        if self._edge_animator is not None:
+            try:
+                self._edge_animator.stop()
+            except Exception:
+                pass
+        self._edge_dock_animating = False
         self._edge_dock_dragging = True
+        self._edge_dock_drag_start_direction = self._edge_dock_direction
         self._edge_dock_drag_origin = event.globalPosition().toPoint()
         self._edge_dock_drag_geom = self.geometry()
         if self._edge_detector:
             self._edge_detector.set_pinned_open(True)
+            if self._edge_dock_revealed:
+                self._edge_detector.set_state(PanelState.EXPANDED)
         self.grabMouse()
         event.accept()
 
@@ -7500,27 +9129,21 @@ class MainWindow(QMainWindow):
                 g.moveBottom(screen.bottom())
             elif dock == "top":
                 g.moveTop(screen.top())
-            self.setGeometry(g)
+            g = self._apply_dock_toplevel_geometry(g)
             fw, fh = max(1, g.width()), max(1, g.height())
             self._store_live_size(fw, fh, dock)
-            clip = getattr(self, "_edge_dock_clip", None)
-            root = getattr(self, "_edge_dock_root", None)
-            if clip is not None and clip.geometry() != QRect(0, 0, fw, fh):
-                clip.setGeometry(0, 0, fw, fh)
-            if root is not None and root.geometry() != QRect(0, 0, fw, fh):
-                root.setGeometry(0, 0, fw, fh)
             t = 1.0 if self._edge_dock_revealed else float(getattr(self, "_edge_dock_reveal_progress", 0.0))
             self._apply_reveal_mask(t)
             self._apply_dock_shape_mask(fw, fh)
             if self._edge_dock_revealed:
-                self._fit_columns()
-            try:
-                col_w = None
-                visible = [c for c in getattr(self, "_columns", []) if c.isVisible()]
-                if visible:
-                    col_w = visible[0].get_width()
-            except Exception:
-                pass
+                try:
+                    self._fit_columns()
+                except Exception:
+                    pass
+                try:
+                    self._sync_webviews_to_columns_layout_safe()
+                except Exception:
+                    pass
             event.accept()
             return
         if self._edge_dock_dragging and self._edge_dock_drag_origin and self._edge_dock_drag_geom:
@@ -7534,6 +9157,10 @@ class MainWindow(QMainWindow):
 
     def mouseReleaseEvent(self, event) -> None:
         if self._edge_dock_resizing:
+            try:
+                self._resize_diag_emit("manual_resize_end_before", force=True)
+            except Exception:
+                pass
             self._edge_dock_resizing = False
             self.releaseMouse()
             self._snap_to_dock_edge()
@@ -7558,11 +9185,25 @@ class MainWindow(QMainWindow):
                 root.setGeometry(0, 0, fw, fh)
             if self._edge_dock_revealed:
                 self._apply_reveal_mask(1.0)
+                # 手動リサイズ終了時に非stowカラムの visibility を再適用する。
+                # 直前に collapse 経路や count ベース hide で hide された列が
+                # 残っていると「リサイズ後にカラムが消えた」ように見えるため。
+                try:
+                    self._update_edge_dock_column_visibility()
+                except Exception:
+                    pass
                 self._fit_columns()
             else:
-                collapsed = self._collapsed_geometry()
-                if self.geometry() != collapsed:
-                    self.setGeometry(collapsed)
+                full_c = self._expanded_geometry_for_edge(self._edge_dock_direction)
+                if self.geometry() != full_c:
+                    self.setGeometry(full_c)
+                self._dock_slide_full_geom = QRect(full_c)
+                self._dock_slide_strip_geom = QRect(self._collapsed_geometry())
+                self._apply_reveal_mask(0.0)
+            try:
+                self._resize_diag_emit("manual_resize_end_after", force=True)
+            except Exception:
+                pass
             if self._edge_detector:
                 self._edge_detector.set_pinned_open(False)
             event.accept()
@@ -7570,29 +9211,96 @@ class MainWindow(QMainWindow):
         if self._edge_dock_dragging:
             self._edge_dock_dragging = False
             self.releaseMouse()
-            if self._edge_detector:
-                self._edge_detector.set_pinned_open(False)
-            if self._edge_dock_revealed:
-                self._edge_dock_profile_lock = True
+            self._edge_dock_animating = False
+            if self._edge_animator is not None:
                 try:
-                    full = self._expanded_geometry_for_edge(self._edge_dock_direction)
-                    if self.geometry() != full:
-                        self.setGeometry(full)
+                    self._edge_animator.stop()
+                except Exception:
+                    pass
+            # 残留 size-lerp を破棄
+            prev_anim = getattr(self, "_edge_dir_anim", None)
+            if prev_anim is not None:
+                try:
+                    prev_anim.stop()
+                except Exception:
+                    pass
+                self._edge_dir_anim = None
+
+            start_dir = getattr(self, "_edge_dock_drag_start_direction", None)
+            new_dir = self._edge_dock_direction
+            direction_changed = (
+                start_dir is not None and start_dir != new_dir
+            )
+
+            if self._edge_dock_revealed:
+                # 方向が変わった、または新方向の target サイズが現在と大きく異なる場合は
+                # 表示中の live setGeometry を禁止し、離散 hide→commit→show のみ使う。
+                # （Right↔Bottom で黒帯を出す主因だった。）
+                full = self._expanded_geometry_for_edge(new_dir)
+                cur = self.geometry()
+                size_differs = (
+                    abs(cur.width() - full.width()) > 8
+                    or abs(cur.height() - full.height()) > 8
+                )
+                if direction_changed or size_differs:
+                    self._apply_edge_direction_discrete(new_dir, target_geom=full)
                     self._snap_to_dock_edge()
-                    root = getattr(self, "_edge_dock_root", None)
-                    clip = getattr(self, "_edge_dock_clip", None)
-                    if root is not None:
-                        root.setGeometry(0, 0, full.width(), full.height())
-                    if clip is not None:
-                        clip.setGeometry(0, 0, full.width(), full.height())
-                    self._apply_reveal_mask(1.0)
-                    self._fit_columns()
-                    self._update_edge_dock_column_visibility()
-                finally:
-                    self._edge_dock_profile_lock = False
+                    self._set_interactive(True)
+                    self._set_window_opaque(True)
+                else:
+                    # 同一方向・ほぼ同サイズ: 既存の軽量 commit（位置スナップのみ）
+                    self._edge_dock_profile_lock = True
+                    try:
+                        self._commit_dock_container_geometry(full, revealed=True)
+                        self._snap_to_dock_edge()
+                        full = QRect(self.geometry())
+                        self._dock_slide_full_geom = QRect(full)
+                        self._update_edge_dock_column_visibility()
+                        self._apply_dock_content_insets()
+                        try:
+                            self._fit_columns()
+                        except Exception:
+                            pass
+                        try:
+                            for col in self._columns:
+                                if not col.isVisible():
+                                    continue
+                                for wv in getattr(col, "webviews", lambda: [])():
+                                    if wv is None:
+                                        continue
+                                    try:
+                                        wv.update()
+                                    except Exception:
+                                        pass
+                            self._update_boundary_visibility()
+                        except Exception:
+                            pass
+                        try:
+                            self._set_dock_content_updates(True)
+                        except Exception:
+                            pass
+                        try:
+                            self._set_dock_webengines_visible(True)
+                        except Exception:
+                            pass
+                        self._set_interactive(True)
+                        self._set_window_opaque(True)
+                    finally:
+                        self._edge_dock_profile_lock = False
             self._dock_shape_mask_wh = None
             self._dock_shape_mask_key = None
-            self._apply_dock_shape_mask()
+            try:
+                self._apply_dock_shape_mask()
+            except Exception:
+                pass
+            # detector を通常状態へ戻す（EXPANDING/COLLAPSING 残留で hover 不能になるのを防ぐ）
+            if self._edge_detector:
+                self._edge_detector.set_pinned_open(False)
+                if self._edge_dock_revealed:
+                    self._edge_detector.set_state(PanelState.EXPANDED)
+                else:
+                    self._edge_detector.set_state(PanelState.COLLAPSED)
+                self._edge_detector.set_params(edge=self._edge_dock_direction)
             self._save_edge_dock_settings()
             event.accept()
             return
@@ -7711,6 +9419,59 @@ class MainWindow(QMainWindow):
     def _on_column_activated(self, column: AccountColumn) -> None:
         self._set_active_column(column)
 
+
+    def _ensure_service_menu_above_dock(self, menu) -> None:
+        """Dock(ON=WindowStaysOnTop)時にサービスメニューが背後に隠れないよう昇格する。
+
+        ColumnAddOverlay の _promote_overlay_tool と同契約だが、
+        サービスメニューは既に Tool + global 座標で配置済みのため
+        geometry の parent→global 再マップは行わない。
+        """
+        if menu is None:
+            return
+        parent_topmost = False
+        try:
+            if bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint):
+                parent_topmost = True
+        except Exception:
+            pass
+        try:
+            ph = self.windowHandle()
+            if ph is not None and bool(ph.flags() & Qt.WindowType.WindowStaysOnTopHint):
+                parent_topmost = True
+        except Exception:
+            pass
+        if not parent_topmost:
+            # 通常ウィンドウ: 既存フラグのまま。transient だけ張って親子関係を保つ
+            try:
+                _ = self.winId()
+                _ = menu.winId()
+                wh = menu.windowHandle()
+                ph = self.windowHandle()
+                if wh is not None and ph is not None:
+                    wh.setTransientParent(ph)
+            except Exception:
+                pass
+            return
+        try:
+            flags = Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+            # setWindowFlags は hide するため、呼び出し前の global geometry を保持
+            geo = menu.geometry()
+            menu.setWindowFlags(flags)
+            menu.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            menu.setGeometry(geo)
+        except Exception:
+            pass
+        try:
+            _ = self.winId()
+            _ = menu.winId()
+            wh = menu.windowHandle()
+            ph = self.windowHandle()
+            if wh is not None and ph is not None:
+                wh.setTransientParent(ph)
+        except Exception:
+            pass
+
     def _open_service_menu(self, grok: bool) -> None:
         self._log_dock_input("CLICK", getattr(self, "_add_twitter_btn", None))
         import time
@@ -7772,6 +9533,16 @@ class MainWindow(QMainWindow):
             pass
         pos = self._add_twitter_btn.mapToGlobal(self._add_twitter_btn.rect().bottomLeft())
         menu.move(pos)
+
+        # Dock ON 時 MainWindow は WindowStaysOnTopHint 付き。
+        # ColumnAddOverlay(+カラム) は _promote_overlay_tool で topmost+transient に昇格するが、
+        # サービスメニュー(+X) は未対応のため Dock 背後に隠れ、選択・追加できなくなる。
+        # メニューは既に Tool+global 配置済みなので、geometry 再マップはせず
+        # topmost / transient だけを overlay と同じ契約で付与する。
+        try:
+            self._ensure_service_menu_above_dock(menu)
+        except Exception:
+            pass
 
         try:
             QApplication.instance().installEventFilter(menu)
@@ -8008,13 +9779,56 @@ class MainWindow(QMainWindow):
     def _restore_account(self, account_id: str, grok: bool) -> None:
         from src.core.models import Account
 
-        target_store = self._grok_columns if grok else self._twitter_columns
-        for col in target_store:
-            if col.get_account_id() == account_id:
-                if grok == self._grok_mode:
-                    self._set_active_column(col)
-                return
+        # 現在表示中の pack（Dock なら lr/tb、通常なら normal）だけを「既に開いている」とみなす。
+        # 旧実装は _twitter_columns/_grok_columns（常に normal pack）を見ていたため、
+        # Dock 表示中に +X で選ぶと normal 側の既存カラムにヒットして return し、
+        # Dock pack への追加も edge_dock_column_count_* の更新も行われなかった。
+        active = list(getattr(self, "_columns", None) or [])
+        for col in active:
+            try:
+                if col.get_account_id() != account_id:
+                    continue
+            except Exception:
+                continue
+            # 既存カラムが個別収納中なら先に復帰（タブだけ切り替わって本体が見えないのを防ぐ）
+            if getattr(col, "is_individually_stowed", lambda: False)():
+                try:
+                    self._restore_single_column(col)
+                except Exception:
+                    pass
+            # 一括収納で隠れている場合も戻す
+            stowed = list(getattr(self, "_stowed_columns", None) or [])
+            if col in stowed:
+                try:
+                    col.show()
+                except Exception:
+                    pass
+                remaining = [c for c in stowed if c is not col]
+                self._stowed_columns = remaining
+                try:
+                    key = self._layout_mode_key()
+                    if hasattr(self, "_mode_stowed_columns") and self._mode_stowed_columns is not None:
+                        self._mode_stowed_columns[key] = list(remaining)
+                except Exception:
+                    pass
+                try:
+                    self._update_stow_restore_rail()
+                except Exception:
+                    pass
+            if not col.isVisible():
+                try:
+                    col.show()
+                except Exception:
+                    pass
+            self._set_active_column(col)
+            try:
+                self._fit_columns()
+            except Exception:
+                pass
+            return
 
+        # アクティブ pack に無い → 現在モードへ新規追加（_add_column が pack 追記と
+        # _sync_count_from_active_list で edge_dock_column_count_lr/tb を +1 する）
         acc_info = self._known_accounts.get(account_id)
         if not acc_info:
             return
@@ -8026,7 +9840,13 @@ class MainWindow(QMainWindow):
             profile_path=acc_info.get("legacy_profile_path", "") or acc_info.get("profile_path", ""),
         )
 
-        self._add_column(account)
+        self._add_column(account, service_grok=bool(grok))
+        # +カラム経路（_on_column_added）と同様に永続化。再起動・Dock OFF/ON 後も数を維持する
+        try:
+            self._save_columns()
+            self._save_accounts()
+        except Exception:
+            pass
 
     @staticmethod
     def _is_valid_saved_account(acc: dict) -> bool:
@@ -8150,14 +9970,28 @@ class MainWindow(QMainWindow):
                         self._restore_column_tabs(
                             col, tabs_raw, active_tab, defer_load_ms=defer_ms
                         )
-                    if col is not None and bool(col_conf.get("stowed")):
-                        if not hasattr(self, "_pending_stow_ids") or self._pending_stow_ids is None:
-                            self._pending_stow_ids = []
-                        self._pending_stow_ids.append(col.get_column_id())
-                        if not hasattr(self, "_mode_stowed_columns") or self._mode_stowed_columns is None:
-                            self._mode_stowed_columns = {"normal": [], "lr": [], "tb": []}
-                        if col not in self._mode_stowed_columns.setdefault("normal", []):
-                            self._mode_stowed_columns["normal"].append(col)
+                    if col is not None:
+                        # 個別収納と←→一括収納は別状態
+                        # normal pack 実体へ即適用（Dock 起動で bind が先に走っても失わない）
+                        if bool(col_conf.get("individually_stowed")):
+                            try:
+                                pw = int(col_conf.get("width") or 0)
+                                if pw >= AccountColumn.MIN_WIDTH:
+                                    col._width_before_individual_stow = pw
+                                col.set_individually_stowed(True)
+                            except Exception:
+                                pass
+                            if not hasattr(self, "_pending_stow_ids") or self._pending_stow_ids is None:
+                                self._pending_stow_ids = []
+                            try:
+                                self._pending_stow_ids.append(col.get_column_id())
+                            except Exception:
+                                pass
+                        elif bool(col_conf.get("stowed")):
+                            if not hasattr(self, "_mode_stowed_columns") or self._mode_stowed_columns is None:
+                                self._mode_stowed_columns = {"normal": [], "lr": [], "tb": []}
+                            if col not in self._mode_stowed_columns.setdefault("normal", []):
+                                self._mode_stowed_columns["normal"].append(col)
                 except Exception:
                     pass
                 loaded_index += 1
@@ -8205,6 +10039,10 @@ class MainWindow(QMainWindow):
             if not hasattr(self, "_mode_preferred_widths") or self._mode_preferred_widths is None:
                 self._mode_preferred_widths = {"normal": {}, "lr": {}, "tb": {}}
             self._mode_preferred_widths["normal"] = dict(self._preferred_widths)
+        except Exception:
+            pass
+        try:
+            self._apply_individual_stow_on_startup()
         except Exception:
             pass
         QTimer.singleShot(0, self._fit_columns_after_restore)
@@ -8265,12 +10103,24 @@ class MainWindow(QMainWindow):
                         active_tab = int(col_conf.get("active_tab", 0) or 0)
                         if isinstance(tabs_raw, list) and tabs_raw:
                             self._restore_column_tabs(col, tabs_raw, active_tab)
+                    except Exception:
+                        pass
+                    try:
                         if bool(col_conf.get("stowed")):
                             # Dock 等の mode 用。通常起動の _pending_stow_ids には混ぜない
                             if not hasattr(self, "_mode_stowed_columns") or self._mode_stowed_columns is None:
                                 self._mode_stowed_columns = {"normal": [], "lr": [], "tb": []}
                             if col not in self._mode_stowed_columns.setdefault(mode, []):
                                 self._mode_stowed_columns[mode].append(col)
+                    except Exception:
+                        pass
+                    # タブ復元失敗と独立して個別収納を復元する
+                    try:
+                        if bool(col_conf.get("individually_stowed")):
+                            pw = int(col_conf.get("width") or 0)
+                            if pw >= AccountColumn.MIN_WIDTH:
+                                col._width_before_individual_stow = pw
+                            col.set_individually_stowed(True)
                     except Exception:
                         pass
                     w = int(col_conf.get("width") or 0)
@@ -8281,7 +10131,10 @@ class MainWindow(QMainWindow):
                         w = int(widths[aid])
                     if w >= AccountColumn.MIN_WIDTH:
                         try:
-                            col.set_width(w, emit_signal=False)
+                            if getattr(col, "is_individually_stowed", lambda: False)():
+                                col._width_before_individual_stow = w
+                            else:
+                                col.set_width(w, emit_signal=False)
                         except Exception:
                             pass
             if mode == "lr" and lst:
@@ -8447,15 +10300,114 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _toggle_maximized(self) -> None:
-        if getattr(self, "_edge_dock_enabled", False):
-
+    def _stop_window_opacity_anim(self) -> None:
+        anim = getattr(self, "_win_opacity_anim", None)
+        if anim is None:
             return
-        if self.isMaximized():
-            self.showNormal()
-        else:
-            self.showMaximized()
-        self._sync_window_chrome_icons()
+        try:
+            anim.stop()
+        except Exception:
+            pass
+        self._win_opacity_anim = None
+
+    def _run_window_opacity(
+        self, end: float, duration_ms: int, on_finished=None, *, ease_in: bool = False
+    ) -> None:
+        """トップレベル windowOpacity のみ。子や WebView は触らない。"""
+        if getattr(self, "_close_fade_anim", None) is not None:
+            # 終了フェード中は干渉しない
+            return
+        self._stop_window_opacity_anim()
+        self._win_opacity_gen = int(getattr(self, "_win_opacity_gen", 0) or 0) + 1
+        gen = self._win_opacity_gen
+        try:
+            cur = float(self.windowOpacity())
+        except Exception:
+            cur = 1.0
+        end = max(0.0, min(1.0, float(end)))
+        if abs(cur - end) < 0.02:
+            try:
+                self.setWindowOpacity(end)
+            except Exception:
+                pass
+            if callable(on_finished):
+                on_finished()
+            return
+        anim = QPropertyAnimation(self, b"windowOpacity", self)
+        anim.setDuration(max(40, int(duration_ms)))
+        anim.setStartValue(cur)
+        anim.setEndValue(end)
+        anim.setEasingCurve(
+            QEasingCurve.Type.InCubic if ease_in else QEasingCurve.Type.OutCubic
+        )
+
+        def _done() -> None:
+            if gen != getattr(self, "_win_opacity_gen", None):
+                return
+            self._win_opacity_anim = None
+            try:
+                self.setWindowOpacity(end)
+            except Exception:
+                pass
+            if callable(on_finished):
+                try:
+                    on_finished()
+                except Exception:
+                    pass
+
+        anim.finished.connect(_done)
+        self._win_opacity_anim = anim
+        anim.start()
+
+    def _minimize_window(self) -> None:
+        """短い opacity フェード後に showMinimized。Dock ON 時は無効。"""
+        if getattr(self, "_edge_dock_enabled", False):
+            return
+        if self.isMinimized():
+            return
+        if getattr(self, "_close_fade_anim", None) is not None:
+            return
+
+        def _after() -> None:
+            # 最小化中は opacity=0 のまま。復元時の一瞬完全表示を防ぐ。
+            try:
+                self.setWindowOpacity(0.0)
+            except Exception:
+                pass
+            self._opacity_restore_pending = True
+            try:
+                self.showMinimized()
+            except Exception:
+                pass
+
+        self._run_window_opacity(0.0, 120, _after, ease_in=True)
+
+    def _toggle_maximized(self) -> None:
+        """OS状態変更 + 短い opacity フェードイン。Dock ON 時は無効。"""
+        if getattr(self, "_edge_dock_enabled", False):
+            return
+        if getattr(self, "_close_fade_anim", None) is not None:
+            return
+        try:
+            if self.isMaximized():
+                self.showNormal()
+            else:
+                try:
+                    self._normal_window_geometry = QRect(self.geometry())
+                except Exception:
+                    pass
+                self.showMaximized()
+        except Exception:
+            pass
+        try:
+            self.setWindowOpacity(0.0)
+        except Exception:
+            pass
+        self._run_window_opacity(1.0, 140)
+        try:
+            self._sync_window_chrome_icons()
+        except Exception:
+            pass
 
     def _column_for_webview(self, webview: XWebView) -> AccountColumn | None:
         if webview is None:
@@ -8660,13 +10612,32 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event: QEvent) -> None:
         super().resizeEvent(event)
+        try:
+            self._resize_diag_emit("resizeEvent_enter")
+        except Exception:
+            pass
         if self._media_wide_view is not None:
             self._apply_media_wide_geometry()
+        # 方向切替 / Dock ON/OFF の離散置換中は、setGeometry の副作用を最小化する。
+        # mask / fit / QTimer を走らせると最終 state と競合して黒帯の原因になる。
+        if getattr(self, "_edge_dock_switching", False):
+            if self._edge_dock_clip and self._edge_dock_root:
+                fw = max(1, self.width())
+                fh = max(1, self.height())
+                cg = QRect(0, 0, fw, fh)
+                if self._edge_dock_clip.geometry() != cg:
+                    self._edge_dock_clip.setGeometry(cg)
+                if self._edge_dock_root.size() != QSize(fw, fh):
+                    self._edge_dock_root.resize(fw, fh)
+            return
         if not getattr(self, "_edge_dock_enabled", False):
             self._schedule_normal_window_mask()
-        else:
+        elif not getattr(self, "_edge_dock_animating", False):
+            # 展開/収納アニメ中は _apply_reveal_mask が setMask を担当する。
+            # ここで full shape mask を当てると中間 frame が消える。
             self._update_window_mask()
         os_sizing = bool(getattr(self, "_os_sizing", False))
+        # OS リサイズ中も content geometry を追従（HWND だけ伸びて黒帯になるのを防ぐ）
         if (
             self._edge_dock_enabled
             and self._edge_dock_revealed
@@ -8675,8 +10646,6 @@ class MainWindow(QMainWindow):
             and self.width() > self.EDGE_DOCK_INDICATOR_WIDTH * 4
         ):
             self._store_live_size(self.width(), self.height())
-            self._update_chrome_by_window_width()
-            return
 
         if self._edge_dock_clip and self._edge_dock_root:
             fw = max(1, self.width())
@@ -8706,14 +10675,24 @@ class MainWindow(QMainWindow):
             and self.width() > self.EDGE_DOCK_INDICATOR_WIDTH * 4
         ):
             self._store_live_size(self.width(), self.height())
+        # 手動 Dock リサイズ中は mouseMove が毎フレーム fit する。ここでは二重 fit を避け
+        # layout-safe WE 同期だけ行う。
         if getattr(self, "_edge_dock_resizing", False):
+            try:
+                self._sync_webviews_to_columns_layout_safe()
+            except Exception:
+                pass
             self._update_chrome_by_window_width()
             return
         if not stably_collapsed:
-            if not getattr(self, "_edge_dock_enabled", False):
+            try:
                 self._fit_columns()
-            else:
-                QTimer.singleShot(0, self._fit_columns)
+            except Exception:
+                pass
+            try:
+                self._sync_webviews_to_columns_layout_safe()
+            except Exception:
+                pass
         if getattr(self, "_stowed_columns", None):
             self._update_stow_restore_rail()
         self._update_chrome_by_window_width()
@@ -8722,6 +10701,27 @@ class MainWindow(QMainWindow):
                 self._update_dock_notify_visual()
             except Exception:
                 pass
+        try:
+            self._resize_diag_emit("resizeEvent_exit")
+        except Exception:
+            pass
+
+    def _sync_webviews_to_columns_layout_safe(self) -> None:
+        """列幅変更・ウィンドウリサイズ後に WE を layout 安全に追従させる。
+
+        parent.rect 全埋めは境界ハンドルを覆うため使わない（Mayotter1 方針）。
+        """
+        for col in list(getattr(self, "_columns", None) or []):
+            try:
+                if not col.isVisible():
+                    continue
+            except Exception:
+                continue
+            for wv in getattr(col, "webviews", lambda: [])() or []:
+                try:
+                    self._layout_safe_webview_geometry(wv)
+                except Exception:
+                    pass
 
     def _sync_dock_after_os_resize(self) -> None:
         if not self._edge_dock_enabled:
@@ -8746,7 +10746,14 @@ class MainWindow(QMainWindow):
                     root.setGeometry(cg)
         if self._edge_dock_revealed and fw > self.EDGE_DOCK_INDICATOR_WIDTH * 4:
             self._store_live_size(fw, fh, self._edge_dock_direction)
-            self._fit_columns()
+            try:
+                self._fit_columns()
+            except Exception:
+                pass
+            try:
+                self._sync_webviews_to_columns_layout_safe()
+            except Exception:
+                pass
 
     def changeEvent(self, event: QEvent) -> None:
         if event.type() == QEvent.Type.WindowStateChange and getattr(self, "_edge_dock_enabled", False):
@@ -8756,8 +10763,59 @@ class MainWindow(QMainWindow):
                 self.setWindowState(state & ~bad)
                 if not self.isVisible():
                     self.show()
+            super().changeEvent(event)
+            QTimer.singleShot(0, self._update_window_mask)
+            return
+        old_min = False
+        if event.type() == QEvent.Type.WindowStateChange:
+            try:
+                old_min = bool(event.oldState() & Qt.WindowState.WindowMinimized)
+            except Exception:
+                old_min = False
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
+            # タスクバー復元: 最小化中に opacity=0 を維持しているので、そのまま 0→1
+            if (
+                old_min
+                and not self.isMinimized()
+                and not getattr(self, "_edge_dock_enabled", False)
+                and getattr(self, "_close_fade_anim", None) is None
+            ):
+                self._opacity_restore_pending = False
+                try:
+                    # 既に 0 ならそのまま。1 に戻っていた場合だけ先に 0 にする。
+                    if float(self.windowOpacity() or 1.0) > 0.05:
+                        self.setWindowOpacity(0.0)
+                except Exception:
+                    try:
+                        self.setWindowOpacity(0.0)
+                    except Exception:
+                        pass
+                self._run_window_opacity(1.0, 140)
+            elif self.isMinimized():
+                # 最小化中は 1.0 に戻さない（復元点滅の原因になる）
+                pass
+            else:
+                anim = getattr(self, "_win_opacity_anim", None)
+                running = False
+                try:
+                    from PySide6.QtCore import QAbstractAnimation
+                    running = (
+                        anim is not None
+                        and anim.state() == QAbstractAnimation.State.Running
+                    )
+                except Exception:
+                    running = anim is not None
+                if not running:
+                    try:
+                        self.setWindowOpacity(1.0)
+                    except Exception:
+                        pass
+                    self._opacity_restore_pending = False
+            try:
+                self._sync_window_chrome_icons()
+            except Exception:
+                pass
             QTimer.singleShot(0, self._update_window_mask)
 
     def closeEvent(self, event) -> None:
@@ -8765,6 +10823,10 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_close_fade_done", False):
             event.ignore()
             self._close_fade_done = True
+            try:
+                self._stop_window_opacity_anim()
+            except Exception:
+                pass
             try:
                 from PySide6.QtCore import QPropertyAnimation, QEasingCurve
                 anim = QPropertyAnimation(self, b"windowOpacity", self)
@@ -8799,6 +10861,10 @@ class MainWindow(QMainWindow):
             self._save_accounts()
             try:
                 self._save_columns()
+            except Exception:
+                pass
+            try:
+                self._persist_individual_stow_state()
             except Exception:
                 pass
         except Exception:
@@ -9979,7 +12045,6 @@ class MainWindow(QMainWindow):
     def _run_datatransfer_attach_poc(self, paths: list[str], *, use_recording_target: bool = True) -> None:
         import base64
         import json
-        import os
         from pathlib import Path as _P
 
         def _log(msg: str) -> None:
@@ -10916,14 +12981,6 @@ class MainWindow(QMainWindow):
             self._attach_timing_log("T6_synthetic_click", css_x=css_x, css_y=css_y)
         except Exception:
             pass
-        dpr = 1.0
-        try:
-            dpr = float(webview.devicePixelRatioF())
-        except Exception:
-            try:
-                dpr = float(webview.devicePixelRatio())
-            except Exception:
-                dpr = 1.0
         local = QPoint(int(round(css_x)), int(round(css_y)))
         try:
             r = webview.rect()
@@ -11057,7 +13114,6 @@ class MainWindow(QMainWindow):
             QTimer,
             QThread,
             Signal,
-            QObject,
             Qt as _Qt,
         )
 
@@ -11459,7 +13515,6 @@ class MainWindow(QMainWindow):
         def _run_check():
             try:
                 from src.core.updater import check_for_update
-                from pathlib import Path
 
                 repo = ""
                 try:
@@ -11805,6 +13860,8 @@ class MainWindow(QMainWindow):
         column.boundary_dragged.connect(lambda delta, c=column: self._on_boundary_dragged(c, delta))
         column.boundary_drag_finished.connect(self._on_boundary_drag_finished)
         column.stow_right_requested.connect(self._stow_columns_right_of)
+        column.stow_self_requested.connect(self._stow_single_column)
+        column.restore_self_requested.connect(self._restore_single_column)
         column.reset_widths_requested.connect(self._reset_all_column_widths)
         column.reorder_requested.connect(
             lambda x, c=column: self._commit_column_reorder_at(c, x)
@@ -11902,11 +13959,17 @@ class MainWindow(QMainWindow):
             self._update_boundary_visibility()
         else:
             self._fit_after_column_add(column)
+            try:
+                self._column_add_settling = True
+                self._fit_columns()
+            except Exception:
+                pass
+            finally:
+                self._column_add_settling = False
             self._update_boundary_visibility()
             if self._edge_dock_enabled and self._edge_dock_revealed:
                 try:
                     column.show()
-                    self._fit_columns()
                 except Exception:
                     pass
         try:
@@ -12051,12 +14114,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
-                import os
-                if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                    print(f"[REORDER] drag_start column={getattr(column, 'get_column_id', lambda: '?')()}", flush=True)
-            except Exception:
-                pass
-            try:
                 from PySide6.QtWidgets import QGraphicsOpacityEffect
                 if getattr(column, "_reorder_opacity_effect", None) is None:
                     eff = QGraphicsOpacityEffect(column)
@@ -12149,13 +14206,6 @@ class MainWindow(QMainWindow):
             self._update_boundary_visibility()
         except Exception:
             pass
-        try:
-            import os
-            if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                ids = [getattr(c, "get_column_id", lambda: "?")() for c in self._columns]
-                print(f"[REORDER] preview {old_index}->{new_index} order={ids}", flush=True)
-        except Exception:
-            pass
 
     def _on_column_reorder_drag_finished(self) -> None:
         ind = getattr(self, "_column_insert_indicator", None)
@@ -12171,12 +14221,6 @@ class MainWindow(QMainWindow):
                 pass
         original = getattr(self, "_reorder_original", None)
         if original is not None and col is not None:
-            try:
-                import os
-                if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                    print("[REORDER] finished cancel → restore original", flush=True)
-            except Exception:
-                pass
             original = list(original)
             if list(self._columns) != original:
                 for i, c in enumerate(original):
@@ -12204,20 +14248,7 @@ class MainWindow(QMainWindow):
         if column not in self._columns:
             return
         if getattr(self, "_reorder_original", None) is None and getattr(self, "_reorder_dragging", None) is None:
-            try:
-                import os
-                if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                    print("[REORDER] commit skipped (no active drag session)", flush=True)
-            except Exception:
-                pass
             return
-        try:
-            import os
-            if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                ids = [getattr(c, "get_column_id", lambda: "?")() for c in self._columns]
-                print(f"[REORDER] commit start x={global_x} order={ids}", flush=True)
-        except Exception:
-            pass
         if global_x is not None:
             try:
                 last_x = getattr(self, "_reorder_last_x", None)
@@ -12247,13 +14278,6 @@ class MainWindow(QMainWindow):
         ind = getattr(self, "_column_insert_indicator", None)
         if ind is not None:
             ind.hide()
-        try:
-            import os
-            if os.environ.get("MAYOTTER_COLUMN_DEBUG"):
-                ids = [getattr(c, "get_column_id", lambda: "?")() for c in self._columns]
-                print(f"[REORDER] commit done order={ids}", flush=True)
-        except Exception:
-            pass
 
     def _redistribute_equal_widths(self) -> None:
         if getattr(self, "_restoring_session", False):
@@ -12264,11 +14288,34 @@ class MainWindow(QMainWindow):
         viewport_width = self._scroll.viewport().width() if self._scroll is not None else 0
         if viewport_width <= 0:
             viewport_width = max(1, self.width() - 8)
-        n = len(visible)
+        stow_w = AccountColumn.STOWED_WIDTH
         min_w = AccountColumn.MIN_WIDTH
-        base = max(min_w, viewport_width // n)
+        # 個別収納スロットは均等割の対象外（_fit_columns と同じ扱い）
+        normals = [
+            c for c in visible
+            if not getattr(c, "is_individually_stowed", lambda: False)()
+        ]
+        stowed = [
+            c for c in visible
+            if getattr(c, "is_individually_stowed", lambda: False)()
+        ]
+        for col in stowed:
+            try:
+                col._current_width = stow_w
+                col.setMinimumWidth(stow_w)
+                col.setMaximumWidth(stow_w)
+                col.setFixedWidth(stow_w)
+                col.updateGeometry()
+            except Exception:
+                pass
+        if not normals:
+            self._update_boundary_visibility()
+            return
+        avail = max(0, viewport_width - len(stowed) * stow_w)
+        n = len(normals)
+        base = max(min_w, avail // n)
         widths = [base] * n
-        rem = viewport_width - sum(widths)
+        rem = avail - sum(widths)
         i = 0
         while rem > 0 and n > 0:
             widths[i % n] += 1
@@ -12282,10 +14329,31 @@ class MainWindow(QMainWindow):
             i += 1
             if i > n * 8:
                 break
-        for col, w in zip(visible, widths):
+        for col, w in zip(normals, widths):
             col.set_width(w, emit_signal=False)
+        # リセット後の幅を preferred に即時反映（resize→_fit_columns で古い幅が復活しないように）
+        pref = dict(getattr(self, "_preferred_widths", None) or {})
+        snap = dict(getattr(self, "_stow_saved_widths", None) or {})
+        for col, w in zip(normals, widths):
+            try:
+                cid = col.get_column_id()
+            except Exception:
+                cid = ""
+            if not cid:
+                continue
+            pref[cid] = int(w)
+            snap.pop(cid, None)
+        self._preferred_widths = pref
+        self._stow_saved_widths = snap
+        try:
+            key = self._layout_mode_key()
+            if not hasattr(self, "_mode_preferred_widths") or self._mode_preferred_widths is None:
+                self._mode_preferred_widths = {"normal": {}, "lr": {}, "tb": {}}
+            self._mode_preferred_widths[key] = dict(pref)
+        except Exception:
+            pass
         if self._scroll_layout is not None:
-            for col in visible:
+            for col in normals:
                 self._scroll_layout.setStretchFactor(col, 0)
         self._update_boundary_visibility()
         self._save_column_widths()
@@ -12298,67 +14366,197 @@ class MainWindow(QMainWindow):
         if viewport_width <= 0:
             viewport_width = max(1, self.width() - 8)
         min_w = AccountColumn.MIN_WIDTH
-        n = len(visible)
-        equal_share = max(min_w, viewport_width // max(1, n))
+        default_w = float(AccountColumn.DEFAULT_WIDTH)
+        stow_w = AccountColumn.STOWED_WIDTH
+        # 現在モードの preferred を補完（Dock pack 初回など cid が空のとき他モード比を転写）
+        try:
+            key = self._layout_mode_key()
+            self._ensure_mode_preferred_weights(key, visible)
+        except Exception:
+            pass
+        pref = dict(getattr(self, "_preferred_widths", None) or {})
 
-        existing = []
-        for col in visible:
+        def _is_stowed(col) -> bool:
+            return bool(getattr(col, "is_individually_stowed", lambda: False)())
+
+        def _weight(col) -> float:
+            try:
+                cid = col.get_column_id()
+            except Exception:
+                cid = ""
+            if cid and float(pref.get(cid) or 0) > 0:
+                return max(float(min_w), float(pref[cid]))
+            try:
+                live = float(col.get_width() or 0)
+            except Exception:
+                live = 0.0
+            if live >= min_w:
+                return live
+            return default_w
+
+        if new_col is None or new_col not in visible:
+            return
+
+        stowed_cols = [c for c in visible if _is_stowed(c)]
+        normal_cols = [c for c in visible if not _is_stowed(c)]
+        stowed_sum = stow_w * len(stowed_cols)
+        avail = max(0, int(viewport_width) - stowed_sum)
+
+        if not normal_cols:
+            for col in stowed_cols:
+                col.set_width(stow_w, emit_signal=False)
+            if self._scroll_layout is not None:
+                for col in visible:
+                    try:
+                        self._scroll_layout.setStretchFactor(col, 0)
+                    except Exception:
+                        pass
+            self._save_column_widths()
+            return
+
+        # 既存通常カラムのウェイト（相対比を維持）。
+        # 新規は既存 weight の平均（全て同じならその共通値）。既存が無ければ DEFAULT_WIDTH。
+        existing_weights: list[float] = []
+        for col in normal_cols:
             if col is new_col:
                 continue
-            try:
-                live = int(col.get_width() or 0)
-            except Exception:
-                live = 0
-            existing.append(float(live if live >= min_w else AccountColumn.DEFAULT_WIDTH))
-
-        near_equal = True
-        if existing:
-            mean = sum(existing) / len(existing)
-            if mean > 0:
-                for v in existing:
-                    if v > mean * 1.3 or v < mean * 0.7:
-                        near_equal = False
-                        break
-            else:
-                near_equal = True
-
-        if near_equal or not existing:
-            ratios = [float(equal_share)] * n
+            existing_weights.append(_weight(col))
+        if existing_weights:
+            new_weight = sum(existing_weights) / float(len(existing_weights))
         else:
-            ratios = []
-            for col in visible:
-                if col is new_col:
-                    ratios.append(float(equal_share))
-                else:
-                    try:
-                        live = int(col.get_width() or 0)
-                    except Exception:
-                        live = 0
-                    ratios.append(float(live if live >= min_w else AccountColumn.DEFAULT_WIDTH))
+            new_weight = default_w
+        new_weight = max(float(min_w), float(new_weight))
 
-        total = sum(ratios) or float(n)
-        widths = [max(min_w, int(viewport_width * r / total)) for r in ratios]
-        diff = viewport_width - sum(widths)
-        for i in range(abs(diff)):
-            if diff > 0:
-                widths[i % n] += 1
-            elif widths[n - 1 - (i % n)] > min_w:
-                widths[n - 1 - (i % n)] -= 1
-        for col, w in zip(visible, widths):
-            col.set_width(w, emit_signal=False)
+        weights: list[float] = []
+        for col in normal_cols:
+            if col is new_col:
+                weights.append(new_weight)
+            else:
+                weights.append(_weight(col))
+
+        total_w = sum(weights) or float(len(weights))
+        # まず比率どおりに配分
+        raw = [avail * (w / total_w) for w in weights]
+        widths = [max(min_w, int(round(r))) for r in raw]
+
+        # viewport との差分を調整（比率を大きく崩さないようウェイト比例で）
+        diff = avail - sum(widths)
+        if diff != 0 and widths:
+            # 差分をウェイト比で分配（整数）
+            order = sorted(range(len(widths)), key=lambda i: weights[i], reverse=(diff > 0))
+            t = 0
+            while t < abs(diff):
+                progressed = False
+                for i in order:
+                    if t >= abs(diff):
+                        break
+                    if diff > 0:
+                        widths[i] += 1
+                        t += 1
+                        progressed = True
+                    elif widths[i] > min_w:
+                        widths[i] -= 1
+                        t += 1
+                        progressed = True
+                if not progressed:
+                    break
+
+        # MIN を下回るカラムがあれば、余剰のあるカラムから移す
+        for i, w in enumerate(widths):
+            if w >= min_w:
+                continue
+            need = min_w - w
+            widths[i] = min_w
+            for j in sorted(range(len(widths)), key=lambda k: widths[k], reverse=True):
+                if need <= 0:
+                    break
+                if j == i:
+                    continue
+                can = widths[j] - min_w
+                if can <= 0:
+                    continue
+                take = min(can, need)
+                widths[j] -= take
+                need -= take
+
+        for col, w in zip(normal_cols, widths):
+            col.set_width(max(min_w, int(w)), emit_signal=False)
+        for col in stowed_cols:
+            col.set_width(stow_w, emit_signal=False)
+
         if self._scroll_layout is not None:
             for col in visible:
-                self._scroll_layout.setStretchFactor(col, 0)
-        self._save_column_widths()
+                try:
+                    self._scroll_layout.setStretchFactor(col, 0)
+                except Exception:
+                    pass
+        try:
+            cid_new = ""
+            try:
+                cid_new = new_col.get_column_id()
+            except Exception:
+                cid_new = ""
+            pref_out = dict(getattr(self, "_preferred_widths", None) or {})
+            # ensure で埋めた既存値を維持しつつ、新規だけ weight を載せる
+            if cid_new:
+                pref_out[cid_new] = float(new_weight)
+            self._preferred_widths = pref_out
+            try:
+                key = self._layout_mode_key()
+                if not hasattr(self, "_mode_preferred_widths") or self._mode_preferred_widths is None:
+                    self._mode_preferred_widths = {"normal": {}, "lr": {}, "tb": {}}
+                self._mode_preferred_widths[key] = dict(pref_out)
+            except Exception:
+                pass
+            if self._settings_manager and cid_new:
+                widths_to_save = {}
+                for col in self._columns:
+                    try:
+                        cid = col.get_column_id()
+                    except Exception:
+                        continue
+                    if not cid:
+                        continue
+                    if getattr(col, "is_individually_stowed", lambda: False)():
+                        w = int(
+                            pref_out.get(cid)
+                            or getattr(col, "_width_before_individual_stow", 0)
+                            or 0
+                        )
+                    else:
+                        w = int(pref_out.get(cid) or 0)
+                        if w <= 0:
+                            try:
+                                w = int(col.get_width() or 0)
+                            except Exception:
+                                w = 0
+                    if w > 0:
+                        widths_to_save[cid] = w
+                mode = self._layout_mode_key()
+                if hasattr(self._settings_manager, "save_column_widths_for_mode"):
+                    self._settings_manager.save_column_widths_for_mode(mode, widths_to_save)
+                elif mode == "normal":
+                    self._settings_manager.save_column_widths(widths_to_save)
+        except Exception:
+            pass
 
     def _reset_all_column_widths(self) -> None:
         self._redistribute_equal_widths()
 
     def _stow_columns_list(self, to_stow, visible, keep_visible=None) -> None:
         keep_visible = list(keep_visible or [])
+        # 個別収納カラムは Dock 収納に巻き込まない
+        to_stow = [
+            c for c in to_stow
+            if not getattr(c, "is_individually_stowed", lambda: False)()
+        ]
+        if not to_stow:
+            return
         snap: dict = dict(getattr(self, "_stow_saved_widths", None) or {})
         pref = dict(getattr(self, "_preferred_widths", None) or {})
         for col in visible:
+            if getattr(col, "is_individually_stowed", lambda: False)():
+                continue
             try:
                 cid = col.get_column_id()
                 live = int(col.get_width() or col.width() or 0)
@@ -12441,15 +14639,164 @@ class MainWindow(QMainWindow):
             return
         self._stow_columns_list(to_stow, visible, keep_visible=visible[: idx + 1])
 
+    def _normal_visible_columns(self):
+        out = []
+        for c in self._columns:
+            try:
+                if not c.isVisible():
+                    continue
+                if getattr(c, "is_individually_stowed", lambda: False)():
+                    continue
+                out.append(c)
+            except Exception:
+                continue
+        return out
+
+    def _update_individual_stow_buttons(self) -> None:
+        normals = self._normal_visible_columns()
+        can_stow = len(normals) > 1
+        tip_on = "このカラムを収納"
+        tip_off = "最後のカラムは収納できません"
+        for col in self._columns:
+            btn = getattr(col, "_stow_btn", None)
+            if btn is None:
+                continue
+            try:
+                if getattr(col, "is_individually_stowed", lambda: False)():
+                    continue
+                btn.setEnabled(can_stow)
+                btn.setToolTip(tip_on if can_stow else tip_off)
+            except Exception:
+                pass
+
+    def _stow_single_column(self, column) -> None:
+        if column is None:
+            return
+        if getattr(column, "is_individually_stowed", lambda: False)():
+            return
+        if column not in self._columns:
+            try:
+                if column.parent() is None:
+                    return
+            except Exception:
+                return
+        # 最後の通常表示カラムは個別収納しない
+        if len(self._normal_visible_columns()) <= 1:
+            return
+        # preferred は「ユーザーの意図した幅」。個別収納中の一時再配分幅で上書きしない。
+        # 最初の個別収納時だけ、可視通常カラムの実幅を snapshot する。
+        pref = dict(getattr(self, "_preferred_widths", None) or {})
+        any_indiv = any(
+            getattr(c, "is_individually_stowed", lambda: False)()
+            for c in self._columns
+        )
+        if not any_indiv:
+            for col in self._columns:
+                if not col.isVisible():
+                    continue
+                if getattr(col, "is_individually_stowed", lambda: False)():
+                    continue
+                try:
+                    cid = col.get_column_id()
+                    w = int(col.get_width() or col.width() or 0)
+                except Exception:
+                    continue
+                if cid and w >= AccountColumn.MIN_WIDTH:
+                    pref[cid] = w
+            self._preferred_widths = pref
+        # 収納対象カラムの復帰幅は preferred を優先（一時再配分後の実幅を使わない）
+        try:
+            cid = column.get_column_id()
+            pw = int(pref.get(cid) or 0)
+            if cid and pw >= AccountColumn.MIN_WIDTH:
+                column._width_before_individual_stow = pw
+        except Exception:
+            pass
+        # enter の幅固定と fit の再配分を同一フレームにまとめ、隙間描画を出さない
+        host = getattr(self, "_scroll_content", None)
+        if host is not None:
+            host.setUpdatesEnabled(False)
+        try:
+            try:
+                column.set_individually_stowed(True)
+            except Exception:
+                return
+            self._fit_columns()
+        finally:
+            if host is not None:
+                host.setUpdatesEnabled(True)
+        self._update_individual_stow_buttons()
+        if self._active_column is column:
+            others = [
+                c for c in self._columns
+                if c is not column and c.isVisible()
+                and not getattr(c, "is_individually_stowed", lambda: False)()
+            ]
+            if others:
+                self._set_active_column(others[0])
+            else:
+                self._active_column = None
+                self._clear_strip()
+        try:
+            self._save_columns()
+        except Exception:
+            pass
+        try:
+            self._persist_individual_stow_state()
+        except Exception:
+            pass
+
+    def _restore_single_column(self, column) -> None:
+        if column is None:
+            return
+        if not getattr(column, "is_individually_stowed", lambda: False)():
+            return
+        if column not in self._columns:
+            try:
+                if column.parent() is None:
+                    return
+            except Exception:
+                return
+        host = getattr(self, "_scroll_content", None)
+        if host is not None:
+            host.setUpdatesEnabled(False)
+        try:
+            try:
+                column.set_individually_stowed(False)
+            except Exception:
+                return
+            self._fit_columns()
+            # 最終幅確定後に WebView を出す（狭い幅での show→拡大を避ける）
+            try:
+                column.reveal_after_restore()
+            except Exception:
+                pass
+        finally:
+            if host is not None:
+                host.setUpdatesEnabled(True)
+        self._update_individual_stow_buttons()
+        try:
+            self._save_columns()
+        except Exception:
+            pass
+        try:
+            self._persist_individual_stow_state()
+        except Exception:
+            pass
+
+
     def _persist_stowed_state(self) -> None:
         if not self._settings_manager:
             return
         if getattr(self, "_restoring_session", False):
             return
+        # ←→一括収納のみ（個別収納は columns の individually_stowed で保存）
         ids = []
         seen = set()
         for col in list(getattr(self, "_stowed_columns", None) or []):
             try:
+                if getattr(col, "is_individually_stowed", lambda: False)():
+                    continue
                 cid = col.get_column_id()
             except Exception:
                 continue
@@ -12459,6 +14806,8 @@ class MainWindow(QMainWindow):
         for _lst in (getattr(self, "_mode_stowed_columns", None) or {}).values():
             for col in list(_lst or []):
                 try:
+                    if getattr(col, "is_individually_stowed", lambda: False)():
+                        continue
                     cid = col.get_column_id()
                 except Exception:
                     continue
@@ -12477,7 +14826,215 @@ class MainWindow(QMainWindow):
         if self._settings_manager and hasattr(self._settings_manager, "clear_stowed_state"):
             self._settings_manager.clear_stowed_state()
 
+    def _persist_individual_stow_state(self) -> None:
+        if not self._settings_manager:
+            return
+        if getattr(self, "_restoring_session", False):
+            return
+        if not hasattr(self._settings_manager, "save_individually_stowed_state"):
+            return
+        ids = []
+        widths = {}
+        for col in list(getattr(self, "_columns", None) or []):
+            try:
+                if not getattr(col, "is_individually_stowed", lambda: False)():
+                    continue
+                cid = col.get_column_id()
+            except Exception:
+                continue
+            if not cid:
+                continue
+            ids.append(cid)
+            try:
+                w = int(getattr(col, "_width_before_individual_stow", 0) or 0)
+            except Exception:
+                w = 0
+            if w > 0:
+                widths[cid] = w
+        self._settings_manager.save_individually_stowed_state(ids, widths)
+
+    def _reapply_individual_stow_from_snap(self, snap: list) -> None:
+        """Dock→Main 移送後に個別収納を再適用する。既に収納済みのカラムは触らない。"""
+        if not snap:
+            return
+        cols = list(getattr(self, "_columns", None) or [])
+        if not cols:
+            return
+        normal_n = len(cols)
+        applied = sum(
+            1 for c in cols
+            if getattr(c, "is_individually_stowed", lambda: False)()
+        )
+        used: set[int] = set()
+        for i, c in enumerate(cols):
+            if getattr(c, "is_individually_stowed", lambda: False)():
+                used.add(i)
+
+        def _ctype(c) -> str:
+            try:
+                return str(c.get_column_type() or "")
+            except Exception:
+                return str(getattr(c, "_column_type", "") or "")
+
+        for aid, ctype, pw in snap:
+            if normal_n - applied <= 1:
+                break
+            pick = None
+            pick_i = -1
+            for i, col in enumerate(cols):
+                if i in used:
+                    continue
+                try:
+                    if str(col.get_account_id() or "") != aid:
+                        continue
+                except Exception:
+                    continue
+                if _ctype(col) == ctype:
+                    pick, pick_i = col, i
+                    break
+            if pick is None:
+                for i, col in enumerate(cols):
+                    if i in used:
+                        continue
+                    try:
+                        if str(col.get_account_id() or "") == aid:
+                            pick, pick_i = col, i
+                            break
+                    except Exception:
+                        continue
+            if pick is None:
+                continue
+            try:
+                if int(pw or 0) >= AccountColumn.MIN_WIDTH:
+                    pick._width_before_individual_stow = int(pw)
+                if not getattr(pick, "is_individually_stowed", lambda: False)():
+                    pick.set_individually_stowed(True)
+                used.add(pick_i)
+                applied += 1
+            except Exception:
+                continue
+        try:
+            self._update_individual_stow_buttons()
+        except Exception:
+            pass
+
+    def _apply_individual_stow_on_startup(self) -> None:
+        # 全 mode pack へ、各 mode の保存設定を source of truth として適用する。
+        # Dock ON 起動でも normal pack の個別収納を落とさない（Dock OFF 復帰用）。
+        if not self._settings_manager:
+            return
+        packs = self._service_packs() if hasattr(self, "_service_packs") else {}
+        widths_global = {}
+        ids_global = []
+        if hasattr(self._settings_manager, "get_individually_stowed_state"):
+            try:
+                state = self._settings_manager.get_individually_stowed_state() or {}
+                ids_global = list(state.get("column_ids") or [])
+                widths_global = dict(state.get("widths") or {})
+            except Exception:
+                ids_global = []
+                widths_global = {}
+        pending = list(getattr(self, "_pending_stow_ids", None) or [])
+        self._pending_stow_ids = []
+
+        any_applied = False
+        for mode in ("normal", "lr", "tb"):
+            cols = list((packs or {}).get(mode) or [])
+            if not cols:
+                continue
+            confs = []
+            try:
+                if hasattr(self._settings_manager, "get_columns_for_mode"):
+                    confs = list(self._settings_manager.get_columns_for_mode(mode) or [])
+                elif mode == "normal":
+                    confs = list(self._settings_manager.get_columns() or [])
+            except Exception:
+                confs = []
+
+            by_id = {}
+            for col in cols:
+                try:
+                    by_id[col.get_column_id()] = col
+                except Exception:
+                    continue
+
+            targets = []
+            seen = set()
+
+            def _add(col, pw: int = 0):
+                if col is None:
+                    return
+                try:
+                    key = col.get_column_id() or id(col)
+                except Exception:
+                    key = id(col)
+                if key in seen:
+                    return
+                seen.add(key)
+                targets.append((col, pw))
+
+            for i, conf in enumerate(confs):
+                try:
+                    if not bool(conf.get("individually_stowed")):
+                        continue
+                except Exception:
+                    continue
+                col = None
+                cid = str(conf.get("column_id") or "").strip()
+                if cid:
+                    col = by_id.get(cid)
+                if col is None and i < len(cols):
+                    col = cols[i]
+                pw = 0
+                try:
+                    pw = int(conf.get("width") or 0)
+                except Exception:
+                    pw = 0
+                if not pw and cid:
+                    pw = int(widths_global.get(cid) or 0)
+                _add(col, pw)
+
+            # normal のみ: pending / グローバル ID（互換）
+            if mode == "normal":
+                for cid in pending + ids_global:
+                    if not cid:
+                        continue
+                    _add(by_id.get(cid), int(widths_global.get(cid) or 0))
+
+            for col, pw in targets:
+                try:
+                    if getattr(col, "is_individually_stowed", lambda: False)():
+                        any_applied = True
+                        continue
+                    if not pw:
+                        try:
+                            pw = int(widths_global.get(col.get_column_id()) or 0)
+                        except Exception:
+                            pw = 0
+                    if not pw:
+                        pw = int(getattr(col, "_width_before_individual_stow", 0) or 0)
+                    if pw >= AccountColumn.MIN_WIDTH:
+                        col._width_before_individual_stow = pw
+                    col.set_individually_stowed(True)
+                    any_applied = True
+                except Exception:
+                    continue
+
+        if not any_applied:
+            return
+        # 表示中 pack だけ fit（非表示 pack は触らない）
+        try:
+            self._fit_columns()
+        except Exception:
+            pass
+        try:
+            self._update_individual_stow_buttons()
+        except Exception:
+            pass
+
+
     def _apply_persisted_stow_on_startup(self) -> None:
+        # 一括収納の既存復元（個別収納は _apply_individual_stow_on_startup）
         widths = {}
         if self._settings_manager and hasattr(self._settings_manager, "get_stowed_state"):
             try:
@@ -12497,20 +15054,31 @@ class MainWindow(QMainWindow):
                 continue
 
         stowed = []
-        pending = list(getattr(self, "_pending_stow_ids", None) or [])
-        for cid in pending:
-            col = by_id.get(cid)
-            if col is not None and col not in stowed:
-                stowed.append(col)
+        seen = set()
         for cid in legacy_ids:
+            if not cid or cid in seen:
+                continue
             col = by_id.get(cid)
-            if col is not None and col not in stowed:
+            if col is None:
+                continue
+            if getattr(col, "is_individually_stowed", lambda: False)():
+                continue
+            seen.add(cid)
+            stowed.append(col)
+        for col in list(
+            (getattr(self, "_mode_stowed_columns", None) or {}).get(
+                self._layout_mode_key() if hasattr(self, "_layout_mode_key") else "normal"
+            )
+            or []
+        ):
+            if col in stowed:
+                continue
+            if getattr(col, "is_individually_stowed", lambda: False)():
+                continue
+            if col in self._columns:
                 stowed.append(col)
-        self._pending_stow_ids = []
 
         if not stowed:
-            if legacy_ids and not pending:
-                self._clear_persisted_stowed_state()
             return
 
         for col in stowed:
@@ -12519,15 +15087,14 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._stowed_columns = stowed
-        self._stow_saved_widths = dict(widths) if widths else dict(getattr(self, "_stow_saved_widths", {}) or {})
+        self._stow_saved_widths = dict(widths) if widths else dict(
+            getattr(self, "_stow_saved_widths", {}) or {}
+        )
         try:
             if not hasattr(self, "_mode_stowed_columns") or self._mode_stowed_columns is None:
                 self._mode_stowed_columns = {"normal": [], "lr": [], "tb": []}
-            if not hasattr(self, "_mode_stow_saved_widths") or self._mode_stow_saved_widths is None:
-                self._mode_stow_saved_widths = {"normal": {}, "lr": {}, "tb": {}}
             key = self._layout_mode_key()
             self._mode_stowed_columns[key] = list(stowed)
-            self._mode_stow_saved_widths[key] = dict(self._stow_saved_widths)
             self._bound_mode_key = key
         except Exception:
             pass
@@ -12535,10 +15102,6 @@ class MainWindow(QMainWindow):
         self._update_boundary_visibility()
         self.hide_boundary_actions()
         self._update_stow_restore_rail()
-        try:
-            self._persist_stowed_state()
-        except Exception:
-            pass
 
     def _restore_stowed_columns(self, side: str | None = None) -> None:
         all_stowed = list(getattr(self, "_stowed_columns", None) or [])
@@ -12586,54 +15149,18 @@ class MainWindow(QMainWindow):
         self._update_stow_restore_rail()
 
     def _apply_stow_saved_widths(self, snap: dict) -> None:
-        if not snap:
-            self._fit_columns()
-            return
-        visible = [c for c in self._columns if c.isVisible()]
-        if not visible:
-            return
-        viewport_width = 0
-        try:
-            viewport_width = int(self._scroll.viewport().width())
-        except Exception:
-            viewport_width = 0
-        if viewport_width <= 0:
-            self._fit_columns()
-            return
-        min_w = AccountColumn.MIN_WIDTH
-        ratios = []
-        for col in visible:
-            cid = col.get_column_id()
-            if cid in snap and snap[cid] > 0:
-                ratios.append(float(snap[cid]))
-            else:
+        # 個別収納の preferred / 固定幅を壊さないよう、snap を preferred に戻して fit に任せる
+        if snap:
+            pref = dict(getattr(self, "_preferred_widths", None) or {})
+            for cid, w in snap.items():
                 try:
-                    ratios.append(float(col.get_width() or col.width() or min_w))
+                    wi = int(w or 0)
                 except Exception:
-                    ratios.append(float(min_w))
-        total = sum(ratios)
-        if total <= 0:
-            self._fit_columns()
-            return
-        widths = []
-        for r in ratios:
-            widths.append(max(min_w, int(viewport_width * r / total)))
-        diff = viewport_width - sum(widths)
-        n = len(widths)
-        for i in range(abs(diff)):
-            if diff > 0:
-                widths[i % n] += 1
-            elif diff < 0:
-                idx = n - 1 - (i % n)
-                if widths[idx] > min_w:
-                    widths[idx] -= 1
-        for col, w in zip(visible, widths):
-            col.set_width(w, emit_signal=False)
-        self._scroll_content.setMinimumWidth(0)
-        content_h = max(1, self._scroll.viewport().height())
-        self._scroll_content.resize(viewport_width, content_h)
-        self._scroll_layout.invalidate()
-        self._scroll_layout.activate()
+                    continue
+                if cid and wi >= AccountColumn.MIN_WIDTH:
+                    pref[cid] = wi
+            self._preferred_widths = pref
+        self._fit_columns()
 
     def _point_on_restore_knob(self, local_x: int, local_y: int) -> bool:
         return self._restore_knob_side_at(local_x, local_y) is not None
@@ -12683,19 +15210,25 @@ class MainWindow(QMainWindow):
         ):
             self._clear_restore_hand_cursor()
             return
-        on = False
+        side = None
         try:
             gp = event.globalPosition().toPoint()
             local = self.mapFromGlobal(gp)
-            on = self._point_on_restore_knob(local.x(), local.y())
+            side = self._restore_knob_side_at(local.x(), local.y())
         except Exception:
-            on = False
-        rail = getattr(self, "_stow_restore_rail", None)
-        if rail is not None and hasattr(rail, "set_app_hover"):
-            try:
-                rail.set_app_hover(on)
-            except Exception:
-                pass
+            side = None
+        on = side is not None
+        # 左右それぞれ独立に hover を更新する（右だけだと左が leave を取り逃したまま残る）
+        for name, want in (
+            ("_stow_restore_rail", "right"),
+            ("_stow_restore_rail_left", "left"),
+        ):
+            rail = getattr(self, name, None)
+            if rail is not None and hasattr(rail, "set_app_hover"):
+                try:
+                    rail.set_app_hover(side == want)
+                except Exception:
+                    pass
         forced = bool(getattr(self, "_restore_hand_cursor", False))
         if on and not forced:
             QApplication.setOverrideCursor(Qt.CursorShape.PointingHandCursor)
@@ -12711,6 +15244,13 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._restore_hand_cursor = False
+        for name in ("_stow_restore_rail", "_stow_restore_rail_left"):
+            rail = getattr(self, name, None)
+            if rail is not None and hasattr(rail, "set_app_hover"):
+                try:
+                    rail.set_app_hover(False)
+                except Exception:
+                    pass
 
 
     def _stow_index_groups(self) -> tuple[list, list, list, list]:
@@ -13031,9 +15571,9 @@ class MainWindow(QMainWindow):
                     self.show()
                     self.raise_()
                     try:
-                        wid = int(self.winId())
+                        self.winId()
                     except Exception:
-                        wid = 0
+                        pass
 
             rail = _StowRestoreKnob(self, side="right")
             self._stow_restore_rail = rail
@@ -13076,6 +15616,67 @@ class MainWindow(QMainWindow):
         else:
             _hide_rail(left_rail)
 
+
+    def _column_layout_target_width(self) -> int:
+        """AccountColumn 群が埋めるべき水平 client 幅の権威ある値。
+
+        切替直後（特に hide 中の offline direction/ON-OFF 置換）は
+        QScrollArea.viewport().width() が旧 geometry のまま残ることがある。
+        その stale 幅で fit すると sum(column widths) << client となり、
+        edgeDockClip/root の #0b111f が黒帯として露出する。
+
+        契約:
+          - Dock 有効時は edgeDockRoot 幅（scroll contentsMargins 控除）を優先
+          - Dock 無効時は MainWindow 幅を優先
+          - いずれも 0 のときだけ scroll/viewport にフォールバック
+        """
+        def _scroll_h_margins() -> int:
+            try:
+                if self._scroll is None:
+                    return 0
+                m = self._scroll.contentsMargins()
+                return max(0, int(m.left()) + int(m.right()))
+            except Exception:
+                return 0
+
+        if getattr(self, "_edge_dock_enabled", False):
+            root = getattr(self, "_edge_dock_root", None)
+            if root is not None:
+                try:
+                    rw = int(root.width() or 0)
+                    if rw > 0:
+                        return max(1, rw - _scroll_h_margins())
+                except Exception:
+                    pass
+            try:
+                ww = int(self.width() or 0)
+                if ww > 0:
+                    return max(1, ww - _scroll_h_margins())
+            except Exception:
+                pass
+        else:
+            try:
+                ww = int(self.width() or 0)
+                if ww > 0:
+                    return ww
+            except Exception:
+                pass
+        try:
+            if self._scroll is not None:
+                sw = int(self._scroll.width() or 0)
+                if sw > 0:
+                    return max(1, sw - _scroll_h_margins())
+        except Exception:
+            pass
+        try:
+            if self._scroll is not None and self._scroll.viewport() is not None:
+                vw = int(self._scroll.viewport().width() or 0)
+                if vw > 0:
+                    return vw
+        except Exception:
+            pass
+        return 0
+
     def _fit_columns_after_restore(self, *, _attempt: int = 0) -> None:
         try:
             vw = 0
@@ -13089,6 +15690,10 @@ class MainWindow(QMainWindow):
         self._fit_columns()
 
     def _fit_columns(self) -> None:
+        try:
+            self._resize_diag_emit("fit_columns_enter", force=True)
+        except Exception:
+            pass
         if self._media_wide_view is not None:
             self._apply_media_wide_geometry()
             return
@@ -13103,6 +15708,22 @@ class MainWindow(QMainWindow):
             n = min(self._active_column_count(), len(self._columns))
             visible = self._columns[:n] if n else []
         if not visible:
+            return
+
+        # 追加直後は _fit_after_column_add で幅確定済みのため再計算しない
+        if getattr(self, "_column_add_settling", False):
+            try:
+                if self._scroll_layout is not None:
+                    self._scroll_layout.invalidate()
+                    if self._scroll_content is not None and self._scroll_content.layout() is not None:
+                        self._scroll_content.layout().activate()
+            except Exception:
+                pass
+            try:
+                self._update_boundary_visibility()
+                self._update_individual_stow_buttons()
+            except Exception:
+                pass
             return
 
         viewport_width = 0
@@ -13130,6 +15751,7 @@ class MainWindow(QMainWindow):
 
         n = len(visible)
         min_w = AccountColumn.MIN_WIDTH
+        stow_w = AccountColumn.STOWED_WIDTH
 
         preferred = dict(getattr(self, "_preferred_widths", None) or {})
         saved = {}
@@ -13142,8 +15764,13 @@ class MainWindow(QMainWindow):
 
         col_config_by_id = {conf.column_id: conf for conf in self._column_configs}
 
-        ratios = []
-        for col in visible:
+        is_stowed = [
+            bool(getattr(c, "is_individually_stowed", lambda: False)())
+            for c in visible
+        ]
+        stowed_count = sum(1 for s in is_stowed if s)
+
+        def _pref_w(col) -> float:
             cid = col.get_column_id()
             aid = col.get_account_id()
             live_w = 0
@@ -13152,65 +15779,192 @@ class MainWindow(QMainWindow):
             except Exception:
                 live_w = 0
             if cid in preferred and preferred[cid] > 0:
-                ratios.append(float(preferred[cid]))
-            elif cid in saved and saved[cid] > 0:
-                ratios.append(float(saved[cid]))
-            elif aid in saved and saved[aid] > 0:
-                ratios.append(float(saved[aid]))
-            elif cid in col_config_by_id and col_config_by_id[cid].width > 0:
-                ratios.append(float(col_config_by_id[cid].width))
-            elif live_w >= AccountColumn.MIN_WIDTH:
-                ratios.append(float(live_w))
-            else:
-                ratios.append(float(viewport_width) / n)
+                return float(preferred[cid])
+            if cid in saved and saved[cid] > 0:
+                return float(saved[cid])
+            if aid in saved and saved[aid] > 0:
+                return float(saved[aid])
+            if cid in col_config_by_id and col_config_by_id[cid].width > 0:
+                return float(col_config_by_id[cid].width)
+            if live_w >= AccountColumn.MIN_WIDTH:
+                return float(live_w)
+            return float(AccountColumn.DEFAULT_WIDTH)
 
-        total_ratio = sum(ratios)
-        if total_ratio <= 0:
-            total_ratio = n
+        pref_list = [_pref_w(c) for c in visible]
+        widths = [stow_w if s else 0 for s in is_stowed]
+        normal_idxs = [k for k, s in enumerate(is_stowed) if not s]
 
-        widths = []
-        for r in ratios:
-            w = max(min_w, int(viewport_width * r / total_ratio))
-            widths.append(w)
-
-        diff = viewport_width - sum(widths)
-        for i in range(abs(diff)):
-            if diff > 0:
-                widths[i % n] += 1
-            elif diff < 0:
-                idx = n - 1 - (i % n)
-                if widths[idx] > min_w:
+        if stowed_count > 0 and normal_idxs:
+            # 収納スロット分を除いた viewport を通常カラムへ preferred 比率で配分
+            # preferred 自体は書き換えない（復帰・幅リセット用の値を維持）
+            avail = max(0, int(viewport_width) - stowed_count * stow_w)
+            seg_total = sum(pref_list[k] for k in normal_idxs) or 1.0
+            for idx in normal_idxs:
+                widths[idx] = max(min_w, int(avail * pref_list[idx] / seg_total))
+            for idx, s in enumerate(is_stowed):
+                if s:
+                    widths[idx] = stow_w
+            diff = avail - sum(widths[k] for k in normal_idxs)
+            for t in range(abs(diff)):
+                idx = normal_idxs[t % len(normal_idxs)]
+                if diff > 0:
+                    widths[idx] += 1
+                elif widths[idx] > min_w:
                     widths[idx] -= 1
+        elif stowed_count > 0:
+            for idx, s in enumerate(is_stowed):
+                widths[idx] = stow_w if s else max(min_w, int(round(pref_list[idx])))
+        else:
+            # preferred 上の各カラム中心（viewport に正規化）を基準に配分
+            total_pref = sum(pref_list) or 1.0
+            scale = float(viewport_width) / total_pref
+            ideal_centers = []
+            acc = 0.0
+            for p in pref_list:
+                ideal_centers.append(acc + p * scale * 0.5)
+                acc += p * scale
+            i = 0
+            while i < n:
+                if is_stowed[i]:
+                    widths[i] = stow_w
+                    i += 1
+                    continue
+                j = i
+                while j < n and not is_stowed[j]:
+                    j += 1
+                if i > 0 and is_stowed[i - 1]:
+                    left_edge = ideal_centers[i - 1] + stow_w * 0.5
+                else:
+                    left_edge = 0.0
+                if j < n and is_stowed[j]:
+                    right_edge = ideal_centers[j] - stow_w * 0.5
+                else:
+                    right_edge = float(viewport_width)
+                seg_avail = max(0, int(round(right_edge - left_edge)))
+                seg_idxs = list(range(i, j))
+                seg_total = sum(pref_list[k] for k in seg_idxs) or 1.0
+                for idx in seg_idxs:
+                    widths[idx] = max(min_w, int(seg_avail * pref_list[idx] / seg_total))
+                diff = seg_avail - sum(widths[idx] for idx in seg_idxs)
+                for t in range(abs(diff)):
+                    idx = seg_idxs[t % len(seg_idxs)]
+                    if diff > 0:
+                        widths[idx] += 1
+                    elif widths[idx] > min_w:
+                        widths[idx] -= 1
+                i = j
+            if normal_idxs:
+                diff = viewport_width - sum(widths)
+                for t in range(abs(diff)):
+                    idx = normal_idxs[t % len(normal_idxs)]
+                    if diff > 0:
+                        widths[idx] += 1
+                    elif widths[idx] > min_w:
+                        widths[idx] -= 1
 
-        for col, w in zip(visible, widths):
-            col.set_width(w, emit_signal=False)
+        # 最終幅だけを一度反映する。通常カラムは fixed の付け外しをせず、
+        # setMin/Max + 必要時の resize のみ。layout.activate は位置決めに使う。
+        changed_normals = []
+        for col, w, stowed in zip(visible, widths, is_stowed):
+            try:
+                if stowed:
+                    if int(getattr(col, "_current_width", 0) or 0) != stow_w or int(col.maximumWidth()) != stow_w:
+                        col._current_width = stow_w
+                        col.setMinimumWidth(stow_w)
+                        col.setMaximumWidth(stow_w)
+                        col.setFixedWidth(stow_w)
+                else:
+                    tw = max(min_w, int(w))
+                    cur = int(getattr(col, "_current_width", 0) or 0)
+                    if cur != tw or int(col.width()) != tw or int(col.maximumWidth()) != tw:
+                        col._current_width = tw
+                        col.setMinimumWidth(min_w)
+                        col.setMaximumWidth(tw)
+                        if int(col.width()) != tw:
+                            col.resize(tw, col.height() if col.height() > 0 else max(1, self._scroll.viewport().height()))
+                        else:
+                            col.updateGeometry()
+                        changed_normals.append((col, tw))
+            except Exception:
+                pass
 
-        self._scroll_content.setMinimumWidth(0)
+        if self._scroll_layout is not None:
+            for col in visible:
+                try:
+                    self._scroll_layout.setStretchFactor(col, 0)
+                except Exception:
+                    pass
         content_h = max(1, self._scroll.viewport().height())
-        self._scroll_content.resize(viewport_width, content_h)
+        total_w = max(1, int(sum(widths)))
+        content_w = max(viewport_width, total_w)
+        self._scroll_content.setMinimumWidth(0)
+        self._scroll_content.setMaximumWidth(16777215)
+        self._scroll_content.resize(content_w, content_h)
         self._scroll_layout.invalidate()
         self._scroll_layout.activate()
+        # activate 後にまだ幅がずれている場合のみ一度補正
+        for col, tw in changed_normals:
+            try:
+                if int(col.width()) != tw:
+                    col.resize(tw, col.height() if col.height() > 0 else content_h)
+            except Exception:
+                pass
+        if stowed_count > 0:
+            for col, stowed in zip(visible, is_stowed):
+                if not stowed:
+                    continue
+                try:
+                    if int(col.width()) != stow_w or int(col.maximumWidth()) != stow_w:
+                        col._current_width = stow_w
+                        col.setMinimumWidth(stow_w)
+                        col.setMaximumWidth(stow_w)
+                        col.setFixedWidth(stow_w)
+                except Exception:
+                    pass
+        # WebView は body の layout 配下なので明示 setGeometry しない
+        # （layout と競合して余分な resize を起こす）
         self._update_boundary_visibility()
+        self._update_individual_stow_buttons()
+        try:
+            self._resize_diag_emit("fit_columns_exit", force=True)
+        except Exception:
+            pass
 
     def _update_boundary_visibility(self) -> None:
-        visible = [c for c in self._columns if c.isVisible()]
+        # 通常同士が隣接なら左カラムに境界。間に個別収納がある場合は
+        # 連続する収納スロット全体を境界領域とし、各スロットに同じ左右通常カラムを紐づける
         for col in self._columns:
             col.set_boundary_enabled(False)
             if hasattr(col, "_boundary_right_col"):
                 col._boundary_right_col = None
-        if len(visible) >= 2:
-            # 可視カラムの geometry が決まってから境界を付ける
-            try:
-                self._scroll_layout.activate()
-            except Exception:
-                pass
-        for i in range(max(0, len(visible) - 1)):
-            left = visible[i]
-            right = visible[i + 1]
-            left._boundary_right_col = right
-            left.set_boundary_enabled(True)
-            if hasattr(left, "_position_resize_handles"):
-                left._position_resize_handles()
+            if hasattr(col, "_boundary_left_col"):
+                col._boundary_left_col = None
+        ordered = [c for c in self._columns if c.isVisible()]
+        normals = [
+            (i, c) for i, c in enumerate(ordered)
+            if not getattr(c, "is_individually_stowed", lambda: False)()
+        ]
+        for k in range(max(0, len(normals) - 1)):
+            i1, left = normals[k]
+            i2, right = normals[k + 1]
+            if i2 == i1 + 1:
+                left._boundary_right_col = right
+                left.set_boundary_enabled(True)
+                if hasattr(left, "_position_resize_handles"):
+                    left._position_resize_handles()
+            else:
+                # 間の個別収納は見た目・展開は個別のまま。
+                # 幅調整だけ同じ左右通常カラムに紐づけ、各スロットの太い領域全体で
+                # 同一のカラム幅調整を開始できるようにする（先頭だけ enable しない）。
+                for mi in range(i1 + 1, i2):
+                    mid = ordered[mi]
+                    if not getattr(mid, "is_individually_stowed", lambda: False)():
+                        continue
+                    mid._boundary_left_col = left
+                    mid._boundary_right_col = right
+                    mid.set_boundary_enabled(True)
+                    if hasattr(mid, "_position_resize_handles"):
+                        mid._position_resize_handles()
 
     def _check_hibernation(self) -> None:
         for col in self._columns:
@@ -13218,18 +15972,74 @@ class MainWindow(QMainWindow):
                 if hasattr(tab, "maybe_freeze"):
                     tab.maybe_freeze()
 
+    def _suppress_all_boundary_hover_ui(self) -> None:
+        """カラム幅ドラッグ中: 共有UI・展開↔・名前・青ヒントをすべて消す。"""
+        try:
+            self.hide_boundary_actions()
+        except Exception:
+            pass
+        for col in getattr(self, "_columns", None) or []:
+            try:
+                h = getattr(col, "_resize_handle", None)
+                if h is not None:
+                    try:
+                        h._expand_anim.stop()
+                    except Exception:
+                        pass
+                    h._actions_visible = False
+                    h._expand = 0.0
+                    h.set_hint(False)
+                if hasattr(col, "_hide_stowed_restore_btn_now"):
+                    col._hide_stowed_restore_btn_now()
+                if hasattr(col, "_hide_stowed_name_label_now"):
+                    col._hide_stowed_name_label_now()
+            except Exception:
+                pass
+
     def _on_boundary_dragged(self, column: AccountColumn, delta: int) -> None:
-        self._boundary_dragging = True
-        left_col = column
-        right_col = getattr(column, "_boundary_right_col", None)
-        if right_col is None or right_col not in self._columns:
-            visible = [c for c in self._columns if c.isVisible()]
-            if column not in visible:
+        if not getattr(self, "_boundary_dragging", False):
+            self._boundary_dragging = True
+            self._suppress_all_boundary_hover_ui()
+        else:
+            self._boundary_dragging = True
+        if getattr(column, "is_individually_stowed", lambda: False)():
+            left_col = getattr(column, "_boundary_left_col", None)
+            right_col = getattr(column, "_boundary_right_col", None)
+            if left_col is None or right_col is None:
+                ordered = [c for c in self._columns if c.isVisible()]
+                try:
+                    idx = ordered.index(column)
+                except ValueError:
+                    return
+                left_col = None
+                for j in range(idx - 1, -1, -1):
+                    if not getattr(ordered[j], "is_individually_stowed", lambda: False)():
+                        left_col = ordered[j]
+                        break
+                right_col = None
+                for j in range(idx + 1, len(ordered)):
+                    if not getattr(ordered[j], "is_individually_stowed", lambda: False)():
+                        right_col = ordered[j]
+                        break
+            if left_col is None or right_col is None:
                 return
-            idx = visible.index(column)
-            if idx >= len(visible) - 1:
+        else:
+            left_col = column
+            right_col = getattr(column, "_boundary_right_col", None)
+            if right_col is None or right_col not in self._columns:
+                normals = [
+                    c for c in self._columns
+                    if c.isVisible()
+                    and not getattr(c, "is_individually_stowed", lambda: False)()
+                ]
+                if column not in normals:
+                    return
+                idx = normals.index(column)
+                if idx >= len(normals) - 1:
+                    return
+                right_col = normals[idx + 1]
+            if getattr(right_col, "is_individually_stowed", lambda: False)():
                 return
-            right_col = visible[idx + 1]
 
         if not hasattr(left_col, "_drag_base_width"):
             left_col._drag_base_width = left_col.get_width()
@@ -13263,11 +16073,88 @@ class MainWindow(QMainWindow):
             return
         left_col, new_left, right_col, new_right = pending
         self._boundary_pending = None
+        try:
+            if getattr(self, "_RESIZE_DIAG_ENABLED", False):
+                def _cw(c):
+                    try:
+                        return int(c.width() or 0)
+                    except Exception:
+                        return -1
+                def _wvg(c):
+                    try:
+                        for wv in getattr(c, "webviews", lambda: [])() or []:
+                            if wv is not None:
+                                g = wv.geometry()
+                                return f"{g.width()}x{g.height()}"
+                    except Exception:
+                        pass
+                    return "?"
+                self._resize_diag_emit(
+                    "boundary_before_set_width",
+                    force=True,
+                    extra=(
+                        f"L={_cw(left_col)}->{new_left} R={_cw(right_col)}->{new_right} "
+                        f"Lwv={_wvg(left_col)} Rwv={_wvg(right_col)}"
+                    ),
+                )
+        except Exception:
+            pass
         left_col.set_width(new_left, emit_signal=False)
         right_col.set_width(new_right, emit_signal=False)
+        try:
+            resized = getattr(self, "_boundary_user_resized_cids", None)
+            if not isinstance(resized, set):
+                resized = set()
+            for col in (left_col, right_col):
+                if col is None:
+                    continue
+                if getattr(col, "is_individually_stowed", lambda: False)():
+                    continue
+                try:
+                    cid = col.get_column_id()
+                except Exception:
+                    cid = ""
+                if cid:
+                    resized.add(cid)
+            self._boundary_user_resized_cids = resized
+        except Exception:
+            pass
         content = getattr(self, "_scroll_content", None)
         if content is not None and content.layout() is not None:
             content.layout().activate()
+        # 列幅変更中も WE を新幅へ追従（境界ハンドルは覆わない）
+        try:
+            for col in (left_col, right_col):
+                for wv in getattr(col, "webviews", lambda: [])() or []:
+                    self._layout_safe_webview_geometry(wv)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_RESIZE_DIAG_ENABLED", False):
+                def _cw(c):
+                    try:
+                        return int(c.width() or 0)
+                    except Exception:
+                        return -1
+                def _wvg(c):
+                    try:
+                        for wv in getattr(c, "webviews", lambda: [])() or []:
+                            if wv is not None:
+                                g = wv.geometry()
+                                return f"{g.width()}x{g.height()}"
+                    except Exception:
+                        pass
+                    return "?"
+                self._resize_diag_emit(
+                    "boundary_after_set_width",
+                    force=True,
+                    extra=(
+                        f"L={_cw(left_col)} R={_cw(right_col)} "
+                        f"Lwv={_wvg(left_col)} Rwv={_wvg(right_col)}"
+                    ),
+                )
+        except Exception:
+            pass
 
     def _on_boundary_drag_finished(self) -> None:
         timer = getattr(self, "_boundary_coalesce_timer", None)
@@ -13279,6 +16166,42 @@ class MainWindow(QMainWindow):
                 del col._drag_base_width
         self._boundary_dragging = False
         self._boundary_pending = None
+        try:
+            self._sync_webviews_to_columns_layout_safe()
+        except Exception:
+            pass
+        try:
+            resized = getattr(self, "_boundary_user_resized_cids", None) or set()
+            if resized:
+                pref = dict(getattr(self, "_preferred_widths", None) or {})
+                for col in list(getattr(self, "_columns", None) or []):
+                    try:
+                        cid = col.get_column_id()
+                    except Exception:
+                        continue
+                    if not cid or cid not in resized:
+                        continue
+                    if getattr(col, "is_individually_stowed", lambda: False)():
+                        continue
+                    try:
+                        live = int(col.get_width() or 0)
+                    except Exception:
+                        live = 0
+                    if live >= AccountColumn.MIN_WIDTH:
+                        pref[cid] = live
+                self._preferred_widths = pref
+                try:
+                    key = self._layout_mode_key()
+                    if not hasattr(self, "_mode_preferred_widths") or self._mode_preferred_widths is None:
+                        self._mode_preferred_widths = {"normal": {}, "lr": {}, "tb": {}}
+                    mode_pref = dict(self._mode_preferred_widths.get(key) or {})
+                    mode_pref.update({cid: pref[cid] for cid in resized if cid in pref})
+                    self._mode_preferred_widths[key] = mode_pref
+                except Exception:
+                    pass
+            self._boundary_user_resized_cids = set()
+        except Exception:
+            self._boundary_user_resized_cids = set()
         self._save_column_widths()
 
     def _save_column_widths(self) -> None:
@@ -13308,20 +16231,39 @@ class MainWindow(QMainWindow):
                         w = int(col.get_width() or 0)
                     except Exception:
                         w = 0
-            elif cid in snap and int(snap.get(cid) or 0) > 0:
-                w = int(snap[cid])
+            elif getattr(col, "is_individually_stowed", lambda: False)():
+                # 個別収納中のスロット幅(10)を preferred に書かない
+                w = int(
+                    pref.get(cid)
+                    or getattr(col, "_width_before_individual_stow", 0)
+                    or 0
+                )
             else:
+                # 個別収納中の通常カラム幅は一時的な再配分なので preferred を上書きしない
                 try:
-                    w = int(col.get_width() or 0)
+                    any_indiv = any(
+                        getattr(c, "is_individually_stowed", lambda: False)()
+                        for c in self._columns
+                    )
                 except Exception:
-                    w = 0
-                if w > 0:
-                    pref[cid] = w
+                    any_indiv = False
+                try:
+                    live = int(col.get_width() or 0)
+                except Exception:
+                    live = 0
+                if any_indiv and int(pref.get(cid) or 0) > 0:
+                    w = int(pref[cid])
+                else:
+                    w = live
+                    if w > 0:
+                        pref[cid] = w
+                        snap.pop(cid, None)
             if w > 0:
                 widths[cid] = w
             if aid and w > 0:
                 by_account.setdefault(aid, []).append(w)
         self._preferred_widths = pref
+        self._stow_saved_widths = snap
         try:
             key = self._layout_mode_key()
             if not hasattr(self, "_mode_preferred_widths") or self._mode_preferred_widths is None:
@@ -13404,7 +16346,6 @@ class MainWindow(QMainWindow):
                 col._column_id = cid
             except Exception:
                 pass
-        reg = self._known_accounts.get(aid, {})
         tabs_state = {"tabs": [], "active_tab": 0}
         try:
             if hasattr(col, "export_tabs_state"):
@@ -13434,23 +16375,34 @@ class MainWindow(QMainWindow):
             cid = (col.get_column_id() or cid).strip()
         except Exception:
             pass
-        stowed = False
+        individually = False
         try:
-            # 対象 mode の収納だけを見る（他 mode の収納を現在モードへ混ぜない）
-            key = for_mode or self._layout_mode_key()
-            if key == self._layout_mode_key():
-                stowed = col in (getattr(self, "_stowed_columns", None) or [])
-            else:
-                stowed = col in (
-                    (getattr(self, "_mode_stowed_columns", None) or {}).get(key) or []
-                )
+            individually = bool(getattr(col, "is_individually_stowed", lambda: False)())
         except Exception:
-            stowed = False
+            individually = False
+        bulk_stowed = False
+        try:
+            # ←→一括収納のみ。個別収納とは別フラグ
+            if not individually:
+                key = for_mode or self._layout_mode_key()
+                if key == self._layout_mode_key():
+                    bulk_stowed = col in (getattr(self, "_stowed_columns", None) or [])
+                else:
+                    bulk_stowed = col in (
+                        (getattr(self, "_mode_stowed_columns", None) or {}).get(key) or []
+                    )
+        except Exception:
+            bulk_stowed = False
         width_out = max(1, int(col.get_width() or 0))
         try:
-            snap = getattr(self, "_stow_saved_widths", None) or {}
-            if cid in snap and int(snap[cid]) > 0:
-                width_out = int(snap[cid])
+            if individually:
+                pw = int(getattr(col, "_width_before_individual_stow", 0) or 0)
+                if pw > 0:
+                    width_out = pw
+            else:
+                snap = getattr(self, "_stow_saved_widths", None) or {}
+                if cid in snap and int(snap[cid]) > 0:
+                    width_out = int(snap[cid])
         except Exception:
             pass
         return {
@@ -13463,7 +16415,8 @@ class MainWindow(QMainWindow):
             "width": width_out,
             "tabs": tabs,
             "active_tab": active,
-            "stowed": bool(stowed),
+            "stowed": bool(bulk_stowed),
+            "individually_stowed": bool(individually),
         }
 
     def _save_columns(self) -> None:
@@ -13503,12 +16456,54 @@ class MainWindow(QMainWindow):
         except Exception:
             packs = self._service_packs()
 
+        # アクティブ pack の個別収納を (account_id, column_type) で収集し、
+        # 非アクティブ pack の保存へも反映する（Dock ON 終了後も normal 側を落とさない）
+        active_indiv: dict[tuple[str, str], int] = {}
+        active_key = self._layout_mode_key()
+        try:
+            for col in list(self._columns or []):
+                try:
+                    if not getattr(col, "is_individually_stowed", lambda: False)():
+                        continue
+                    aid = str(col.get_account_id() or "")
+                    if not aid:
+                        continue
+                    try:
+                        ctype = str(col.get_column_type() or "")
+                    except Exception:
+                        ctype = str(getattr(col, "_column_type", "") or "")
+                    pw = int(getattr(col, "_width_before_individual_stow", 0) or 0)
+                    active_indiv[(aid, ctype)] = pw
+                except Exception:
+                    continue
+        except Exception:
+            active_indiv = {}
+
         for mode in ("normal", "lr", "tb"):
             cols = list((packs or {}).get(mode) or [])
-            if mode == self._layout_mode_key():
+            if mode == active_key:
                 cols = list(self._columns)
             if not cols and mode != "normal":
                 continue
+            # 非アクティブ pack: アクティブ側の個別収納を同 account+type へ転写してから保存
+            if active_indiv and mode != active_key:
+                for col in cols:
+                    try:
+                        aid = str(col.get_account_id() or "")
+                        try:
+                            ctype = str(col.get_column_type() or "")
+                        except Exception:
+                            ctype = str(getattr(col, "_column_type", "") or "")
+                        k = (aid, ctype)
+                        if k not in active_indiv:
+                            continue
+                        if not getattr(col, "is_individually_stowed", lambda: False)():
+                            pw = int(active_indiv.get(k) or 0)
+                            if pw >= AccountColumn.MIN_WIDTH:
+                                col._width_before_individual_stow = pw
+                            col.set_individually_stowed(True)
+                    except Exception:
+                        continue
             data = _pack_to_list(cols, mode)
             try:
                 if hasattr(self._settings_manager, "save_columns_for_mode"):
@@ -13823,7 +16818,7 @@ class MainWindow(QMainWindow):
 
     def _open_confirmed_external_in_app(self, url: str, page=None) -> None:
         from PySide6.QtCore import QUrl
-        from src.browser.webview import MayotterPage, XWebView
+        from src.browser.webview import MayotterPage
 
         url = (url or "").strip()
         if not url:

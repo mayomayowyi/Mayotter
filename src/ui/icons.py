@@ -177,6 +177,36 @@ def make_forward_icon(color: str = _COLOR_SECONDARY, size: int = 14) -> QIcon:
     p.end()
     return QIcon(pm)
 
+def make_chevron_down_icon(color: str = _COLOR_SECONDARY, size: int = 14) -> QIcon:
+    pm, p = _blank(size)
+    p.setPen(_pen(color, size, 1.05))
+    m = _margin(size)
+    cx, cy = size / 2.0, size / 2.0
+    path = QPainterPath()
+    path.moveTo(m * 1.05, cy - size * 0.14)
+    path.lineTo(cx, size - m * 1.15)
+    path.lineTo(size - m * 1.05, cy - size * 0.14)
+    p.drawPath(path)
+    p.end()
+    return QIcon(pm)
+
+def make_expand_h_icon(color: str = _COLOR_SECONDARY, size: int = 14) -> QIcon:
+    pm, p = _blank(size)
+    p.setPen(_pen(color, size, 0.7))
+    cy = size / 2.0
+    path = QPainterPath()
+    path.moveTo(size * 0.38, size * 0.28)
+    path.lineTo(size * 0.16, cy)
+    path.lineTo(size * 0.38, size * 0.72)
+    p.drawPath(path)
+    path = QPainterPath()
+    path.moveTo(size * 0.62, size * 0.28)
+    path.lineTo(size * 0.84, cy)
+    path.lineTo(size * 0.62, size * 0.72)
+    p.drawPath(path)
+    p.end()
+    return QIcon(pm)
+
 def make_plus_icon(color: str = _COLOR_SECONDARY, size: int = 12) -> QIcon:
     pm, p = _blank(size)
     p.setPen(_pen(color, size, 1.05))

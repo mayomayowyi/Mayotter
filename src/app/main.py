@@ -2,12 +2,6 @@
 
 import sys
 
-def create_window():
-    from src.browser.profile_manager import ProfileManager
-    from src.core.settings import SettingsManager
-    from src.ui.main_window import MainWindow
-    return MainWindow(ProfileManager(), SettingsManager())
-
 def main() -> int:
     import os
 

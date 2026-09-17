@@ -4,8 +4,30 @@ from __future__ import annotations
 from enum import Enum, auto
 from typing import Callable, Optional
 
-from PySide6.QtCore import QObject, QPoint, QRect, QTimer, Signal
+from PySide6.QtCore import (
+    QObject,
+    QPoint,
+    QRect,
+    QTimer,
+    Signal,
+    QEasingCurve,
+    QVariantAnimation,
+    QAbstractAnimation,
+)
 from PySide6.QtGui import QCursor
+from shiboken6 import isValid
+
+EASING_MAP = {
+    "Linear": QEasingCurve.Type.Linear,
+    "InQuad": QEasingCurve.Type.InQuad,
+    "OutQuad": QEasingCurve.Type.OutQuad,
+    "InOutQuad": QEasingCurve.Type.InOutQuad,
+    "OutCubic": QEasingCurve.Type.OutCubic,
+    "InOutCubic": QEasingCurve.Type.InOutCubic,
+    "OutBack": QEasingCurve.Type.OutBack,
+    "InOutBack": QEasingCurve.Type.InOutBack,
+}
+
 
 class PanelState(Enum):
     COLLAPSED = auto()
@@ -13,10 +35,19 @@ class PanelState(Enum):
     EXPANDED = auto()
     COLLAPSING = auto()
 
+
 class EdgeDetector(QObject):
+    """画面端トリガー + パネル余白の keep-open。
+
+    トリガー帯は availableGeometry の端に固定（パネルサイズ変化で判定が
+    チラつかない）。bottom/top はタスクバー側へ keep-open を伸ばし振動を防ぐ。
+    """
 
     should_expand = Signal()
     should_collapse = Signal()
+
+    # availableGeometry 外側（タスクバー側）へ伸ばす px
+    _EDGE_PAST_AVAILABLE_PX = 80
 
     def __init__(
         self,
@@ -115,49 +146,60 @@ class EdgeDetector(QObject):
             if near_edge:
                 self.should_expand.emit()
         elif self._state == PanelState.EXPANDED:
-            if inside_or_near_panel:
+            # 展開後もトリガー端にカーソルがあれば開いたまま（境界での振動防止）
+            if inside_or_near_panel or near_edge:
                 self._hide_timer.stop()
             else:
                 if not self._hide_timer.isActive():
                     self._hide_timer.start(self.hide_delay_ms)
 
-    def _is_near_trigger(self, pos: QPoint, screen: QRect, panel: QRect) -> bool:
+    def _panel_span_ok(self, pos: QPoint, panel: QRect, horizontal: bool) -> bool:
+        """パネルが有効なとき、端方向のスパン内にカーソルがあるか。"""
         if not panel.isValid() or panel.width() <= 0 or panel.height() <= 0:
-            return False
+            return True
+        if horizontal:
+            return panel.left() - 2 <= pos.x() <= panel.right() + 2
+        return panel.top() - 2 <= pos.y() <= panel.bottom() + 2
+
+    def _is_near_trigger(self, pos: QPoint, screen: QRect, panel: QRect) -> bool:
+        """画面端トリガー帯。パネルサイズ変化の影響を受けない。"""
         tol = max(2, int(self.trigger_px))
+        past = self._EDGE_PAST_AVAILABLE_PX
         if self.edge == "right":
-            if not (panel.top() - 2 <= pos.y() <= panel.bottom() + 2):
+            if not self._panel_span_ok(pos, panel, horizontal=False):
                 return False
-            return (panel.left() - tol) <= pos.x() <= (panel.right() + tol)
+            return (screen.right() - tol) <= pos.x() <= (screen.right() + past)
         if self.edge == "left":
-            if not (panel.top() - 2 <= pos.y() <= panel.bottom() + 2):
+            if not self._panel_span_ok(pos, panel, horizontal=False):
                 return False
-            return (panel.left() - tol) <= pos.x() <= (panel.right() + tol)
+            return (screen.left() - past) <= pos.x() <= (screen.left() + tol)
         if self.edge == "top":
-            if not (panel.left() - 2 <= pos.x() <= panel.right() + 2):
+            if not self._panel_span_ok(pos, panel, horizontal=True):
                 return False
-            return (panel.top() - tol) <= pos.y() <= (panel.bottom() + tol)
+            return (screen.top() - past) <= pos.y() <= (screen.top() + tol)
         if self.edge == "bottom":
-            if not (panel.left() - 2 <= pos.x() <= panel.right() + 2):
+            if not self._panel_span_ok(pos, panel, horizontal=True):
                 return False
-            return (panel.top() - tol) <= pos.y() <= (panel.bottom() + tol)
+            return (screen.bottom() - tol) <= pos.y() <= (screen.bottom() + past)
         return False
 
     def _is_inside_keep_zone(self, pos: QPoint, panel: QRect, screen: QRect) -> bool:
         if not panel.isValid() or panel.width() <= 0:
             return False
+        past = self._EDGE_PAST_AVAILABLE_PX
         if self.edge == "right":
             left = panel.left() - self.keep_open_margin
-            return left <= pos.x() <= screen.right() and panel.top() <= pos.y() <= panel.bottom()
+            return left <= pos.x() <= screen.right() + past and panel.top() <= pos.y() <= panel.bottom()
         if self.edge == "left":
             right = panel.right() + self.keep_open_margin
-            return screen.left() <= pos.x() <= right and panel.top() <= pos.y() <= panel.bottom()
+            return screen.left() - past <= pos.x() <= right and panel.top() <= pos.y() <= panel.bottom()
         if self.edge == "top":
             bottom = panel.bottom() + self.keep_open_margin
-            return panel.left() <= pos.x() <= panel.right() and screen.top() <= pos.y() <= bottom
+            return panel.left() <= pos.x() <= panel.right() and screen.top() - past <= pos.y() <= bottom
         if self.edge == "bottom":
             top = panel.top() - self.keep_open_margin
-            return panel.left() <= pos.x() <= panel.right() and top <= pos.y() <= screen.bottom()
+            # Include taskbar band past availableGeometry.bottom().
+            return panel.left() <= pos.x() <= panel.right() and top <= pos.y() <= screen.bottom() + past
         return panel.adjusted(-20, -20, 20, 20).contains(pos)
 
 class EdgeAnimator(QObject):
@@ -227,17 +269,3 @@ class EdgeAnimator(QObject):
             self.finished_expand.emit()
         else:
             self.finished_collapse.emit()
-
-from PySide6.QtCore import QEasingCurve, QVariantAnimation, QAbstractAnimation
-from shiboken6 import isValid
-
-EASING_MAP = {
-    "Linear": QEasingCurve.Type.Linear,
-    "InQuad": QEasingCurve.Type.InQuad,
-    "OutQuad": QEasingCurve.Type.OutQuad,
-    "InOutQuad": QEasingCurve.Type.InOutQuad,
-    "OutCubic": QEasingCurve.Type.OutCubic,
-    "InOutCubic": QEasingCurve.Type.InOutCubic,
-    "OutBack": QEasingCurve.Type.OutBack,
-    "InOutBack": QEasingCurve.Type.InOutBack,
-}

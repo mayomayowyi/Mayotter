@@ -1,7 +1,6 @@
 
 from __future__ import annotations
 
-import os
 import struct
 import wave
 from pathlib import Path
@@ -15,7 +14,7 @@ WAVE_DIM = "#2f517d"
 REC_RED = "#e66464"
 
 def decode_audio_to_wav(src: str | Path, dst: Path) -> Path | None:
-    from src.media.ffmpeg_util import find_ffmpeg, FFmpegError
+    from src.media.ffmpeg_util import find_ffmpeg
     import subprocess
     import sys
 
@@ -311,8 +310,8 @@ def _cover_square_image(
     scale: float = 1.0,
     rotation: float = 0.0,
 ):
-    from PySide6.QtCore import Qt, QRectF, QPointF
-    from PySide6.QtGui import QImage, QPainter, QTransform, QColor
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QImage, QPainter, QColor
 
     if img is None or img.isNull():
         return img
@@ -355,7 +354,7 @@ def _cover_square_image(
     return out
 
 def _apply_circular_alpha_mask(img):
-    from PySide6.QtCore import Qt, QRectF
+    from PySide6.QtCore import QRectF
     from PySide6.QtGui import QImage, QPainter, QPainterPath, QColor
 
     if img is None or img.isNull():
@@ -376,7 +375,7 @@ def _apply_circular_alpha_mask(img):
         return img
 
 def _dominant_bg_from_image(img, *, width: int, height: int):
-    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtGui import QColor
     from collections import Counter, defaultdict
 
     if img is None or img.isNull():

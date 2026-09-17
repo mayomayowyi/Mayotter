@@ -14,10 +14,6 @@ class InstanceLock:
         self._lock.setStaleLockTime(30_000)
         self._held = False
 
-    @property
-    def lock_path(self) -> Path:
-        return self._path
-
     def try_acquire(self) -> bool:
         if self._lock.tryLock(100):
             self._held = True

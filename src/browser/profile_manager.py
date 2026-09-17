@@ -107,9 +107,6 @@ class ProfileManager:
     def __init__(self) -> None:
         self._profiles: dict[str, object] = {}
 
-    def get_cached(self, account_id: str):
-        return self._profiles.get(account_id)
-
     def open_existing(
         self,
         account_id: str,
@@ -142,16 +139,6 @@ class ProfileManager:
 
         storage_path = resolve_profile_path(aid)
         return self._build_profile(aid, storage_path, mkdir=True)
-
-    def get_or_create(self, account_id: str, profile_path: str = ""):
-        profile = self.open_existing(account_id, profile_path or None)
-        if profile is not None:
-            return profile
-        raise RuntimeError(
-            f"Profile missing for account_id={account_id!r}; "
-            "refusing to create empty profile during open. "
-            "Use create_new() only for explicit new accounts."
-        )
 
     def _build_profile(
         self,
@@ -370,6 +357,3 @@ class ProfileManager:
 
     def __len__(self) -> int:
         return len(self._profiles)
-
-    def _cleanup_profile_data(self, account_id: str) -> None:
-        self.delete_profile_data(account_id)

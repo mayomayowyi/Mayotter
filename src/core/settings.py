@@ -12,6 +12,8 @@ COLUMN_WIDTHS_KEY = "column_widths"
 COLUMN_WIDTHS_BY_MODE_KEY = "column_widths_by_mode"
 STOWED_COLUMNS_KEY = "stowed_column_ids"
 STOW_SAVED_WIDTHS_KEY = "stow_saved_widths"
+INDIVIDUALLY_STOWED_COLUMNS_KEY = "individually_stowed_column_ids"
+INDIVIDUAL_STOW_WIDTHS_KEY = "individual_stow_widths"
 WINDOW_GEOMETRY_KEY = "window_geometry"
 WINDOW_GEOMETRY_NORMAL_KEY = "window_geometry_normal"
 WINDOW_GEOMETRY_DOCK_KEY = "window_geometry_dock"
@@ -125,6 +127,31 @@ class SettingsManager:
         settings[STOW_SAVED_WIDTHS_KEY] = {}
         self.save(settings)
 
+    def get_individually_stowed_state(self) -> dict[str, Any]:
+        settings = self.load()
+        ids = settings.get(INDIVIDUALLY_STOWED_COLUMNS_KEY) or []
+        if not isinstance(ids, list):
+            ids = []
+        widths = settings.get(INDIVIDUAL_STOW_WIDTHS_KEY) or {}
+        if not isinstance(widths, dict):
+            widths = {}
+        return {
+            "column_ids": [str(x) for x in ids if x],
+            "widths": {str(k): int(v) for k, v in widths.items() if v},
+        }
+
+    def save_individually_stowed_state(self, column_ids: list, widths: dict | None = None) -> None:
+        settings = self.load()
+        settings[INDIVIDUALLY_STOWED_COLUMNS_KEY] = [str(x) for x in (column_ids or []) if x]
+        clean_w = {}
+        for k, v in (widths or {}).items():
+            try:
+                clean_w[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        settings[INDIVIDUAL_STOW_WIDTHS_KEY] = clean_w
+        self.save(settings)
+
     def save(self, settings: dict[str, Any]) -> None:
         current = self.load()
         current.update(settings)
@@ -169,13 +196,6 @@ class SettingsManager:
                 WINDOW_GEOMETRY_NORMAL_KEY: geometry_hex,
                 WINDOW_GEOMETRY_KEY: geometry_hex,
             })
-
-    def get_window_geometry_dock(self) -> bytes | None:
-        settings = self.load()
-        data = settings.get(WINDOW_GEOMETRY_DOCK_KEY)
-        if data:
-            return bytes.fromhex(data)
-        return None
 
     def save_window_geometry_dock(self, geometry) -> None:
         if geometry:
@@ -448,17 +468,6 @@ class SettingsManager:
             y = 0.0
         return (max(-1.0, min(1.0, x)), max(-1.0, min(1.0, y)))
 
-    def save_audio_visual_image_crop(self, x: float, y: float) -> None:
-        try:
-            x = max(-1.0, min(1.0, float(x)))
-        except Exception:
-            x = 0.0
-        try:
-            y = max(-1.0, min(1.0, float(y)))
-        except Exception:
-            y = 0.0
-        self.save({AUDIO_VISUAL_IMAGE_CROP_X_KEY: x, AUDIO_VISUAL_IMAGE_CROP_Y_KEY: y})
-
     def get_audio_visual_image_transform(self) -> tuple[float, float, float, float]:
         cx, cy = self.get_audio_visual_image_crop()
         settings = self.load()
@@ -544,9 +553,6 @@ class SettingsManager:
     def get_github_repo(self) -> str:
         settings = self.load()
         return str(settings.get(GITHUB_REPO_KEY, "") or "").strip()
-
-    def save_github_repo(self, repo: str) -> None:
-        self.save({GITHUB_REPO_KEY: str(repo or "").strip()})
 
     def get_disable_x_keyboard_shortcuts(self) -> bool:
         settings = self.load()

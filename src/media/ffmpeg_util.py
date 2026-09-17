@@ -331,8 +331,6 @@ def plan_loudness_filter(
     *,
     peak_info: dict | None = None,
 ) -> dict:
-    import math
-
     plan = {
         "af": loudnorm_filter_string(None),
         "mode": "single_pass",

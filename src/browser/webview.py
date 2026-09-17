@@ -198,7 +198,7 @@ def attach_capture_holder_parent(parent: QWidget | None) -> None:
         w.move(0, 0)
         w.hide()
         _OFFSCREEN_CAPTURE_HOLDER = w
-    except Exception as exc:
+    except Exception:
         pass
 
 def _offscreen_capture_holder() -> QWidget | None:
@@ -363,7 +363,6 @@ def _emit_download_progress(download, file_name: str, file_path: str, progress: 
         keys = list(_DOWNLOAD_VIEWS.keys())
     else:
         keys = [id(profile)]
-    emitted = False
     for key in keys:
         refs = _DOWNLOAD_VIEWS.get(key, [])
         alive = []
@@ -374,7 +373,6 @@ def _emit_download_progress(download, file_name: str, file_path: str, progress: 
             alive.append(ref)
             if hasattr(view, "download_progress"):
                 view.download_progress.emit(download_id, file_name, file_path, progress, status)
-                emitted = True
         _DOWNLOAD_VIEWS[key] = alive
 
 def normalize_user_input_url(text: str) -> str:
@@ -407,6 +405,11 @@ class MayotterPage(QWebEnginePage):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        try:
+            from PySide6.QtGui import QColor
+            self.setBackgroundColor(QColor("#0b111f"))
+        except Exception:
+            pass
         self.pending_attach_files: list[str] | None = None
         self._attach_choose_count = 0
         self._user_confirmed_external_url: str | None = None
@@ -694,12 +697,6 @@ class XWebView(QWebEngineView):
         page = self.page()
         if hasattr(page, "lifecycleState") and page.lifecycleState() != QWebEnginePage.LifecycleState.Active:
             page.setLifecycleState(QWebEnginePage.LifecycleState.Active)
-
-    def mark_user_gesture(self) -> None:
-        try:
-            self._last_user_gesture_mono = time.monotonic()
-        except Exception:
-            self._last_user_gesture_mono = None
 
     def seconds_since_user_gesture(self) -> float | None:
         try:
@@ -1007,6 +1004,11 @@ class XWebView(QWebEngineView):
     def _create_page(self, profile: QWebEngineProfile) -> QWebEnginePage:
         page = MayotterPage(profile, self)
         apply_webengine_security_settings(page)
+        try:
+            from PySide6.QtGui import QColor
+            page.setBackgroundColor(QColor("#0b111f"))
+        except Exception:
+            pass
         return page
 
     def _connect_signals(self) -> None:
@@ -1065,12 +1067,6 @@ class XWebView(QWebEngineView):
                     )
             except Exception:
                 pass
-
-    def is_html_fullscreen(self) -> bool:
-        return bool(self._media_wide_active)
-
-    def is_media_wide(self) -> bool:
-        return bool(self._media_wide_active)
 
     def _on_url_changed(self, url: QUrl) -> None:
         url_str = url.toString()
@@ -1247,6 +1243,12 @@ class XWebView(QWebEngineView):
             )
         if has_image:
             menu.addSeparator()
+            add(
+                "画像をコピー",
+                lambda: self.page().triggerAction(
+                    QWebEnginePage.WebAction.CopyImageToClipboard
+                ),
+            )
             add(
                 "画像を保存...",
                 lambda: self.page().triggerAction(

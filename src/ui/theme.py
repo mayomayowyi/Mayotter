@@ -271,7 +271,6 @@ POPOVER_CLOSE_MS = 120
 def menu_dropdown_show(widget, *, duration_ms: int = POPOVER_OPEN_MS) -> None:
     try:
         from PySide6.QtCore import QPropertyAnimation, QEasingCurve, Qt as _Qt
-        from PySide6.QtWidgets import QGraphicsOpacityEffect
 
         for attr in (
             "_mayotter_hide_anim",
