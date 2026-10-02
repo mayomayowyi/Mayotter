@@ -21,6 +21,7 @@ update_tmp/
 build/
 dist/
 packaging/output/
+packaging/cache/
 
 *.spec.bak
 
@@ -33,3 +34,7 @@ env/
 
 .DS_Store
 Thumbs.db
+
+# 作業用バックアップ
+backup_*.zip
+.backup_*.zip

@@ -16,6 +16,8 @@ SOURCE_TYPE_LISTS = "lists"
 SOURCE_TYPE_SEARCH = "search"
 SOURCE_TYPE_DIRECT_MESSAGES = "direct_messages"
 SOURCE_TYPE_GROK = "grok"
+SOURCE_TYPE_SCHEDULED = "scheduled"
+SOURCE_TYPE_UNSENT = "unsent"
 
 SOURCE_TYPE_URL = "url"
 SOURCE_TYPE_LIST = "list"
@@ -33,6 +35,8 @@ SAVED_ENTRY_URL = FAVORITES_ENTRY_URL
 
 DM_ENTRY_URL = "https://x.com/messages"
 X_GROK_ENTRY_URL = "https://x.com/i/grok"
+SCHEDULED_ENTRY_URL = "https://x.com/compose/post/unsent/scheduled"
+UNSENT_ENTRY_URL = "https://x.com/compose/post/unsent/drafts"
 
 _COLUMN_TYPE_MIGRATION: dict[str, str] = {
     "likes": SOURCE_TYPE_FAVORITES,
@@ -97,6 +101,10 @@ def resolve_source_url(column_type: str, account_initial_url: str = "", source_u
         if source_url and source_url.startswith("http") and "x.com" in source_url:
             return source_url
         return X_GROK_ENTRY_URL
+    if column_type == SOURCE_TYPE_SCHEDULED:
+        return SCHEDULED_ENTRY_URL
+    if column_type == SOURCE_TYPE_UNSENT:
+        return UNSENT_ENTRY_URL
     if column_type == SOURCE_TYPE_PROFILE:
         handle = (source_url or "").strip()
         if handle.startswith("http"):
@@ -145,6 +153,10 @@ def default_column_title(column_type: str, account_display_name: str = "", sourc
         return "ダイレクトメッセージ"
     if column_type == SOURCE_TYPE_GROK:
         return "Grok"
+    if column_type == SOURCE_TYPE_SCHEDULED:
+        return "予約投稿"
+    if column_type == SOURCE_TYPE_UNSENT:
+        return "未送信"
     if column_type == SOURCE_TYPE_LISTS:
         if source_url and not source_url.startswith("http"):
             return f"リスト {source_url}"

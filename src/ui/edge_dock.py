@@ -7,6 +7,7 @@ from typing import Callable, Optional
 from PySide6.QtCore import (
     QObject,
     QPoint,
+    QPointF,
     QRect,
     QTimer,
     Signal,
@@ -85,6 +86,9 @@ class EdgeDetector(QObject):
 
     def stop(self) -> None:
         self._poll.stop()
+        self._hide_timer.stop()
+        self._pinned_open = False
+        self._state = PanelState.COLLAPSED
 
     @property
     def state(self) -> PanelState:
@@ -198,7 +202,7 @@ class EdgeDetector(QObject):
             return panel.left() <= pos.x() <= panel.right() and screen.top() - past <= pos.y() <= bottom
         if self.edge == "bottom":
             top = panel.top() - self.keep_open_margin
-            # Include taskbar band past availableGeometry.bottom().
+            # availableGeometry の下にあるタスクバー帯も含める
             return panel.left() <= pos.x() <= panel.right() and top <= pos.y() <= screen.bottom() + past
         return panel.adjusted(-20, -20, 20, 20).contains(pos)
 
@@ -224,7 +228,14 @@ class EdgeAnimator(QObject):
         self.easing_name = name if name in EASING_MAP else "OutCubic"
 
     def _easing(self) -> QEasingCurve:
-        return QEasingCurve(EASING_MAP.get(self.easing_name, QEasingCurve.Type.OutCubic))
+        # 展開は expo-out（立ち上がりが速く終端で静かに止まる）、
+        # 収納は in-out quart（溜めてから一気に畳む）のベジェ曲線を使う
+        curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
+        if self._expanding:
+            curve.addCubicBezierSegment(QPointF(0.16, 1.0), QPointF(0.3, 1.0), QPointF(1.0, 1.0))
+        else:
+            curve.addCubicBezierSegment(QPointF(0.76, 0.0), QPointF(0.24, 1.0), QPointF(1.0, 1.0))
+        return curve
 
     def stop(self) -> None:
         anim = self._anim

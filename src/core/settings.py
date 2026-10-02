@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -50,26 +51,45 @@ CROPPED_VISUAL_DIR_KEY = "cropped_visual_dir"
 AUTO_CHECK_UPDATES_KEY = "auto_check_updates"
 GITHUB_REPO_KEY = "github_repo"
 DISABLE_X_KEYBOARD_SHORTCUTS_KEY = "disable_x_keyboard_shortcuts"
+UI_THEME_KEY = "ui_theme"
+SAVED_SEARCHES_KEY = "saved_searches"
 
 class SettingsManager:
 
     def __init__(self, settings_path: Path | None = None) -> None:
         self._settings_path = settings_path or SETTINGS_FILE
+        self._cache: dict[str, Any] | None = None
+        self._cache_mtime_ns: int | None = None
+
+    def _disk_mtime_ns(self) -> int | None:
+        try:
+            return self._settings_path.stat().st_mtime_ns
+        except OSError:
+            return None
 
     def load(self) -> dict[str, Any]:
-        if not self._settings_path.exists():
+        """設定のコピーを返す（getter ごとに app.json を読み直さない）。"""
+        mtime_ns = self._disk_mtime_ns()
+        if self._cache is not None and mtime_ns == self._cache_mtime_ns:
+            return copy.deepcopy(self._cache)
+        if mtime_ns is None:
+            self._cache = {}
+            self._cache_mtime_ns = None
             return {}
         try:
             with open(self._settings_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
+            self._cache = data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, OSError, UnicodeError):
-            return {}
+            self._cache = {}
+        self._cache_mtime_ns = self._disk_mtime_ns()
+        return copy.deepcopy(self._cache)
 
     def get_column_widths(self) -> dict[str, int]:
         settings = self.load()
         by_mode = settings.get(COLUMN_WIDTHS_BY_MODE_KEY) or {}
-        if isinstance(by_mode, dict) and by_mode.get("normal"):
+        # 明示的な {} とキー不存在を区別する。[]/{} は有効な保存状態。
+        if isinstance(by_mode, dict) and "normal" in by_mode and isinstance(by_mode.get("normal"), dict):
             return dict(by_mode.get("normal") or {})
         return settings.get(COLUMN_WIDTHS_KEY, {}) or {}
 
@@ -79,8 +99,8 @@ class SettingsManager:
     def get_column_widths_for_mode(self, mode: str) -> dict[str, int]:
         settings = self.load()
         by_mode = settings.get(COLUMN_WIDTHS_BY_MODE_KEY) or {}
-        if isinstance(by_mode, dict) and mode in by_mode and by_mode[mode]:
-            return dict(by_mode[mode] or {})
+        if isinstance(by_mode, dict) and mode in by_mode and isinstance(by_mode.get(mode), dict):
+            return dict(by_mode.get(mode) or {})
         if mode == "normal":
             return settings.get(COLUMN_WIDTHS_KEY, {}) or {}
         return {}
@@ -166,6 +186,8 @@ class SettingsManager:
             except OSError:
                 pass
         os.replace(tmp_path, self._settings_path)
+        self._cache = copy.deepcopy(current)
+        self._cache_mtime_ns = self._disk_mtime_ns()
 
     def get_window_geometry(self) -> bytes | None:
         settings = self.load()
@@ -213,7 +235,8 @@ class SettingsManager:
     def get_columns(self) -> list[dict[str, Any]]:
         settings = self.load()
         by_mode = settings.get(COLUMNS_BY_MODE_KEY) or {}
-        if isinstance(by_mode, dict) and by_mode.get("normal"):
+        # 明示的な [] とキー不存在を区別する。[] は全削除という有効な保存状態。
+        if isinstance(by_mode, dict) and "normal" in by_mode and isinstance(by_mode.get("normal"), list):
             return list(by_mode.get("normal") or [])
         return settings.get(COLUMNS_KEY, []) or []
 
@@ -223,8 +246,8 @@ class SettingsManager:
     def get_columns_for_mode(self, mode: str) -> list[dict[str, Any]]:
         settings = self.load()
         by_mode = settings.get(COLUMNS_BY_MODE_KEY) or {}
-        if isinstance(by_mode, dict) and mode in by_mode and by_mode[mode]:
-            return list(by_mode[mode] or [])
+        if isinstance(by_mode, dict) and mode in by_mode and isinstance(by_mode.get(mode), list):
+            return list(by_mode.get(mode) or [])
         if mode == "normal":
             return settings.get(COLUMNS_KEY, []) or []
         return []
@@ -240,6 +263,37 @@ class SettingsManager:
             settings[COLUMNS_KEY] = list(columns or [])
         self.save(settings)
 
+    def save_columns_for_modes(self, modes: dict[str, list[dict[str, Any]]]) -> None:
+        """複数 mode の pack を app.json へ 1 回の書き込みで保存する。"""
+        if not isinstance(modes, dict) or not modes:
+            return
+        settings = self.load()
+        by_mode = settings.get(COLUMNS_BY_MODE_KEY) or {}
+        if not isinstance(by_mode, dict):
+            by_mode = {}
+        for mode, columns in modes.items():
+            if mode not in ("normal", "lr", "tb"):
+                continue
+            by_mode[mode] = list(columns or [])
+            if mode == "normal":
+                settings[COLUMNS_KEY] = list(columns or [])
+        settings[COLUMNS_BY_MODE_KEY] = by_mode
+        self.save(settings)
+
+    def has_columns_for_mode(self, mode: str) -> bool:
+        """その mode のカラム保存が存在するかを返す。明示的な [] も True。
+
+        get_* が [] を返すだけでは「未初期化」と「全削除済み」を区別できないため、
+        seed 生成すべきか（未初期化のみ）判定するために使う。
+        """
+        settings = self.load()
+        by_mode = settings.get(COLUMNS_BY_MODE_KEY) or {}
+        if isinstance(by_mode, dict) and mode in by_mode:
+            return True
+        if mode == "normal" and COLUMNS_KEY in settings:
+            return True
+        return False
+
     def get_download_history(self) -> list[dict[str, Any]]:
         settings = self.load()
         return settings.get(DOWNLOAD_HISTORY_KEY, [])
@@ -252,38 +306,24 @@ class SettingsManager:
     def get_edge_dock_column_count(self) -> int:
         settings = self.load()
         count = settings.get(EDGE_DOCK_COLUMN_COUNT_KEY, 1)
-        if not isinstance(count, int) or count < 1:
+        # 0 は全削除という正当な状態。負値・非数値だけ既定値へ戻す。
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             return 1
         return count
-
-    def save_edge_dock_column_count(self, count: int) -> None:
-        if not isinstance(count, int) or count < 1:
-            count = 1
-        self.save({EDGE_DOCK_COLUMN_COUNT_KEY: count})
 
     def get_edge_dock_column_count_lr(self) -> int:
         settings = self.load()
         count = settings.get(EDGE_DOCK_COLUMN_COUNT_LR_KEY, settings.get(EDGE_DOCK_COLUMN_COUNT_KEY, 1))
-        if not isinstance(count, int) or count < 1:
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             return 1
         return min(count, 8)
-
-    def save_edge_dock_column_count_lr(self, count: int) -> None:
-        if not isinstance(count, int) or count < 1:
-            count = 1
-        self.save({EDGE_DOCK_COLUMN_COUNT_LR_KEY: count})
 
     def get_edge_dock_column_count_tb(self) -> int:
         settings = self.load()
         count = settings.get(EDGE_DOCK_COLUMN_COUNT_TB_KEY, 2)
-        if not isinstance(count, int) or count < 1:
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             return 2
         return min(count, 8)
-
-    def save_edge_dock_column_count_tb(self, count: int) -> None:
-        if not isinstance(count, int) or count < 1:
-            count = 2
-        self.save({EDGE_DOCK_COLUMN_COUNT_TB_KEY: count})
 
     def get_edge_dock_zoom_percent(self) -> int:
         settings = self.load()
@@ -292,19 +332,11 @@ class SettingsManager:
             return 90
         return max(50, min(150, z))
 
-    def save_edge_dock_zoom_percent(self, percent: int) -> None:
-        percent = max(50, min(150, int(percent)))
-        percent = int(round(percent / 5) * 5)
-        self.save({EDGE_DOCK_ZOOM_KEY: percent})
-
     def get_edge_dock_always_on_top(self) -> bool:
         settings = self.load()
         if EDGE_DOCK_ALWAYS_ON_TOP_KEY not in settings:
             return True
         return bool(settings.get(EDGE_DOCK_ALWAYS_ON_TOP_KEY, True))
-
-    def save_edge_dock_always_on_top(self, enabled: bool) -> None:
-        self.save({EDGE_DOCK_ALWAYS_ON_TOP_KEY: bool(enabled)})
 
     def get_edge_dock_disable_on_fullscreen(self) -> bool:
         settings = self.load()
@@ -312,25 +344,16 @@ class SettingsManager:
             return True
         return bool(settings.get(EDGE_DOCK_DISABLE_ON_FULLSCREEN_KEY, True))
 
-    def save_edge_dock_disable_on_fullscreen(self, enabled: bool) -> None:
-        self.save({EDGE_DOCK_DISABLE_ON_FULLSCREEN_KEY: bool(enabled)})
-
     def get_edge_dock_unread_indicator(self) -> bool:
         settings = self.load()
         if EDGE_DOCK_UNREAD_INDICATOR_KEY not in settings:
             return True
         return bool(settings.get(EDGE_DOCK_UNREAD_INDICATOR_KEY, True))
 
-    def save_edge_dock_unread_indicator(self, enabled: bool) -> None:
-        self.save({EDGE_DOCK_UNREAD_INDICATOR_KEY: bool(enabled)})
-
     def get_edge_dock_enabled(self) -> bool:
         settings = self.load()
         val = settings.get(EDGE_DOCK_ENABLED_KEY, False)
         return bool(val)
-
-    def save_edge_dock_enabled(self, enabled: bool) -> None:
-        self.save({EDGE_DOCK_ENABLED_KEY: bool(enabled)})
 
     def get_edge_dock_direction(self) -> str:
         settings = self.load()
@@ -338,11 +361,6 @@ class SettingsManager:
         if direction not in ("left", "right", "top", "bottom"):
             return "right"
         return direction
-
-    def save_edge_dock_direction(self, direction: str) -> None:
-        if direction not in ("left", "right", "top", "bottom"):
-            direction = "right"
-        self.save({EDGE_DOCK_DIRECTION_KEY: direction})
 
     def get(self, key: str, default: Any = None) -> Any:
         settings = self.load()
@@ -419,10 +437,46 @@ class SettingsManager:
             count = int(count)
         except (TypeError, ValueError):
             count = 2
-        return max(1, count)
+        return max(0, count)
 
-    def save_normal_column_count(self, count: int) -> None:
-        self.save({NORMAL_COLUMN_COUNT_KEY: max(1, int(count))})
+    def get_saved_searches(self) -> list[dict[str, str]]:
+        """保存した検索条件 [{"name", "query"}]。壊れた項目は読み飛ばす。"""
+        raw = self.load().get(SAVED_SEARCHES_KEY)
+        out: list[dict[str, str]] = []
+        if not isinstance(raw, list):
+            return out
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            query = str(item.get("query") or "").strip()
+            if name and query:
+                out.append({"name": name, "query": query})
+        return out
+
+    def save_saved_searches(self, searches: list[dict[str, str]]) -> None:
+        clean = []
+        seen = set()
+        for item in searches or []:
+            name = str((item or {}).get("name") or "").strip()
+            query = str((item or {}).get("query") or "").strip()
+            if name and query and name not in seen:
+                seen.add(name)
+                clean.append({"name": name, "query": query})
+        self.save({SAVED_SEARCHES_KEY: clean})
+
+    def get_ui_theme(self) -> str:
+        settings = self.load()
+        theme = str(settings.get(UI_THEME_KEY, "dark") or "dark").strip().lower()
+        return theme if theme in ("dark", "nadeshiko", "baby_blue", "bordeaux", "pure_purple") else "dark"
+
+    def save_ui_theme(self, theme: str) -> None:
+        value = str(theme or "dark").strip().lower()
+        if value not in ("dark", "nadeshiko", "baby_blue", "bordeaux", "pure_purple"):
+            value = "dark"
+        settings = self.load()
+        settings[UI_THEME_KEY] = value
+        self.save(settings)
 
     def get_auto_normalize_audio(self) -> bool:
         settings = self.load()

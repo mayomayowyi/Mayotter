@@ -18,6 +18,11 @@ X_ALLOWED_HOSTS = frozenset(
         "twitter.com",
         "www.twitter.com",
         "mobile.twitter.com",
+        # ログイン/セッション維持に必要な API・アカウント系ホスト
+        "api.x.com",
+        "api.twitter.com",
+        "accounts.x.com",
+        "accounts.twitter.com",
     }
 )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from PySide6.QtCore import Qt, QEvent, Signal, QTimer, QRectF, QSize, QPointF
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QPainter, QColor, QPen, QBrush, QFont, QRegion
@@ -12,6 +13,10 @@ from src.ui.icons import (
     make_file_open_icon,
     make_download_icon,
     make_forward_icon,
+    _COLOR_SECONDARY,
+    _COLOR_DANGER,
+    _COLOR_ACCENT_SOFT,
+    _COLOR_TEXT_SECONDARY,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -35,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.browser.webview import normalize_user_input_url
+from src.ui.theme import themed_qcolor, color as theme_color
 
 def rounded_overlay_mask(width: int, height: int, radius: int = 8) -> QRegion:
     w = max(1, int(width))
@@ -51,6 +57,23 @@ def rounded_overlay_mask(width: int, height: int, radius: int = 8) -> QRegion:
     bl = QRegion(0, h - 2 * r, 2 * r, 2 * r, QRegion.RegionType.Ellipse).intersected(QRegion(0, h - r, r, r))
     br = QRegion(w - 2 * r, h - 2 * r, 2 * r, 2 * r, QRegion.RegionType.Ellipse).intersected(QRegion(w - r, h - r, r, r))
     return region.united(tl).united(tr).united(bl).united(br)
+
+def _apply_smooth_overlay_shape(widget: QWidget) -> None:
+    """角は DWM に任せる。QRegion は DWM の角丸が使えない環境のときだけ使う。"""
+    try:
+        from src.ui.window_polish import prepare_popup_chrome, native_rounding_available
+        if native_rounding_available():
+            widget.clearMask()
+            if prepare_popup_chrome(widget, corner="round"):
+                return
+    except Exception:
+        pass
+    try:
+        widget.setProperty("mayotterNativeRounded", False)
+        widget.setMask(rounded_overlay_mask(widget.width(), widget.height()))
+    except Exception:
+        pass
+
 
 def _overlay_outside_press_should_close(overlay, event, trigger_names: set[str]) -> bool:
     if not isinstance(event, QMouseEvent):
@@ -104,6 +127,11 @@ def _promote_overlay_tool(widget: QWidget, parent: QWidget | None) -> None:
     widget._mayotter_tool_parent = parent
     try:
         widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, False)
+        # このオーバーレイは不透明な SURFACE を自前で塗る。ウィンドウを半透明にすると
+        # Windows ではポップアップ全体からデスクトップが透けることがあるので、
+        # 半透明は専用の外枠と内側サーフェスを持つダイアログだけに限る。
+        widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        widget.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
     except Exception:
         pass
     # IME
@@ -149,6 +177,23 @@ def _demote_overlay_child(widget: QWidget) -> None:
         widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         widget.hide()
+    except Exception:
+        pass
+    _hide_native_descendants(widget)
+
+
+def _hide_native_descendants(widget: QWidget) -> None:
+    """再親子化後、子孫のネイティブ HWND が表示のまま残り、閉じたはずの内容が透けて見えるのを防ぐ。
+
+    Qt 側は非表示扱いなので、次に show されるときは Qt が改めて表示する。
+    """
+    try:
+        import ctypes
+        hide = ctypes.windll.user32.ShowWindow
+        for child in widget.findChildren(QWidget):
+            hwnd = int(child.internalWinId() or 0)
+            if hwnd:
+                hide(hwnd, 0)
     except Exception:
         pass
 
@@ -297,7 +342,7 @@ class UrlOverlay(QWidget):
 
         self._go_btn = QToolButton()
         self._go_btn.setObjectName("url_go_btn")
-        self._go_btn.setIcon(make_forward_icon("#aeb6c5", 14))
+        self._go_btn.setIcon(make_forward_icon(_COLOR_SECONDARY, 14))
         self._go_btn.setIconSize(QSize(14, 14))
         self._go_btn.setFixedSize(28, 28)
         self._go_btn.setToolTip("移動")
@@ -323,9 +368,9 @@ class UrlOverlay(QWidget):
             h = max(int(self.sizeHint().height() or 0), 40)
             self.setFixedSize(width, h)
             self.setGeometry(x, y, width, h)
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
         _promote_overlay_tool(self, parent)
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
         try:
             from src.ui.theme import popover_show
             popover_show(self)
@@ -344,7 +389,7 @@ class UrlOverlay(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
 
     def close_overlay(self) -> None:
         def _clear():
@@ -431,10 +476,17 @@ class TextPromptOverlay(QWidget):
 
         self.hide()
 
-    def open_prompt(self, title: str, initial: str = "", ok_text: str = "保存") -> None:
+    def open_prompt(
+        self, title: str, initial: str = "", ok_text: str = "保存", allow_empty: bool = False
+    ) -> None:
+        self._allow_empty = bool(allow_empty)
         self._title_label.setText(title)
         self._ok_btn.setText(ok_text)
         self._input.setText(initial)
+        try:
+            self._ok_btn.setEnabled(bool((initial or "").strip()) or self._allow_empty)
+        except Exception:
+            pass
         parent = self.parentWidget()
         if parent is not None:
             width = min(self.OVERLAY_WIDTH, max(parent.width() - 40, 240))
@@ -448,9 +500,9 @@ class TextPromptOverlay(QWidget):
             h = max(int(self.sizeHint().height() or 0), 80)
             self.setFixedSize(width, h)
             self.setGeometry(x, y, width, h)
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
         _promote_overlay_tool(self, parent)
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
         try:
             from src.ui.theme import popover_show
             popover_show(self)
@@ -469,7 +521,7 @@ class TextPromptOverlay(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
 
     def close_overlay(self) -> None:
         def _clear():
@@ -496,12 +548,13 @@ class TextPromptOverlay(QWidget):
         return False
 
     def _on_text_changed(self, text: str) -> None:
-        self._ok_btn.setEnabled(bool(text.strip()))
+        allow_empty = bool(getattr(self, "_allow_empty", False))
+        self._ok_btn.setEnabled(bool(text.strip()) or allow_empty)
 
     def _confirm(self) -> None:
-
         value = self._input.text().strip()
-        if not value:
+        allow_empty = bool(getattr(self, "_allow_empty", False))
+        if not value and not allow_empty:
             return
         self.close_overlay()
         self.accepted.emit(value)
@@ -561,17 +614,17 @@ class AccountComboBox(QComboBox):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        from PySide6.QtGui import QPainter, QPen, QColor
+        from PySide6.QtGui import QPainter, QPen
         from PySide6.QtCore import Qt as _Qt
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         div_x = self.width() - self.ARROW_ZONE
-        p.fillRect(div_x, 1, self.ARROW_ZONE - 1, self.height() - 2, QColor("#141e30"))
-        p.setPen(QPen(QColor("#1d2d44"), 1))
+        p.fillRect(div_x, 1, self.ARROW_ZONE - 1, self.height() - 2, themed_qcolor("#141e30"))
+        p.setPen(QPen(themed_qcolor("#1d2d44"), 1))
         p.drawLine(div_x, 6, div_x, self.height() - 6)
         p.setPen(
             QPen(
-                QColor("#9fb4d8"),
+                themed_qcolor("#9fb4d8"),
                 1.6,
                 _Qt.PenStyle.SolidLine,
                 _Qt.PenCapStyle.RoundCap,
@@ -600,6 +653,13 @@ class AccountComboBox(QComboBox):
             if _time.monotonic() - float(getattr(self, "_popup_closed_at", 0.0) or 0.0) < 0.35:
                 event.accept()
                 return
+            try:
+                self.setFocus(_Qt.FocusReason.MouseFocusReason)
+            except Exception:
+                pass
+            self.showPopup()
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def showPopup(self) -> None:
@@ -613,13 +673,46 @@ class AccountComboBox(QComboBox):
 
         if _time.monotonic() - float(getattr(self, "_popup_closed_at", 0.0) or 0.0) < 0.28:
             return
-        from PySide6.QtWidgets import QSizePolicy
-        from PySide6.QtCore import QSize as _QSize
+        from PySide6.QtWidgets import QSizePolicy, QDialog
+        from PySide6.QtCore import QSize as _QSize, QPoint as _QPoint
         if self._list_popup is None:
-            pop = QFrame(
-                None,
-                Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint,
-            )
+            owner = self.window()
+            embedded_popup = isinstance(owner, QDialog)
+            if embedded_popup:
+                # QDialog.exec() 中に別 top-level の Tool を出すと、Windows では
+                # modal blocker 側に入力が吸われて警告音だけ鳴ることがある。
+                # 設定画面では dialog 内の通常 child として重ね、modal 境界を跨がない。
+                pop = QFrame(owner)
+            else:
+                flags = (
+                    Qt.WindowType.Tool
+                    | Qt.WindowType.FramelessWindowHint
+                    | Qt.WindowType.NoDropShadowWindowHint
+                )
+                try:
+                    if bool(owner.windowFlags() & Qt.WindowType.WindowStaysOnTopHint):
+                        flags |= Qt.WindowType.WindowStaysOnTopHint
+                except Exception:
+                    pass
+                try:
+                    handle = owner.windowHandle()
+                    if handle is not None and bool(
+                        handle.flags() & Qt.WindowType.WindowStaysOnTopHint
+                    ):
+                        flags |= Qt.WindowType.WindowStaysOnTopHint
+                except Exception:
+                    pass
+                pop = QFrame(owner, flags)
+                try:
+                    _ = owner.winId()
+                    _ = pop.winId()
+                    wh = pop.windowHandle()
+                    oh = owner.windowHandle()
+                    if wh is not None and oh is not None:
+                        wh.setTransientParent(oh)
+                except Exception:
+                    pass
+            pop._mayotter_embedded_popup = embedded_popup
             pop.setObjectName("account_combo_popover")
             pop.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 
@@ -661,6 +754,9 @@ class AccountComboBox(QComboBox):
                 "  background-color: #181c26;"
                 "  border: 1px solid #2b3242;"
                 "  border-radius: 8px;"
+                "}"
+                "QFrame#account_combo_popover[mayotterNativeRounded=\"true\"] {"
+                "  border-radius: 0px;"
                 "}"
                 "QListWidget#account_combo_list {"
                 "  background: transparent; border: none; color: #f1f3f7;"
@@ -732,37 +828,153 @@ class AccountComboBox(QComboBox):
         lst.setFixedHeight(list_h)
 
         self._list_popup.setFixedSize(w, h)
+        if not getattr(self._list_popup, "_mayotter_embedded_popup", False):
+            owner = self.window()
+            flags = (
+                Qt.WindowType.Tool
+                | Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.NoDropShadowWindowHint
+            )
+            try:
+                if bool(owner.windowFlags() & Qt.WindowType.WindowStaysOnTopHint):
+                    flags |= Qt.WindowType.WindowStaysOnTopHint
+            except Exception:
+                pass
+            try:
+                handle = owner.windowHandle()
+                if handle is not None and bool(
+                    handle.flags() & Qt.WindowType.WindowStaysOnTopHint
+                ):
+                    flags |= Qt.WindowType.WindowStaysOnTopHint
+            except Exception:
+                pass
+            try:
+                if self._list_popup.windowFlags() != flags:
+                    geo = self._list_popup.geometry()
+                    self._list_popup.setWindowFlags(flags)
+                    self._list_popup.setGeometry(geo)
+                _ = owner.winId()
+                _ = self._list_popup.winId()
+                wh = self._list_popup.windowHandle()
+                oh = owner.windowHandle()
+                if wh is not None and oh is not None:
+                    wh.setTransientParent(oh)
+            except Exception:
+                pass
         ax, ay = int(gp.x()), int(gp.y() + 2)
-        self._list_popup.move(ax, ay)
-        self._list_popup._locked_xy = (ax, ay)
-        try:
-            self._list_popup.setMask(rounded_overlay_mask(w, h, 8))
-        except Exception:
-            pass
+        if getattr(self._list_popup, "_mayotter_embedded_popup", False):
+            owner = self._list_popup.parentWidget()
+            if owner is not None:
+                local = owner.mapFromGlobal(_QPoint(ax, ay))
+                self._list_popup.move(local)
+                self._list_popup._locked_xy = (int(local.x()), int(local.y()))
+            else:
+                self._list_popup.move(ax, ay)
+                self._list_popup._locked_xy = (ax, ay)
+            try:
+                self._list_popup.setMask(rounded_overlay_mask(w, h))
+            except Exception:
+                pass
+        else:
+            self._list_popup.move(ax, ay)
+            self._list_popup._locked_xy = (ax, ay)
+            try:
+                _apply_smooth_overlay_shape(self._list_popup)
+            except Exception:
+                pass
         try:
             from src.ui.theme import popover_show
             popover_show(self._list_popup)
         except Exception:
             self._list_popup.show()
             self._list_popup.raise_()
+        self._install_popup_outside_filter()
 
     def hidePopup(self) -> None:
         import time as _time
         pop = self._list_popup
         if pop is None:
             return
-        if not pop.isVisible() and not getattr(pop, "_mayotter_fading_out", False):
+        if getattr(pop, "_mayotter_fading_out", False):
+            return
+        if not pop.isVisible():
             return
 
         def _mark_closed():
             self._popup_closed_at = _time.monotonic()
+            self._remove_popup_outside_filter()
 
         try:
             from src.ui.theme import popover_hide
+            pop._mayotter_fading_out = True
             popover_hide(pop, on_finished=_mark_closed)
         except Exception:
-            pop.hide()
+            try:
+                pop._mayotter_allow_hide = True
+                pop.hide()
+            finally:
+                pop._mayotter_allow_hide = False
+                pop._mayotter_fading_out = False
             _mark_closed()
+
+    def _install_popup_outside_filter(self) -> None:
+        try:
+            from PySide6.QtCore import QObject, QEvent
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is None:
+                return
+            old = getattr(self, "_popup_outside_filter", None)
+            if old is not None:
+                try:
+                    app.removeEventFilter(old)
+                except Exception:
+                    pass
+
+            combo = self
+
+            class _OutsideFilter(QObject):
+                def eventFilter(self, obj, event):
+                    if event.type() != QEvent.Type.MouseButtonPress:
+                        return False
+                    pop = getattr(combo, "_list_popup", None)
+                    if pop is None or not pop.isVisible():
+                        return False
+                    if getattr(pop, "_mayotter_fading_out", False):
+                        return False
+                    try:
+                        gp = event.globalPosition().toPoint()
+                    except Exception:
+                        try:
+                            gp = event.globalPos()
+                        except Exception:
+                            return False
+                    try:
+                        if pop.rect().contains(pop.mapFromGlobal(gp)):
+                            return False
+                        if combo.rect().contains(combo.mapFromGlobal(gp)):
+                            return False
+                    except Exception:
+                        return False
+                    combo.hidePopup()
+                    return False
+
+            filt = _OutsideFilter(self)
+            self._popup_outside_filter = filt
+            app.installEventFilter(filt)
+        except Exception:
+            pass
+
+    def _remove_popup_outside_filter(self) -> None:
+        try:
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            old = getattr(self, "_popup_outside_filter", None)
+            if app is not None and old is not None:
+                app.removeEventFilter(old)
+            self._popup_outside_filter = None
+        except Exception:
+            pass
 
     def _on_popover_item(self, item) -> None:
         if item is None:
@@ -775,11 +987,32 @@ class AccountComboBox(QComboBox):
             self.setCurrentIndex(idx)
         self.hidePopup()
 
+    def refresh_theme(self) -> None:
+        self.setStyleSheet(
+            "QComboBox#column_add_combo {"
+            f"  background-color: {theme_color('SURFACE_SUNKEN')};"
+            f"  border: 1px solid {theme_color('BORDER')};"
+            f"  border-radius: 6px;"
+            f"  padding: 2px 22px 2px 6px;"
+            f"  color: {theme_color('TEXT')};"
+            f"  min-height: 24px;"
+            "}"
+            "QComboBox#column_add_combo::drop-down {"
+            "  border: none;"
+            "  width: 28px;"
+            "}"
+            "QComboBox#column_add_combo::down-arrow {"
+            "  image: none; border: none; width: 0px; height: 0px;"
+            "}"
+        )
+        self.update()
+
 class ColumnAddOverlay(QWidget):
 
     OVERLAY_WIDTH = 380
 
     column_added = Signal(object)
+    closed = Signal()
 
     _SOURCE_TYPE_DEFS: list[tuple[str, str]] = [
         ("home", "ホーム"),
@@ -790,6 +1023,8 @@ class ColumnAddOverlay(QWidget):
         ("search", "検索"),
         ("direct_messages", "DM"),
         ("grok", "Grok"),
+        ("scheduled", "予約"),
+        ("unsent", "未送信"),
     ]
 
     _INPUT_PLACEHOLDERS: dict[str, str] = {
@@ -957,6 +1192,7 @@ class ColumnAddOverlay(QWidget):
             self._account_combo.addItem(name, aid)
 
         self._source_type = "home"
+        self._refresh_presets()
         for stype, btn in self._type_buttons.items():
             btn.setChecked(stype == "home")
         try:
@@ -995,12 +1231,11 @@ class ColumnAddOverlay(QWidget):
             self.setGeometry(x, y, width, h)
             self._locked_local_xy = (int(x), int(y))
             self._locked_xy = (int(x), int(y))
-            self._geometry_locked = True
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
 
         _promote_overlay_tool(self, parent)
         self._locked_xy = (int(self.x()), int(self.y()))
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
         try:
             from src.ui.theme import popover_show
             popover_show(self)
@@ -1046,7 +1281,7 @@ class ColumnAddOverlay(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
 
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
 
     def leaveEvent(self, event) -> None:
 
@@ -1071,62 +1306,110 @@ class ColumnAddOverlay(QWidget):
         except Exception:
             pass
 
-    def close_overlay(self) -> None:
-
-        try:
-            combo = getattr(self, "_account_combo", None)
-            if combo is not None:
-                pop = getattr(combo, "_list_popup", None)
-                if pop is not None:
-                    try:
-                        pop._mayotter_fading_out = False
-                        pop._mayotter_allow_hide = True
-                        from PySide6.QtWidgets import QFrame
-                        QFrame.setVisible(pop, False)
-                    except Exception:
+    def close_overlay(self, checked=False, *, immediate: bool = False) -> None:
+        # 検索展開/収納アニメが残っていると、閉じた後も tick が geometry や
+        # ネイティブ化を触り、再親子化済みのウィジェットが左上に点滅する
+        card_anim = getattr(self, "_card_anim", None)
+        if card_anim is not None:
+            try:
+                card_anim.blockSignals(True)
+                card_anim.stop()
+            except Exception:
+                pass
+            self._card_anim = None
+        combo = getattr(self, "_account_combo", None)
+        if combo is not None:
+            try:
+                combo._remove_popup_outside_filter()
+            except Exception:
+                pass
+            pop = getattr(combo, "_list_popup", None)
+            if pop is not None:
+                for attr in (
+                    "_mayotter_hide_anim",
+                    "_mayotter_show_anim",
+                    "_mayotter_show_group",
+                    "_mayotter_hide_group",
+                ):
+                    anim = getattr(pop, attr, None)
+                    if anim is not None:
                         try:
-                            pop.hide()
-                        except Exception:
-                            pass
-                    finally:
-                        try:
-                            pop._mayotter_allow_hide = False
+                            anim.stop()
                         except Exception:
                             pass
                 try:
-                    import time as _t
-                    combo._popup_closed_at = _t.monotonic()
+                    pop._mayotter_fading_out = False
+                    pop._mayotter_allow_hide = True
+                    QFrame.setVisible(pop, False)
+                    pop.setWindowOpacity(1.0)
+                    pop.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
                 except Exception:
                     pass
+                finally:
+                    try:
+                        pop._mayotter_allow_hide = False
+                    except Exception:
+                        pass
+            try:
+                import time as _t
+                combo._popup_closed_at = _t.monotonic()
+            except Exception:
+                pass
+
+        try:
+            QApplication.instance().removeEventFilter(self)
+        except Exception:
+            pass
+        try:
             self._locked_xy = (self.x(), self.y())
-            self._geometry_locked = True
             self.setFixedSize(self.width(), self.height())
         except Exception:
             pass
 
+        finished = False
+
         def _after():
+            nonlocal finished
+            if finished:
+                return
+            finished = True
             try:
-                self._geometry_locked = False
+                self.hide()
+                self.setWindowOpacity(1.0)
+                self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+                self._mayotter_fading_out = False
             except Exception:
                 pass
             try:
                 _demote_overlay_child(self)
             except Exception:
                 pass
+            try:
+                self.closed.emit()
+            except Exception:
+                pass
 
-        from src.ui.theme import menu_dropdown_hide
+        if immediate:
+            for attr in (
+                "_mayotter_hide_anim",
+                "_mayotter_show_anim",
+                "_mayotter_show_group",
+                "_mayotter_hide_group",
+            ):
+                anim = getattr(self, attr, None)
+                if anim is not None:
+                    try:
+                        anim.stop()
+                    except Exception:
+                        pass
+            _after()
+            return
+
         try:
-            QApplication.instance().removeEventFilter(self)
-        except Exception:
-            pass
-        try:
+            from src.ui.theme import menu_dropdown_hide
             menu_dropdown_hide(self, on_finished=_after)
         except Exception:
             _after()
-            try:
-                self.hide()
-            except Exception:
-                pass
 
     def is_open(self) -> bool:
         return self.isVisible()
@@ -1143,6 +1426,15 @@ class ColumnAddOverlay(QWidget):
                     return True
         elif etype == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
             if event.button() == Qt.MouseButton.LeftButton:
+                try:
+                    pop = getattr(self._account_combo, "_list_popup", None)
+                    gp = event.globalPosition().toPoint()
+                    if pop is not None and pop.isVisible() and pop.rect().contains(
+                        pop.mapFromGlobal(gp)
+                    ):
+                        return False
+                except Exception:
+                    pass
                 if _overlay_outside_press_should_close(
                     self, event, {"add_column_btn"}
                 ):
@@ -1175,7 +1467,9 @@ class ColumnAddOverlay(QWidget):
                 pass
             if not was_input:
                 self._card_resize_open_search()
-            else:
+            elif not self._card_anim_running():
+                # 展開アニメ中の再クリックで即フルサイズにすると、アニメの更新と交互に
+                # 高さが振れて点滅する。アニメ中は何もしない。
                 try:
                     bh = int(self._search_body_target_h())
                     self._ensure_search_body_content_full()
@@ -1191,7 +1485,8 @@ class ColumnAddOverlay(QWidget):
 
             if was_input:
                 self._card_resize_close_search()
-            else:
+            elif not self._card_anim_running():
+                # 収納アニメ中に別ボタンを押したときは、アニメに任せる（即時に畳むと点滅する）
                 try:
                     self._search_body.setFixedHeight(0)
                     self._search_body.setMaximumHeight(0)
@@ -1212,6 +1507,10 @@ class ColumnAddOverlay(QWidget):
                     pass
         except Exception:
             pass
+
+    def _card_anim_running(self) -> bool:
+        anim = getattr(self, "_card_anim", None)
+        return anim is not None and anim.state() == anim.State.Running
 
     def _ensure_search_body_content_full(self) -> None:
         try:
@@ -1429,9 +1728,8 @@ class ColumnAddOverlay(QWidget):
         self.setFixedSize(w, h)
         if int(self.x()) != int(x) or int(self.y()) != int(y):
             self.move(int(x), int(y))
-        self._geometry_locked = True
         try:
-            self.setMask(rounded_overlay_mask(w, h))
+            _apply_smooth_overlay_shape(self)
         except Exception:
             pass
 
@@ -1491,9 +1789,8 @@ class ColumnAddOverlay(QWidget):
         self.setFixedSize(w, h)
         self.setGeometry(x, y, w, h)
         self._locked_xy = (x, y)
-        self._geometry_locked = True
         try:
-            self.setMask(rounded_overlay_mask(w, h))
+            _apply_smooth_overlay_shape(self)
         except Exception:
             pass
         try:
@@ -1593,11 +1890,34 @@ class ColumnAddOverlay(QWidget):
                 b.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
                 b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
                 b.clicked.connect(lambda _=False, t=token: self._insert_search_operator(t))
-                row.addWidget(b)
-            row.addStretch(1)
+                # 行の余白は各チップの文字幅に比例して配り、右端をそろえる
+                row.addWidget(b, max(1, b.sizeHint().width()))
             lay.addLayout(row)
 
-        fh = 2 + 4 + 5 * 12 + 5 * 20 + 9 * 4
+        # 保存した検索条件の行（選択・保存・削除）
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(3)
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        self._preset_combo = AccountComboBox(panel)
+        self._preset_combo.setFixedHeight(30)
+        self._preset_combo.activated.connect(self._on_preset_selected)
+        preset_row.addWidget(self._preset_combo, 1)
+        for text, tip, slot in (
+            ("保存", "今の検索条件を保存", self._save_current_search),
+            ("削除", "選んだ保存済み検索を削除", self._delete_selected_search),
+        ):
+            b = QPushButton(text)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setToolTip(tip)
+            b.setStyleSheet(chip_ss)
+            b.setFlat(True)
+            b.setFixedHeight(20)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(lambda _=False, f=slot: f())
+            preset_row.addWidget(b)
+        lay.addLayout(preset_row)
+
+        fh = lay.sizeHint().height()
         self._SEARCH_FILTER_H = fh
         panel.setFixedHeight(fh)
         panel.setMinimumHeight(fh)
@@ -1607,11 +1927,77 @@ class ColumnAddOverlay(QWidget):
     _SEARCH_INPUT_ROW_H = 36
     _SEARCH_FILTER_H = 202
     _SEARCH_BODY_GAP = 4
-    _SEARCH_BODY_H = _SEARCH_INPUT_ROW_H + _SEARCH_FILTER_H + _SEARCH_BODY_GAP
-    _SEARCH_SECTION_GAP = 0
 
     def _search_body_target_h(self) -> int:
         return int(self._SEARCH_INPUT_ROW_H) + int(self._SEARCH_FILTER_H) + int(self._SEARCH_BODY_GAP)
+
+    def set_saved_searches_store(self, getter, setter) -> None:
+        """保存した検索条件の読み書き先（設定）を受け取る。"""
+        self._saved_searches_get = getter
+        self._saved_searches_set = setter
+        self._refresh_presets()
+
+    def _saved_searches(self) -> list[dict]:
+        getter = getattr(self, "_saved_searches_get", None)
+        try:
+            return list(getter() or []) if callable(getter) else []
+        except Exception:
+            return []
+
+    def _refresh_presets(self, select_name: str = "") -> None:
+        combo = getattr(self, "_preset_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("保存した検索…", "")
+        for item in self._saved_searches():
+            combo.addItem(item["name"], item["query"])
+        if select_name:
+            idx = combo.findText(select_name)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _on_preset_selected(self, index: int) -> None:
+        query = self._preset_combo.itemData(index)
+        if query:
+            self._dynamic_input.setText(str(query))
+            self._dynamic_input.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _save_current_search(self) -> None:
+        query = self._dynamic_input.text().strip()
+        setter = getattr(self, "_saved_searches_set", None)
+        if not query or not callable(setter):
+            return
+        items = self._saved_searches()
+        if any(i["query"] == query for i in items):
+            self._refresh_presets(next(i["name"] for i in items if i["query"] == query))
+            return
+        name = query if len(query) <= 24 else query[:24] + "…"
+        base, n = name, 2
+        while any(i["name"] == name for i in items):
+            name = f"{base} ({n})"
+            n += 1
+        items.append({"name": name, "query": query})
+        try:
+            setter(items)
+        except Exception:
+            return
+        self._refresh_presets(name)
+
+    def _delete_selected_search(self) -> None:
+        idx = self._preset_combo.currentIndex()
+        setter = getattr(self, "_saved_searches_set", None)
+        if idx <= 0 or not callable(setter):
+            return
+        name = self._preset_combo.currentText()
+        items = [i for i in self._saved_searches() if i["name"] != name]
+        try:
+            setter(items)
+        except Exception:
+            return
+        self._refresh_presets()
 
     def _insert_search_operator(self, token: str) -> None:
         edit = self._dynamic_input
@@ -1711,14 +2097,13 @@ class ConfirmOverlay(QWidget):
     def open_confirm(self, message: str, dont_show_key: str | None = None) -> None:
         self._message_label.setText(message)
         self._dont_show_checkbox.setChecked(False)
-        self._dont_show_key = dont_show_key
         parent = self.parentWidget()
         if parent is not None:
             width = min(self.OVERLAY_WIDTH, max(parent.width() - 40, 280))
             x = (parent.width() - width) // 2
             y = 44
             self.setGeometry(x, y, width, self.sizeHint().height())
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
         try:
             from src.ui.theme import popover_show
             popover_show(self)
@@ -1730,7 +2115,7 @@ class ConfirmOverlay(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
 
     def close_overlay(self) -> None:
         _overlay_close(self)
@@ -1774,6 +2159,13 @@ class DownloadItem:
         self.progress = progress
         self.timestamp = time.time()
         self.download_id: str = ""
+        self.bytes_received: int = 0
+        self.size_unknown: bool = False
+        # progress < -1 → 不定形 (sentinel = -(1 + bytes_received))
+        if isinstance(progress, (int, float)) and progress < -1.0:
+            self.size_unknown = True
+            self.bytes_received = max(0, int(-(progress) - 1.0))
+            self.progress = -1.0
 
     def display_name(self) -> str:
         return self.file_name
@@ -1781,7 +2173,16 @@ class DownloadItem:
     def status_label(self) -> str:
         s = (self.status or "").lower()
         if s in ("started", "progress"):
-            pct = int(max(0.0, min(1.0, self.progress)) * 100)
+            if self.size_unknown or (isinstance(self.progress, (int, float)) and self.progress < 0):
+                br = int(getattr(self, "bytes_received", 0) or 0)
+                if br >= 1024 * 1024:
+                    return f"ダウンロード中… {br / (1024 * 1024):.1f} MB 受信中"
+                if br >= 1024:
+                    return f"ダウンロード中… {br / 1024:.0f} KB 受信中"
+                if br > 0:
+                    return f"ダウンロード中… {br} B 受信中"
+                return "ダウンロード中…"
+            pct = int(max(0.0, min(1.0, float(self.progress))) * 100)
             return f"ダウンロード中… {pct}%"
         if s == "completed":
             return "完了"
@@ -1790,6 +2191,80 @@ class DownloadItem:
         if s == "failed":
             return "失敗"
         return s or ""
+
+
+class _DownloadBar(QWidget):
+    """ダウンロード行の細い進捗バー。
+
+    受信は粒度が粗いので、表示値を目標値へなめらかに追わせる。
+    サイズ不明（目標 < 0）のときは往復する帯で「動いている」ことだけ示す。
+    """
+
+    shown = Signal(float)  # 表示中の値（0..1）。パーセント表示の追従用
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(4)
+        self._shown = 0.0
+        self._target = 0.0
+        self._busy = False
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+    def set_target(self, value: float) -> None:
+        if value < 0.0:
+            self._busy = True
+        else:
+            self._busy = False
+            self._target = max(0.0, min(1.0, float(value)))
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def _tick(self) -> None:
+        if self._busy:
+            self._phase = (self._phase + 0.012) % 1.0
+        else:
+            diff = self._target - self._shown
+            if abs(diff) < 0.002:
+                self._shown = self._target
+                self._timer.stop()
+            else:
+                self._shown += diff * 0.2
+            self.shown.emit(self._shown)
+        self.update()
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._busy or abs(self._target - self._shown) >= 0.002:
+            self._timer.start()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w, h = float(self.width()), float(self.height())
+        p.setPen(Qt.PenStyle.NoPen)
+        track = QColor(theme_color("BORDER"))
+        p.setBrush(track)
+        p.drawRoundedRect(QRectF(0, 0, w, h), h / 2, h / 2)
+        fill = QColor(theme_color("ACCENT"))
+        p.setBrush(fill)
+        if self._busy:
+            seg = w * 0.3
+            # 0→1→0 の往復
+            t = self._phase * 2.0
+            t = t if t <= 1.0 else 2.0 - t
+            x = (w - seg) * t
+            p.drawRoundedRect(QRectF(x, 0, seg, h), h / 2, h / 2)
+        elif self._shown > 0.0:
+            p.drawRoundedRect(QRectF(0, 0, max(h, w * self._shown), h), h / 2, h / 2)
+        p.end()
+
 
 class DownloadOverlay(QWidget):
 
@@ -1822,7 +2297,7 @@ class DownloadOverlay(QWidget):
         close_btn = QToolButton()
         close_btn.setObjectName("download_overlay_close")
         close_btn.setText("")
-        close_btn.setIcon(make_close_icon("#93a5c4", 12))
+        close_btn.setIcon(make_close_icon(_COLOR_TEXT_SECONDARY, 12))
         close_btn.setIconSize(QSize(12, 12))
         close_btn.setToolTip("閉じる")
         close_btn.setFixedSize(22, 22)
@@ -1879,11 +2354,11 @@ class DownloadOverlay(QWidget):
                     data.file_name = item.file_name or data.file_name
                     data.status = item.status
                     data.progress = item.progress
+                    data.size_unknown = item.size_unknown
+                    data.bytes_received = item.bytes_received
                     row = self._list.itemWidget(list_item)
                     if row is not None:
-                        sl = getattr(row, "_status_label", None)
-                        if sl is not None:
-                            sl.setText(data.status_label())
+                        self._sync_row_progress(row, data)
                     return
 
         list_item = QListWidgetItem()
@@ -1974,7 +2449,7 @@ class DownloadOverlay(QWidget):
         close_row_btn = QToolButton()
         close_row_btn.setObjectName("download_item_close")
         close_row_btn.setText("")
-        close_row_btn.setIcon(make_close_icon("#93a5c4", 10))
+        close_row_btn.setIcon(make_close_icon(_COLOR_TEXT_SECONDARY, 10))
         close_row_btn.setIconSize(QSize(10, 10))
         close_row_btn.setFixedSize(20, 20)
         close_row_btn.setToolTip("履歴から削除")
@@ -1992,6 +2467,11 @@ class DownloadOverlay(QWidget):
             f"color: {TEXT_MUTED}; font-size: 11px; background: transparent;"
         )
         widget._status_label = status_label
+
+        bar = _DownloadBar()
+        bar.shown.connect(lambda v, w=widget: self._on_bar_shown(w, v))
+        layout.addWidget(bar)
+        widget._progress_bar = bar
 
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
@@ -2017,15 +2497,20 @@ class DownloadOverlay(QWidget):
             b.clicked.connect(slot)
             return b
 
-        btn_row.addWidget(_mk_btn(
-            make_file_open_icon("#aeb6c5", 12), "ファイルを開く",
-            lambda: self._open_file(item)))
-        btn_row.addWidget(_mk_btn(
-            make_folder_icon("#aeb6c5", 12), "フォルダを開く",
-            lambda: self._open_folder(item)))
-        btn_row.addWidget(_mk_btn(
-            make_trash_icon("#e66464", 12), "ファイルを削除",
-            lambda: self._delete_file_and_history(item), danger=True))
+        action_btns = [
+            _mk_btn(
+                make_file_open_icon(_COLOR_SECONDARY, 12), "ファイルを開く",
+                lambda: self._open_file(item)),
+            _mk_btn(
+                make_folder_icon(_COLOR_SECONDARY, 12), "フォルダを開く",
+                lambda: self._open_folder(item)),
+            _mk_btn(
+                make_trash_icon(_COLOR_DANGER, 12), "ファイルを削除",
+                lambda: self._delete_file_and_history(item), danger=True),
+        ]
+        for b in action_btns:
+            btn_row.addWidget(b)
+        widget._action_btns = action_btns
         status_row = QHBoxLayout()
         status_row.setContentsMargins(0, 0, 0, 0)
         status_row.setSpacing(6)
@@ -2033,7 +2518,45 @@ class DownloadOverlay(QWidget):
         status_row.addLayout(btn_row)
         layout.addLayout(status_row)
         widget.setMinimumHeight(56)
+        self._sync_row_progress(widget, item, animate=False)
         return widget
+
+    @staticmethod
+    def _is_downloading(item) -> bool:
+        return (item.status or "").lower() in ("started", "progress")
+
+    def _sync_row_progress(self, row: QWidget, item, *, animate: bool = True) -> None:
+        """行の状態（バー・％・操作ボタン）を item に合わせる。"""
+        bar = getattr(row, "_progress_bar", None)
+        label = getattr(row, "_status_label", None)
+        busy = self._is_downloading(item)
+        if bar is not None:
+            bar.setVisible(busy)
+            if busy:
+                if item.size_unknown or item.progress < 0:
+                    bar.set_target(-1.0)
+                else:
+                    bar.set_target(item.progress)
+                    if not animate:
+                        bar._shown = bar._target
+        # 受信中のファイルは開く・削除の対象にならないので隠す
+        for b in getattr(row, "_action_btns", []):
+            b.setVisible(not busy)
+        if label is not None:
+            if busy and not (item.size_unknown or item.progress < 0) and bar is not None:
+                label.setText(f"ダウンロード中… {int(round(bar._shown * 100))}%")
+            else:
+                label.setText(item.status_label())
+
+    def _on_bar_shown(self, row: QWidget, value: float) -> None:
+        """バーの表示値に合わせて ％ を進める（受信イベントの粒度が粗くても数字が動く）。"""
+        item = getattr(row, "_download_item", None)
+        label = getattr(row, "_status_label", None)
+        if item is None or label is None or not self._is_downloading(item):
+            return
+        if item.size_unknown or item.progress < 0:
+            return
+        label.setText(f"ダウンロード中… {int(round(value * 100))}%")
 
     def _on_item_double_clicked(self, list_item) -> None:
         row = self._list.itemWidget(list_item) if list_item is not None else None
@@ -2155,7 +2678,7 @@ class DownloadOverlay(QWidget):
         self._apply_rounded_mask()
 
     def _apply_rounded_mask(self) -> None:
-        self.setMask(rounded_overlay_mask(self.width(), self.height()))
+        _apply_smooth_overlay_shape(self)
 
     def close_overlay(self) -> None:
         def _after():
@@ -2195,6 +2718,12 @@ class DownloadOverlay(QWidget):
         return False
 
 class DownloadIconButton(QPushButton):
+    """ダウンロード履歴ボタン。受信中は進捗リング、完了時は波紋とチェックで知らせる。
+
+    表示は時間ベースで滑らかに動かす（受信イベントの粒度が粗くても、リングは連続して進む）。
+    """
+
+    _RING_D = 18.0  # リングの直径（ボタンは 28x24）
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2203,209 +2732,229 @@ class DownloadIconButton(QPushButton):
         self.setFixedHeight(24)
         self.setToolTip("ダウンロード履歴")
 
-        self.setIcon(make_download_icon("#9fb4d8", 14))
-        self.setIconSize(QSize(14, 14))
+        # アイコンは paintEvent で不透明度を変えながら自前で描く
+        self._icon = make_download_icon(_COLOR_ACCENT_SOFT, 14)
 
-        self._progress = 0.0
-        self._completed_count = 0
-        self._progress_timer = QTimer(self)
-        self._progress_timer.setInterval(33)
-        self._progress_timer.timeout.connect(self._animate_progress)
+        self._progress = 0.0          # 表示中の進捗（0..1）
         self._target_progress = 0.0
-
-        self._pop_timer = QTimer(self)
-        self._pop_timer.setInterval(16)
-        self._pop_timer.timeout.connect(self._animate_pop)
-        self._pop_phase = 0
-        self._pop_t = 0.0
+        self._active = False          # 受信中
+        self._indeterminate = False
+        self._spin = 0.0              # 不定形のときの回転角（度）
+        self._completed_count = 0
         self._badge_scale = 1.0
-        self._flow_u = 0.0
-        self._check_draw = 0.0
-        self._complete_alpha = 0.0
 
+        self._done_t = -1.0           # 完了演出の経過秒（負なら演出なし）
+        self._ring_a = 0.0            # リングの表示度（フェードイン/アウト）
+        self._icon_a = 1.0            # アイコンの不透明度（なめらかに追従）
+        self._last = time.perf_counter()
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+    # ---- 外部 API（既存の呼び出し口を維持） -------------------------------
     def set_progress(self, progress: float) -> None:
-        self._target_progress = max(0.0, min(1.0, progress))
-        if not self._progress_timer.isActive():
-            self._progress_timer.start()
-
-    def _animate_progress(self) -> None:
-        diff = self._target_progress - self._progress
-        if abs(diff) < 0.02:
-            self._progress = self._target_progress
-            if self._progress >= 1.0:
-                self._progress_timer.stop()
-                self._trigger_pop()
-            else:
-                self._progress_timer.stop()
+        if progress is not None and float(progress) < 0.0:
+            self._indeterminate = True
         else:
-            self._progress += diff * 0.3
-        self.update()
-
-    def _trigger_pop(self) -> None:
-        self._pop_phase = 1
-        self._pop_t = 0.0
-        self._flow_u = 0.0
-        self._check_draw = 0.0
-        self._complete_alpha = 0.0
-        if not self._pop_timer.isActive():
-            self._pop_timer.start()
-
-    def _animate_pop(self) -> None:
-        dt = 0.016
-        active = False
-        if self._pop_phase == 1:
-            active = True
-            self._pop_t = min(1.0, self._pop_t + dt / 0.16)
-            t = self._pop_t
-            u = t * t * (3.0 - 2.0 * t) if t < 1 else 1.0
-            self._flow_u = u
-            self._complete_alpha = 0.25 + 0.55 * u
-            if self._pop_t >= 1.0:
-                self._pop_phase = 2
-                self._pop_t = 0.0
-        elif self._pop_phase == 2:
-            active = True
-            self._pop_t = min(1.0, self._pop_t + dt / 0.18)
-            t = self._pop_t
-            u = t * t * (3.0 - 2.0 * t)
-            self._check_draw = u
-            self._flow_u = max(0.0, 1.0 - u * 1.1)
-            self._complete_alpha = 0.85 - 0.30 * u
-            if self._pop_t >= 1.0:
-                self._pop_phase = 3
-                self._pop_t = 0.0
-        elif self._pop_phase == 3:
-            active = True
-            self._pop_t = min(1.0, self._pop_t + dt / 0.11)
-            u = self._pop_t * self._pop_t * (3.0 - 2.0 * self._pop_t)
-            self._check_draw = max(0.0, 1.0 - u)
-            self._complete_alpha = max(0.0, 0.50 * (1.0 - u))
-            if self._pop_t >= 1.0:
-                self._pop_phase = 0
-                self._check_draw = 0.0
-                self._complete_alpha = 0.0
-                self._flow_u = 0.0
-                self._progress = 0.0
-                self._target_progress = 0.0
-        if self._badge_scale < 1.0:
-            active = True
-            self._badge_scale = min(1.0, self._badge_scale + 0.08)
-        if not active and self._pop_phase == 0:
-            self._pop_timer.stop()
-        self.update()
+            self._indeterminate = False
+            self._target_progress = max(0.0, min(1.0, float(progress or 0.0)))
+        self._active = True
+        self._done_t = -1.0
+        self._start()
 
     def increment_completed(self) -> None:
         self._completed_count += 1
-        self._badge_scale = 0.70
-        self._trigger_pop()
-        self.update()
+        self._badge_scale = 0.6
+        self._indeterminate = False
+        self._target_progress = 1.0
+        self._active = True
+        self._done_t = 0.0
+        self._start()
 
     def clear_completed(self) -> None:
         self._completed_count = 0
-        self._progress = 0.0
-        self._target_progress = 0.0
-        self._progress_timer.stop()
-        self._pop_phase = 0
-        self._complete_alpha = 0.0
-        self._flow_u = 0.0
-        self._check_draw = 0.0
+        self._reset()
         self.update()
 
     def reset_progress(self) -> None:
-        self._progress = 0.0
-        self._target_progress = 0.0
-        self._progress_timer.stop()
+        self._reset()
         self.update()
 
-    def paintEvent(self, event) -> None:
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    def refresh_theme(self) -> None:
+        self._icon = make_download_icon(_COLOR_ACCENT_SOFT, 14)
+        self.update()
 
-        ca = float(getattr(self, "_complete_alpha", 0.0) or 0.0)
-        flow_u = float(getattr(self, "_flow_u", 0.0) or 0.0)
-        check_d = float(getattr(self, "_check_draw", 0.0) or 0.0)
-        cx = self.width() * 0.5
-        cy = self.height() * 0.5
+    # ---- 内部 -------------------------------------------------------------
+    def _reset(self) -> None:
+        # リングはフェードアウトしてから消す（値は消えきるまで保持）
+        if self._done_t > 1.2:
+            self._ring_a = 0.0  # 完了演出の終盤でリングはもう消えている
+        self._active = False
+        self._indeterminate = False
+        self._done_t = -1.0
+        self._icon_a = 1.0
+        self._start()
 
-        if ca > 0.01 or flow_u > 0.01:
-            c = QColor(61, 106, 168, int(36 * ca))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(c))
-            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 6, 6)
+    def _start(self) -> None:
+        if not self._timer.isActive():
+            self._last = time.perf_counter()
+            self._timer.start()
 
-        if flow_u > 0.02:
-            painter.setPen(Qt.PenStyle.NoPen)
-            for i, ox in enumerate((-5.0, 0.0, 5.0)):
-                phase = max(0.0, min(1.0, flow_u * 1.15 - i * 0.08))
-                if phase <= 0.0:
-                    continue
-                y0 = 3.0 + (cy - 4.0) * phase
-                y1 = y0 + 4.0 + 3.0 * (1.0 - phase)
-                alpha = int(110 * (1.0 - abs(phase - 0.55) * 1.2) * (0.7 + 0.3 * flow_u))
-                alpha = max(0, min(140, alpha))
-                sc = QColor(125, 170, 220, alpha)
-                painter.setBrush(QBrush(sc))
-                painter.drawEllipse(QRectF(cx + ox - 1.6, y0, 3.2, max(2.0, y1 - y0)))
+    def _tick(self) -> None:
+        now = time.perf_counter()
+        dt = max(0.0, min(0.1, now - self._last))
+        self._last = now
+        busy = False
 
-        if check_d > 0.02:
-            painter.setPen(QPen(
-                QColor(125, 190, 150, int(220 * min(1.0, check_d * 1.2))),
-                2.0, Qt.PenStyle.SolidLine,
-                Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin,
-            ))
-            p1x, p1y = cx - 4.0, cy
-            p2x, p2y = cx - 1.0, cy + 4.0
-            p3x, p3y = cx + 5.0, cy - 4.0
-            if check_d < 0.45:
-                t = check_d / 0.45
-                painter.drawLine(
-                    QPointF(p1x, p1y),
-                    QPointF(p1x + (p2x - p1x) * t, p1y + (p2y - p1y) * t),
-                )
+        if self._indeterminate:
+            self._spin = (self._spin + 300.0 * dt) % 360.0
+            busy = True
+        else:
+            diff = self._target_progress - self._progress
+            if abs(diff) > 0.0005:
+                # 指数平滑。受信が飛び飛びでもリングは連続して追いかける
+                self._progress += diff * (1.0 - math.exp(-dt * 9.0))
+                busy = True
             else:
-                painter.drawLine(QPointF(p1x, p1y), QPointF(p2x, p2y))
-                t = (check_d - 0.45) / 0.55
-                t = max(0.0, min(1.0, t))
-                painter.drawLine(
-                    QPointF(p2x, p2y),
-                    QPointF(p2x + (p3x - p2x) * t, p2y + (p3y - p2y) * t),
-                )
+                self._progress = self._target_progress
 
-        if 0.0 < self._progress < 1.0 or (
-            self._progress >= 1.0 and self._pop_phase in (1, 2, 3)
-        ):
-            rect = self.rect().adjusted(2, 2, -2, -2)
-            pen = QPen(QColor("#2f517d"), 2)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            painter.setPen(pen)
-            start_angle = 90 * 16
-            span = self._progress if self._progress < 1.0 else max(0.0, 1.0 - float(getattr(self, "_check_draw", 0.0) or 0.0))
-            if span > 0.02:
-                span_angle = int(-span * 360 * 16)
-                painter.drawArc(QRectF(rect), start_angle, span_angle)
+        if self._done_t >= 0.0:
+            # リングが一周してから完了演出へ進める
+            if self._progress >= 0.985:
+                self._done_t += dt
+            busy = True
+            if self._done_t > 1.7:
+                self._reset()
+                busy = False
+
+        if self._badge_scale < 1.0:
+            self._badge_scale = min(1.0, self._badge_scale + dt * 5.0)
+            busy = True
+
+        fade = 5.0 * dt
+        want_ring = 1.0 if self._active else 0.0
+        if self._ring_a < want_ring:
+            self._ring_a = min(want_ring, self._ring_a + fade)
+            busy = True
+        elif self._ring_a > want_ring:
+            self._ring_a = max(want_ring, self._ring_a - fade)
+            busy = True
+            if self._ring_a <= 0.0:
+                self._progress = self._target_progress = 0.0
+        want_icon = 0.55 if self._active else 1.0
+        if self._done_t < 0.0 and abs(self._icon_a - want_icon) > 0.005:
+            self._icon_a += (want_icon - self._icon_a) * (1.0 - math.exp(-dt * 10.0))
+            busy = True
+
+        if not busy and not self._active:
+            self._timer.stop()
+        elif not busy and self._active and self._done_t < 0.0 and abs(self._target_progress - self._progress) <= 0.0005:
+            # 受信中でイベント待ちのときは止める（次の set_progress で再開）
+            self._timer.stop()
+        self.update()
+
+    @staticmethod
+    def _ease_out(t: float) -> float:
+        t = max(0.0, min(1.0, t))
+        return 1.0 - (1.0 - t) ** 3
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)  # 背景・ホバー（QSS）
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        d = self._RING_D
+        ring = QRectF(cx - d / 2.0, cy - d / 2.0, d, d)
+
+        accent = QColor(theme_color("ACCENT"))
+        success = QColor(theme_color("SUCCESS"))
+        track = QColor(theme_color("BORDER"))
+        done = self._done_t
+        # 完了演出の区間: 0〜0.25 色が成功色へ + 波紋 / 0.15〜0.55 チェック / 1.2〜1.7 アイコンへ戻す
+        k_color = self._ease_out(done / 0.25) if done >= 0.0 else 0.0
+        k_check = self._ease_out((done - 0.15) / 0.4) if done >= 0.0 else 0.0
+        k_back = self._ease_out((done - 1.2) / 0.5) if done >= 0.0 else 0.0
+        check_vis = k_check * (1.0 - k_back)
+
+        # アイコン（受信中はやや沈ませ、チェックが出る間は消す）
+        icon_alpha = self._icon_a
+        if done >= 0.0:
+            icon_alpha = max(0.0, min(1.0, 0.55 * (1.0 - k_check) * (1.0 - k_back) + k_back))
+        p.save()
+        p.setOpacity(icon_alpha)
+        pm = self._icon.pixmap(QSize(14, 14))
+        p.drawPixmap(int(cx - 7), int(cy - 7), pm)
+        p.restore()
+
+        if self._ring_a > 0.003:
+            ring_alpha = self._ring_a * (1.0 - k_back)
+            tc = QColor(track)
+            tc.setAlpha(int(150 * ring_alpha))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(tc, 2.0))
+            p.drawEllipse(ring)
+
+            col = QColor(accent)
+            if done >= 0.0:
+                col = QColor(
+                    int(accent.red() + (success.red() - accent.red()) * k_color),
+                    int(accent.green() + (success.green() - accent.green()) * k_color),
+                    int(accent.blue() + (success.blue() - accent.blue()) * k_color),
+                )
+            col.setAlpha(int(255 * ring_alpha))
+            pen = QPen(col, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            if self._indeterminate:
+                p.drawArc(ring, int((90.0 - self._spin) * 16), int(-100 * 16))
+            elif self._progress > 0.004:
+                p.drawArc(ring, 90 * 16, int(-min(1.0, self._progress) * 360 * 16))
+
+        if done >= 0.0 and done < 0.7:
+            # 波紋: 完了の瞬間にリングの外へ広がって消える
+            t = done / 0.7
+            e = self._ease_out(t)
+            rc = QColor(success)
+            rc.setAlpha(int(140 * (1.0 - t)))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(rc, 1.6))
+            r = d / 2.0 + 0.5 + 2.5 * e  # ボタン高(24)に収まる範囲まで
+            p.drawEllipse(QPointF(cx, cy), r, r)
+
+        if check_vis > 0.01:
+            cc = QColor(success)
+            cc.setAlpha(int(255 * check_vis))
+            p.setPen(QPen(cc, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p1, p2, p3 = QPointF(cx - 4.2, cy + 0.2), QPointF(cx - 1.2, cy + 3.4), QPointF(cx + 4.6, cy - 3.2)
+            if k_check < 0.45:
+                s = k_check / 0.45
+                p.drawLine(p1, QPointF(p1.x() + (p2.x() - p1.x()) * s, p1.y() + (p2.y() - p1.y()) * s))
+            else:
+                s = (k_check - 0.45) / 0.55
+                p.drawLine(p1, p2)
+                p.drawLine(p2, QPointF(p2.x() + (p3.x() - p2.x()) * s, p2.y() + (p3.y() - p2.y()) * s))
 
         if self._completed_count > 0:
             badge_text = str(self._completed_count if self._completed_count < 10 else "9+")
             font = QFont()
             font.setPixelSize(9)
             font.setBold(True)
-            painter.setFont(font)
-            fm = painter.fontMetrics()
-            text_rect = fm.boundingRect(badge_text)
-            bw = max(14.0, float(text_rect.width() + 6))
-            bh = max(14.0, float(text_rect.height() + 2))
+            p.setFont(font)
+            fm = p.fontMetrics()
+            bw = max(14.0, float(fm.boundingRect(badge_text).width() + 6))
+            bh = max(14.0, float(fm.boundingRect(badge_text).height() + 2))
             badge_rect = QRectF(self.width() - bw - 2, 1, bw, bh)
-            painter.save()
+            p.save()
             bc = badge_rect.center()
-            bs = float(getattr(self, "_badge_scale", 1.0) or 1.0)
+            bs = self._badge_scale
             if abs(bs - 1.0) > 0.01:
-                painter.translate(bc)
-                painter.scale(bs, bs)
-                painter.translate(-bc)
-            painter.setBrush(QBrush(QColor("#3d6aa8")))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(badge_rect, 7, 7)
-            painter.setPen(QPen(QColor("#f1f3f7")))
-            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
-            painter.restore()
+                # 小さく出てから弾んで大きくなる
+                s2 = bs + 0.18 * math.sin(bs * math.pi)
+                p.translate(bc)
+                p.scale(s2, s2)
+                p.translate(-bc)
+            p.setBrush(QBrush(themed_qcolor("#3d6aa8")))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(badge_rect, 7, 7)
+            p.setPen(QPen(themed_qcolor("#f1f3f7")))
+            p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+            p.restore()

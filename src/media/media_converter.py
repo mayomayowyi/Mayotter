@@ -12,6 +12,7 @@ from src.media.ffmpeg_util import (
     TARGET_TP,
     find_ffmpeg,
     loudnorm_filter_string,
+    DECLICK_FILTER,
     loudness_measured_usable,
     measure_loudness,
     plan_loudness_filter,
@@ -60,6 +61,7 @@ def audio_file_to_mp4(
     crop_y: float = 0.0,
     scale: float = 1.0,
     rotation: float = 0.0,
+    declick: bool = False,
 ) -> Path:
     src = Path(source_path).resolve()
     _media_debug(f"audio_file_to_mp4 enter src={src}")
@@ -126,6 +128,9 @@ def audio_file_to_mp4(
     else:
         _media_debug("normalize=OFF")
 
+    if declick:
+        af = f"{DECLICK_FILTER},{af}" if af else DECLICK_FILTER
+
     def _prog(f: float) -> None:
         if progress_cb:
             progress_cb(0.05 + 0.95 * float(f))
@@ -138,7 +143,7 @@ def audio_file_to_mp4(
             duration_seconds=duration if duration > 0 else None,
             width=width,
             height=height,
-            fps=15,
+            fps=30,
             title="",
             progress_cb=_prog,
             cancel_flag=cancel_flag,
@@ -155,6 +160,8 @@ def audio_file_to_mp4(
         if fb_af and "measured_I" in fb_af:
             if not loudness_measured_usable(measured):
                 fb_af = loudnorm_filter_string(None)
+                if declick:
+                    fb_af = f"{DECLICK_FILTER},{fb_af}"
                 _media_debug("fallback af sanitized to single-pass loudnorm")
         visual = media_temp_dir() / f"vis_{uuid.uuid4().hex[:10]}.png"
         try:
@@ -269,6 +276,7 @@ def _qt_worker_types():
             crop_y: float = 0.0,
             scale: float = 1.0,
             rotation: float = 0.0,
+            declick: bool = False,
         ) -> None:
             super().__init__()
             self.source_path = source_path
@@ -279,6 +287,7 @@ def _qt_worker_types():
             self.crop_y = float(crop_y or 0.0)
             self.scale = float(scale or 1.0)
             self.rotation = float(rotation or 0.0)
+            self.declick = bool(declick)
             self.signals = _ConversionSignals()
             self._cancel = False
             self.setAutoDelete(True)
@@ -313,6 +322,7 @@ def _qt_worker_types():
                     crop_y=self.crop_y,
                     scale=self.scale,
                     rotation=self.rotation,
+                    declick=self.declick,
                 )
                 try:
                     from pathlib import Path as _P
@@ -345,6 +355,7 @@ def start_conversion(
     crop_y: float = 0.0,
     scale: float = 1.0,
     rotation: float = 0.0,
+    declick: bool = False,
     start: bool = True,
 ):
     MediaConversionWorker, QThreadPool = _qt_worker_types()
@@ -357,6 +368,7 @@ def start_conversion(
         crop_y=crop_y,
         scale=scale,
         rotation=rotation,
+        declick=declick,
     )
     worker.setAutoDelete(False)
     if start:

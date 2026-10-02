@@ -10,7 +10,7 @@ from src.ui.theme import (
     TEXT_SECONDARY,
     BORDER_ACCENT,
 )
-from src.ui.icons import make_close_icon
+from src.ui.icons import make_close_icon, _COLOR_TEXT_SECONDARY
 
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal
 from PySide6.QtGui import (
@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QWheelEvent,
     QMouseEvent,
 )
+from src.ui.theme import themed_qcolor
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -71,7 +72,7 @@ class _AvatarCanvas(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         w, h = self.width(), self.height()
-        p.fillRect(0, 0, w, h, QColor("#0f1117"))
+        p.fillRect(0, 0, w, h, themed_qcolor("#0f1117"))
         margin = 8
         dest = QRectF(margin, margin, w - 2 * margin, h - 2 * margin)
         path = QPainterPath()
@@ -184,7 +185,7 @@ class AvatarEditDialog(QDialog):
         title_row.addStretch(1)
         close_tb = QToolButton()
         try:
-            close_tb.setIcon(make_close_icon("#93a5c4", 12))
+            close_tb.setIcon(make_close_icon(_COLOR_TEXT_SECONDARY, 12))
             close_tb.setIconSize(QSize(12, 12))
         except Exception:
             close_tb.setText("×")
@@ -305,6 +306,36 @@ class AvatarEditDialog(QDialog):
             return str(dest)
         except Exception:
             return None
+
+    def refresh_theme(self) -> None:
+        try:
+            from PySide6.QtCore import QSize
+            from PySide6.QtWidgets import QToolButton
+            from src.ui.theme import color
+            self.setStyleSheet(overlay_stylesheet())
+            self._canvas.update()
+            for btn in self.findChildren(QToolButton):
+                if btn.objectName() == "close_tb":
+                    btn.setIcon(make_close_icon(_COLOR_TEXT_SECONDARY, 12))
+                    btn.setIconSize(QSize(12, 12))
+                    break
+            for lbl in self.findChildren(QLabel):
+                if lbl.text() == "音声投稿画像を編集":
+                    lbl.setStyleSheet(f"color:{color('TEXT')}; font-size:14px; font-weight:600;")
+            for lbl in self.findChildren(QLabel):
+                if lbl.text() in ("拡大縮小", "回転"):
+                    lbl.setStyleSheet(f"color:{color('TEXT_SECONDARY')}; font-size:11px; min-width:56px;")
+            for cb in self.findChildren(QCheckBox):
+                cb.setStyleSheet(
+                    f"QCheckBox {{ color:{color('TEXT')}; font-size:12px; spacing:6px; }}"
+                    f"QCheckBox::indicator {{ width:14px; height:14px; }}"
+                )
+            for btn in self.findChildren(QPushButton):
+                if btn.text() in ("キャンセル", "適用"):
+                    pass
+            self.update()
+        except Exception:
+            pass
 
 def open_avatar_editor(
     parent,

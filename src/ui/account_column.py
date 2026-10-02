@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -24,15 +22,22 @@ from PySide6.QtGui import (
 )
 
 from src.browser.webview import XWebView
+from src.ui.theme import themed_qcolor
 from src.ui.icons import (
     make_home_icon,
     make_back_icon,
     make_forward_icon,
     make_chevron_down_icon,
     make_expand_h_icon,
+    make_column_grip_icon,
+    install_close_icon,
+    _COLOR_SECONDARY,
+    _COLOR_TEXT,
+    _COLOR_ACCENT_SOFT,
+    _COLOR_TEXT_SECONDARY,
+    _COLOR_TEXT_MUTED,
 )
 
-_INTERNAL_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 class _UrlBar(QLineEdit):
 
@@ -139,7 +144,7 @@ class _UrlBar(QLineEdit):
 class _SharedUiHoverStrip(QWidget):
     """共有UI（←→🔁）用の透明ホバー帯。境界の2pxリサイズとは別。"""
 
-    WIDTH = 8
+    WIDTH = 18
 
     def __init__(self, parent: QWidget, column: "AccountColumn") -> None:
         super().__init__(parent)
@@ -205,11 +210,10 @@ class _SharedUiHoverStrip(QWidget):
 
 
 class _BoundaryHintBar(QWidget):
-    """通常境界の hover ハイライト専用バー。
+    """通常カラム境界をテーマ色で描く細線。
 
-    通常時は何も描かず（親の暗い背景＝既存の藍色相当が透ける）。
-    hover 時だけ薄い青を paintEvent で描く。stylesheet に頼らないことで、
-    leave 後に色が残る残像を防ぐ。
+    resize hit 自体は2pxのまま維持し、通常時は中央1pxだけを境界色で描く。
+    hover時だけ2pxへ広げることで、WebView間にnative背景の隙間を作らない。
     """
 
     def __init__(self, handle: QWidget) -> None:
@@ -225,15 +229,36 @@ class _BoundaryHintBar(QWidget):
         self.setStyleSheet("background: transparent; border: none;")
 
     def paintEvent(self, event) -> None:
-        # 毎フレーム Source で塗り直す（非 hover 時は透明クリア＝残像防止）
         p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 0))
+
         active = bool(getattr(self._handle, "_hint", False))
-        if active:
-            p.fillRect(self.rect(), QColor(122, 158, 218, 46))  # ≈ rgba(122,158,218,0.18)
-        else:
-            p.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        color = themed_qcolor("#5b8fd6" if active else "#394255")
+        width = 2 if active else 1
+        x = max(0, min(self.width() - 1, self.width() // 2))
+        p.setPen(QPen(color, width))
+        p.drawLine(x, 0, x, max(0, self.height() - 1))
         p.end()
+
+
+class _WebViewHost(QWidget):
+    def sync_webview_geometry(self, webview: XWebView | None = None) -> None:
+        targets = [webview] if webview is not None else None
+        if targets is None:
+            targets = [c for c in self.children() if isinstance(c, XWebView)]
+        r = self.rect()
+        for child in targets:
+            try:
+                if child is not None and child.geometry() != r:
+                    child.setGeometry(r)
+            except Exception:
+                pass
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self.sync_webview_geometry()
 
 
 class _BoundaryHandle(QWidget):
@@ -243,7 +268,6 @@ class _BoundaryHandle(QWidget):
 
     # 通常境界の visual / resize hit は常に 2px（共有UI hover 幅とは分離）
     _IDLE_WIDTH = 2
-    _RESIZE_HIT_HALF = 1
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
@@ -257,8 +281,6 @@ class _BoundaryHandle(QWidget):
         self._active = False
         self._actions_visible = False
         self._expand = 0.0
-        self._btn_reset = None
-        self._btn_stow = None
 
         self._expand_anim = QVariantAnimation(self)
         self._expand_anim.setDuration(180)
@@ -401,9 +423,6 @@ class _BoundaryHandle(QWidget):
         fn = getattr(win, "update_boundary_actions", None)
         if callable(fn):
             fn(cx, top, bot, float(self._expand), self._owner_column())
-
-    def _position_action_buttons(self) -> None:
-        self._apply_expand_layout()
 
     def _animate_expand(self, target: float) -> None:
         """現在 opacity から target へ。途中で stop して新 target へ切り替えてよい。"""
@@ -578,11 +597,12 @@ class _BoundaryHandle(QWidget):
                     if h is None:
                         continue
                     if getattr(h, "_actions_visible", False) and float(getattr(h, "_expand", 0.0)) > 0.5:
-                        # このハンドルをアクティブ owner として layout だけ同期
                         if not self._actions_visible:
-                            self._actions_visible = True
-                            self._expand = float(h._expand)
-                            self._apply_expand_layout()
+                            self._expand = max(
+                                float(getattr(self, "_expand", 0.0) or 0.0),
+                                float(getattr(h, "_expand", 0.0) or 0.0),
+                            )
+                        self._show_actions(True)
                         return
                 except Exception:
                     continue
@@ -874,18 +894,24 @@ class _BoundaryHandle(QWidget):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        # 収納同士の 1px 区切りは親カラム paint が描くが、フル幅ハンドルが
-        # 覆うため左端に同じ 1px を描く（hit ではない・hover ではない）
         owner = self._owner_column()
         if owner is None:
             return
+
+        # 通常境界は透明にして親背景へ依存せず、テーマの境界色を明示描画する。
+        # WebEngine/native child の隙間が露出しても黒線にならない。
         if not getattr(owner, "is_individually_stowed", lambda: False)():
+            p = QPainter(self)
+            p.fillRect(self.rect(), themed_qcolor("#2a3140"))
+            p.end()
             return
+
+        # 収納同士は左端の 1px だけを区切りとして残す。
         left_fn = getattr(owner, "_left_stowed_neighbor", None)
         if not callable(left_fn) or left_fn() is None:
             return
         p = QPainter(self)
-        p.fillRect(0, 0, 1, max(1, self.height()), QColor("#2a3140"))
+        p.fillRect(0, 0, 1, max(1, self.height()), themed_qcolor("#2a3140"))
         p.end()
 
 class _ColumnDragHandle(QWidget):
@@ -908,13 +934,6 @@ class _ColumnDragHandle(QWidget):
         self._dragging = False
         self._press_x = 0.0
         self._press_y = 0.0
-        try:
-            from src.ui.icons import make_column_grip_icon
-            self._icon = make_column_grip_icon("#9fb4d8", 16)
-            self._icon_active = make_column_grip_icon("#eaf1fb", 16)
-        except Exception:
-            self._icon = None
-            self._icon_active = None
         self.setFixedSize(20, 28)
         self.setStyleSheet(
             "QWidget#col_drag_handle { background: transparent; border: 1px solid transparent; border-radius: 4px; }"
@@ -923,12 +942,10 @@ class _ColumnDragHandle(QWidget):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        icon = None
-        if self._dragging and getattr(self, "_icon_active", None) is not None:
-            icon = self._icon_active
-        else:
-            icon = self._icon
-        if icon is None:
+        # テーマ切替に追従させるため、描画ごとに現在テーマの色で生成する
+        try:
+            icon = make_column_grip_icon(_COLOR_TEXT if self._dragging else _COLOR_ACCENT_SOFT, 16)
+        except Exception:
             return
         from PySide6.QtGui import QPainter
         p = QPainter(self)
@@ -1141,9 +1158,9 @@ class RefreshMotionButton(QToolButton):
         cx = self.width() / 2.0
         cy = self.height() / 2.0
         r = min(self.width(), self.height()) * 0.22
-        idle_c = QColor("#aeb6c5")
-        accent = QColor("#4a7ec7")
-        bright = QColor("#7aa3d9")
+        idle_c = themed_qcolor("#aeb6c5")
+        accent = themed_qcolor("#4a7ec7")
+        bright = themed_qcolor("#7aa3d9")
 
         st = self._state
         if st == self._IDLE:
@@ -1268,7 +1285,6 @@ class AccountColumn(QWidget):
     STOWED_WIDTH = 10
     DEFAULT_WIDTH = 400
     LONG_PRESS_MS = 500
-    DRAG_ABORT_PX = 8
 
     def __init__(
         self,
@@ -1296,6 +1312,7 @@ class AccountColumn(QWidget):
         self._title = title
         self._webview = webview
         self._tabs: list[XWebView] = [webview]
+        self._webview_host: QWidget | None = None
         self._current_tab = 0
         self._current_web_url = ""
         self._enabled = enabled
@@ -1319,7 +1336,7 @@ class AccountColumn(QWidget):
         nav_bar.setSpacing(2)
 
         self._back_btn = QToolButton()
-        self._back_btn.setIcon(make_back_icon("#aeb6c5", 14))
+        self._back_btn.setIcon(make_back_icon(_COLOR_SECONDARY, 14))
         self._back_btn.setIconSize(QSize(14, 14))
         self._back_btn.setText("")
         self._back_btn.setFixedSize(26, 26)
@@ -1329,7 +1346,7 @@ class AccountColumn(QWidget):
         nav_bar.addWidget(self._back_btn)
 
         self._forward_btn = QToolButton()
-        self._forward_btn.setIcon(make_forward_icon("#aeb6c5", 14))
+        self._forward_btn.setIcon(make_forward_icon(_COLOR_SECONDARY, 14))
         self._forward_btn.setIconSize(QSize(14, 14))
         self._forward_btn.setText("")
         self._forward_btn.setFixedSize(26, 26)
@@ -1344,7 +1361,7 @@ class AccountColumn(QWidget):
         nav_bar.addWidget(self._reload_btn)
 
         self._home_btn = QToolButton()
-        self._home_btn.setIcon(make_home_icon("#aeb6c5", 16))
+        self._home_btn.setIcon(make_home_icon(_COLOR_SECONDARY, 16))
         self._home_btn.setIconSize(QSize(16, 16))
         self._home_btn.setText("")
         self._home_btn.setFixedSize(26, 26)
@@ -1352,6 +1369,9 @@ class AccountColumn(QWidget):
         self._home_btn.setToolTip("初期ページへ戻る")
         self._home_btn.clicked.connect(self.go_home)
         nav_bar.addWidget(self._home_btn)
+        # 境界の ↔ カーソルを親から継承しないよう矢印を明示する
+        for btn in (self._back_btn, self._forward_btn, self._reload_btn, self._home_btn):
+            btn.setCursor(Qt.CursorShape.ArrowCursor)
 
         self._col_drag_handle = _ColumnDragHandle(self)
         self._col_drag_handle.pressed_drag.connect(self._on_col_grip_pressed)
@@ -1361,7 +1381,7 @@ class AccountColumn(QWidget):
         nav_bar.addWidget(self._col_drag_handle, 0)
 
         self._stow_btn = QToolButton()
-        self._stow_btn.setIcon(make_chevron_down_icon("#aeb6c5", 14))
+        self._stow_btn.setIcon(make_chevron_down_icon(_COLOR_SECONDARY, 14))
         self._stow_btn.setIconSize(QSize(14, 14))
         self._stow_btn.setText("")
         self._stow_btn.setFixedSize(26, 26)
@@ -1380,7 +1400,8 @@ class AccountColumn(QWidget):
         self._url_bar.clicked.connect(self.url_edit_requested)
         nav_bar.addWidget(self._url_bar, 1)
 
-        close_btn = QPushButton("×")
+        close_btn = QPushButton()
+        install_close_icon(close_btn, 12)
         close_btn.setFixedSize(24, 24)
         close_btn.setObjectName("close_btn")
         close_btn.setToolTip("カラムを閉じる")
@@ -1393,18 +1414,19 @@ class AccountColumn(QWidget):
         self._body = QWidget(self)
         self._body.setObjectName("column_body")
         try:
-            from PySide6.QtGui import QColor
             self._body.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
             self._body.setAutoFillBackground(True)
             bp = self._body.palette()
-            bp.setColor(self._body.backgroundRole(), QColor("#0b111f"))
+            bp.setColor(self._body.backgroundRole(), themed_qcolor("#0f1117"))
             self._body.setPalette(bp)
         except Exception:
             pass
         body_row = QHBoxLayout(self._body)
         body_row.setContentsMargins(0, 0, 0, 0)
         body_row.setSpacing(0)
-        body_row.addWidget(webview, 1)
+        self._webview_host = self._create_webview_host()
+        body_row.addWidget(self._webview_host, 1)
+        self._add_webview_to_host(webview)
         self._resize_handle = _BoundaryHandle(self._body)
         self._resize_handle.setFixedWidth(AccountColumn.RESIZE_HANDLE_WIDTH)
         self._resize_handle.setSizePolicy(
@@ -1415,7 +1437,9 @@ class AccountColumn(QWidget):
         )
         self._resize_handle.reset_widths_clicked.connect(self.reset_widths_requested.emit)
         self._resize_handle.hide()
-        body_row.addWidget(self._resize_handle, 0)
+        # 通常境界はレイアウト幅を消費させない。WebEngine同士の間に2pxの
+        # native/background gapを作るとテーマに関係なく黒く見えるため、
+        # body右端へ重ねるoverlayとして扱う。
         # 共有UI専用の透明ホバー帯（resize 2px とは別。描画なし）
         self._shared_ui_hover_strip = _SharedUiHoverStrip(self._body, self)
         self._shared_ui_hover_strip.hide()
@@ -1430,6 +1454,19 @@ class AccountColumn(QWidget):
         ):
             nav_btn.pressed.connect(self.activated)
         # stow は pressed→activated でレイアウトが動くと clicked が落ちるので入れない
+        try:
+            from src.ui.theme import install_hover_fade
+            for b in (
+                self._back_btn,
+                self._forward_btn,
+                self._reload_btn,
+                self._home_btn,
+                self._stow_btn,
+                close_btn,
+            ):
+                install_hover_fade(b, radius=4)
+        except Exception:
+            pass
 
         self._individually_stowed = False
         self._stowed_restore_btn = None
@@ -1462,7 +1499,6 @@ class AccountColumn(QWidget):
         self._profile_resolve_attempted = False
         self._profile_resolve_retries = 0
         self._profile_state = "IDLE"
-        self._profile_tried_settings = False
         self._profile_waiting_self_redirect = False
         self._resolve_request_id = 0
         self._lists_resolved_url = ""
@@ -1472,16 +1508,41 @@ class AccountColumn(QWidget):
         elif self._column_type == "lists":
             QTimer.singleShot(0, self._bootstrap_lists)
 
-    def add_tab_view(self, webview) -> int:
+    def _create_webview_host(self) -> QWidget:
+        host = _WebViewHost(self._body)
+        host.setObjectName("webview_host")
+        host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        host.setAutoFillBackground(True)
+        try:
+            pal = host.palette()
+            pal.setColor(host.backgroundRole(), themed_qcolor("#0f1117"))
+            host.setPalette(pal)
+        except Exception:
+            pass
+        host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        return host
+
+    def _add_webview_to_host(self, webview: XWebView | None) -> None:
+        host = getattr(self, "_webview_host", None)
+        if webview is None or host is None:
+            return None
+        if webview.parentWidget() is not host:
+            webview.setParent(host)
+        try:
+            if hasattr(host, "sync_webview_geometry"):
+                host.sync_webview_geometry(webview)
+        except Exception:
+            pass
+
+    def _set_tab_visible(self, webview: XWebView, visible: bool) -> None:
+        webview.setVisible(visible)
+
+    def add_tab_view(self, webview, *, activate: bool = True) -> int:
         if webview in self._tabs:
             return self._tabs.index(webview)
         self._tabs.append(webview)
-        body_lay = self._body.layout()
-        if body_lay is not None:
-            body_lay.insertWidget(max(0, body_lay.count() - 1), webview, 1)
-        else:
-            self.layout().addWidget(webview, 1)
-        webview.hide()
+        self._add_webview_to_host(webview)
+        self._set_tab_visible(webview, False)
         if hasattr(webview, 'url_changed'):
             webview.url_changed.connect(
                 lambda url, w=webview: self._on_webview_url_changed(w, url)
@@ -1492,9 +1553,11 @@ class AccountColumn(QWidget):
             webview.titleChanged.connect(lambda *_: self.tab_title_changed.emit())
         webview.tab_opener = self.new_tab_requested.emit
         index = len(self._tabs) - 1
-        self.set_current_tab(index)
+        if activate:
+            self.set_current_tab(index)
         self.tabs_changed.emit()
-        self.activated.emit()
+        if activate:
+            self.activated.emit()
         return index
 
     def set_current_tab(self, index: int) -> None:
@@ -1502,26 +1565,80 @@ class AccountColumn(QWidget):
             return
         previous = self._current_tab
         self._current_tab = index
-        for i, tab in enumerate(self._tabs):
-            tab.setVisible(i == index)
         active = self._tabs[index]
+
+        # QWebEngineView は hide(old) → show(new) の順だと native surface が一瞬
+        # 途切れて host 背景が見える。新しいsurfaceを先にActive/geometry確定して
+        # 前面へ出し、その後で旧tabを隠す。関数終了時のvisible invariantは同じ。
+        try:
+            page = active.page() if active is not None else None
+            if page is not None and hasattr(page, "setLifecycleState"):
+                from PySide6.QtWebEngineCore import QWebEnginePage
+                if hasattr(page, "lifecycleState"):
+                    st = page.lifecycleState()
+                    if st != QWebEnginePage.LifecycleState.Active:
+                        page.setLifecycleState(QWebEnginePage.LifecycleState.Active)
+        except Exception:
+            pass
+        try:
+            host = getattr(self, "_webview_host", None)
+            if host is not None and hasattr(host, "sync_webview_geometry"):
+                host.sync_webview_geometry(active)
+        except Exception:
+            pass
+        self._set_tab_visible(active, True)
         try:
             active.raise_()
         except Exception:
             pass
+        for i, tab in enumerate(self._tabs):
+            if i != index:
+                self._set_tab_visible(tab, False)
         pending = getattr(active, "_pending_restore_url", None)
         if pending:
             try:
                 active._pending_restore_url = None
             except Exception:
                 pass
-            try:
-                active.load_url(str(pending), restore=True)
-            except TypeError:
+
+            def _do_load(w=active, u=str(pending)):
                 try:
-                    active.load_url(str(pending))
+                    # サイズが確定して表示された後にロードする
+                    if w is self.current_webview() and not w.isVisible():
+                        self._set_tab_visible(w, True)
+                    w.load_url(u, restore=True)
+                except TypeError:
+                    try:
+                        w.load_url(u)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
+
+            # 復元時は保存された遅延を尊重し、visible/geometry確定後に読み込む。
+            try:
+                from PySide6.QtCore import QTimer
+                delay = max(0, int(getattr(active, "_pending_restore_delay_ms", 0) or 0))
+                active._pending_restore_delay_ms = 0
+                QTimer.singleShot(delay, _do_load)
+            except Exception:
+                _do_load()
+        else:
+            # 非表示中のロードなどで空白のままの復元タブは、
+            # 覚えている URL から読み直す（全タブの強制ロードはしない）
+            try:
+                cur = ""
+                getter = getattr(active, "get_current_url", None)
+                if callable(getter):
+                    cur = (getter() or "").strip()
+                if not cur or cur.startswith("about:") or cur.startswith("data:"):
+                    remembered = (getattr(active, "_current_url", None) or "").strip()
+                    if remembered and not remembered.startswith("about:") and not remembered.startswith("data:"):
+                        from PySide6.QtCore import QTimer
+                        QTimer.singleShot(
+                            0,
+                            lambda w=active, u=remembered: w.load_url(u, restore=True),
+                        )
             except Exception:
                 pass
         url_getter = getattr(active, "get_current_url", None)
@@ -1569,6 +1686,37 @@ class AccountColumn(QWidget):
             pass
         self._update_nav_history_buttons()
 
+    def refresh_theme(self) -> None:
+        try:
+            self._home_btn.setIcon(make_home_icon(_COLOR_SECONDARY, 16))
+            self._stow_btn.setIcon(make_chevron_down_icon(_COLOR_SECONDARY, 14))
+            self._update_nav_history_buttons()
+            self._reload_btn.update()
+            self._col_drag_handle.update()
+        except Exception:
+            pass
+        try:
+            bp = self._body.palette()
+            bp.setColor(self._body.backgroundRole(), themed_qcolor("#0f1117"))
+            self._body.setPalette(bp)
+            host = self._webview_host
+            if host is not None:
+                hp = host.palette()
+                hp.setColor(host.backgroundRole(), themed_qcolor("#0f1117"))
+                host.setPalette(hp)
+            for tab in self._tabs:
+                try:
+                    page = tab.page()
+                    if page is not None:
+                        page.setBackgroundColor(themed_qcolor("#0f1117"))
+                    # 実際のページ背景色で下地を上書きし直す（黒い残像の防止）
+                    tab.apply_page_background()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.update()
+
     def _update_nav_history_buttons(self, *_args) -> None:
         can_back = False
         can_fwd = False
@@ -1581,8 +1729,8 @@ class AccountColumn(QWidget):
                 can_fwd = bool(hist.canGoForward())
         except Exception:
             pass
-        on = "#aeb6c5"
-        off = "#5c6474"
+        on = _COLOR_SECONDARY
+        off = _COLOR_TEXT_MUTED
         try:
             self._back_btn.setIcon(make_back_icon(on if can_back else off, 14))
             self._forward_btn.setIcon(make_forward_icon(on if can_fwd else off, 14))
@@ -1594,13 +1742,21 @@ class AccountColumn(QWidget):
             return
         idx = self._current_tab if 0 <= self._current_tab < len(self._tabs) else 0
         self._current_tab = idx
-        for i, tab in enumerate(self._tabs):
-            want = i == idx
-            tab.setVisible(want)
+        active = self._tabs[idx]
         try:
-            self._tabs[idx].raise_()
+            host = getattr(self, "_webview_host", None)
+            if host is not None and hasattr(host, "sync_webview_geometry"):
+                host.sync_webview_geometry(active)
         except Exception:
             pass
+        self._set_tab_visible(active, True)
+        try:
+            active.raise_()
+        except Exception:
+            pass
+        for i, tab in enumerate(self._tabs):
+            if i != idx:
+                self._set_tab_visible(tab, False)
 
     def close_tab(self, index: int) -> None:
         if not (0 <= index < len(self._tabs)):
@@ -1610,12 +1766,7 @@ class AccountColumn(QWidget):
             self.closed.emit()
             return
         tab = self._tabs.pop(index)
-        body_lay = self._body.layout() if getattr(self, "_body", None) is not None else None
-        if body_lay is not None:
-            body_lay.removeWidget(tab)
-        else:
-            self.layout().removeWidget(tab)
-        tab.hide()
+        self._set_tab_visible(tab, False)
         tab.deleteLater()
         if self._current_tab >= len(self._tabs):
             self._current_tab = len(self._tabs) - 1
@@ -1644,9 +1795,6 @@ class AccountColumn(QWidget):
     def current_webview(self) -> XWebView:
         return self._tabs[self._current_tab]
 
-    def get_tab_count(self) -> int:
-        return len(self._tabs)
-
     def export_tabs_state(self) -> dict:
         tabs_out = []
         for wv in list(self._tabs):
@@ -1660,9 +1808,18 @@ class AccountColumn(QWidget):
                     url = (u.toString() if hasattr(u, "toString") else str(u) or "").strip()
             except Exception:
                 url = ""
+            if not url:
+                url = (getattr(wv, "_pending_restore_url", None) or "").strip()
             if not url or url.startswith("about:") or url.startswith("data:"):
                 url = (getattr(self, "_initial_url", None) or "") if not tabs_out else ""
-            tabs_out.append({"url": url or ""})
+            entry: dict = {"url": url or ""}
+            try:
+                custom = getattr(wv, "_custom_name", None)
+                if isinstance(custom, str) and custom.strip():
+                    entry["custom_name"] = custom.strip()
+            except Exception:
+                pass
+            tabs_out.append(entry)
         active = int(getattr(self, "_current_tab", 0) or 0)
         if tabs_out:
             active = max(0, min(active, len(tabs_out) - 1))
@@ -1812,22 +1969,19 @@ class AccountColumn(QWidget):
         h = getattr(self, "_resize_handle", None)
         et = event.type()
         if btn is not None and obj is btn:
-            if et == QEvent.Type.Leave:
-                QTimer.singleShot(0, self._maybe_release_stowed_hover)
+            if et in (QEvent.Type.Leave, QEvent.Type.MouseMove):
+                # ノブは隣の収納帯の上にもはみ出す。位置で持ち主を決め直す
+                QTimer.singleShot(0, self._sync_stowed_hover)
             elif et == QEvent.Type.Enter:
-                self._hide_other_stowed_restore_btns()
-                self._show_stowed_restore_btn()
-                self._show_stowed_name_label()
+                self._sync_stowed_hover()
             return False
         if h is not None and obj is h:
             # 収納スロット全体がハンドル → 個別展開↔を中継
             # 共有UIはハンドル enterEvent の _ensure_stowed_shared_ui
             if et == QEvent.Type.Enter:
-                self._hide_other_stowed_restore_btns()
-                self._show_stowed_restore_btn()
-                self._show_stowed_name_label()
+                self._sync_stowed_hover()
             elif et == QEvent.Type.Leave:
-                QTimer.singleShot(0, self._maybe_release_stowed_hover)
+                QTimer.singleShot(0, self._sync_stowed_hover)
             return False
         return False
 
@@ -1844,10 +1998,18 @@ class AccountColumn(QWidget):
             h._position_bar()
             h.raise_()
             return
-        # 通常境界: visual / resize / cursor はすべて 2px ハンドル
+        # 通常境界はbody右端へoverlayする。レイアウトに2pxの空白を
+        # 作らないので、QWebEngine native surfaceの黒背景が露出しない。
         h.setFixedWidth(self.RESIZE_HANDLE_WIDTH)
+        h.setGeometry(
+            max(0, int(self._body.width()) - self.RESIZE_HANDLE_WIDTH),
+            0,
+            self.RESIZE_HANDLE_WIDTH,
+            max(1, int(self._body.height())),
+        )
         h.setCursor(Qt.CursorShape.SizeHorCursor)
         h._position_bar()
+        h.raise_()
         self._position_shared_ui_hover_strip()
 
     def _position_shared_ui_hover_strip(self) -> None:
@@ -1898,11 +2060,15 @@ class AccountColumn(QWidget):
                 h.hide()
             return
         body = getattr(self, "_body", None)
-        if body is not None and h.parentWidget() is not body:
-            h.setParent(body)
+        if body is not None:
             lay = body.layout()
             if lay is not None:
-                lay.addWidget(h, 0)
+                try:
+                    lay.removeWidget(h)
+                except Exception:
+                    pass
+            if h.parentWidget() is not body:
+                h.setParent(body)
         h.setVisible(enabled)
         if strip is not None:
             if not enabled:
@@ -1915,11 +2081,6 @@ class AccountColumn(QWidget):
                 if lay is not None:
                     lay.activate()
             self._position_resize_handles()
-
-    def _toggle_enabled(self) -> None:
-        self._enabled = not self._enabled
-        self._maybe_load_initial()
-        self.enabled_changed.emit(self._enabled)
 
     def _maybe_load_initial(self) -> None:
         if not self._enabled or self._loaded_once:
@@ -1947,7 +2108,6 @@ class AccountColumn(QWidget):
             return
         self._session_resolve_target = "lists"
         self._profile_resolve_attempted = False
-        self._lists_cookie_retry_phase = True
         self._profile_resolve_retries = 0
         started = False
         try:
@@ -2009,8 +2169,7 @@ class AccountColumn(QWidget):
             return
 
         self._profile_state = "RESOLVING"
-        rid = self._begin_resolve_request("lists")
-        self._lists_resolve_request_id = rid
+        self._begin_resolve_request("lists")
         try:
             self._url_bar.setText("リストを取得中…")
             self._url_bar.setToolTip("ログイン中のXアカウントからリストを取得しています")
@@ -2051,21 +2210,10 @@ class AccountColumn(QWidget):
             return
 
         self._profile_state = "RESOLVING"
-        rid = self._begin_resolve_request("profile")
-        self._profile_resolve_request_id = rid
+        self._begin_resolve_request("profile")
         try:
             self._url_bar.setText("プロフィールを取得中…")
             self._url_bar.setToolTip("ログイン中のXアカウントからプロフィールを取得しています")
-        except Exception:
-            pass
-        try:
-            import os
-            if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                print(
-                    f"[PROFILE] bootstrap column={getattr(self, '_column_id', '')} "
-                    f"current={self._current_web_url!r}",
-                    flush=True,
-                )
         except Exception:
             pass
 
@@ -2115,12 +2263,6 @@ class AccountColumn(QWidget):
                         uid = m.group(1)
                 if uid and uid not in self._profile_cookie_uids:
                     self._profile_cookie_uids.append(uid)
-                    try:
-                        import os
-                        if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                            print(f"[PROFILE] twid uid={uid}", flush=True)
-                    except Exception:
-                        pass
             except Exception:
                 pass
 
@@ -2136,12 +2278,6 @@ class AccountColumn(QWidget):
             except Exception:
                 pass
             if not uids:
-                try:
-                    import os
-                    if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                        print("[PROFILE] no twid cookie — fall back", flush=True)
-                except Exception:
-                    pass
                 target = getattr(self, "_session_resolve_target", "profile")
                 if target == "lists":
                     if getattr(self, "_lists_home_attempted", False):
@@ -2169,12 +2305,6 @@ class AccountColumn(QWidget):
             if getattr(self, "_nav_target_lock", "") == "lists" or (
                 self._profile_state == "RESOLVED" and self._column_type == "lists"
             ):
-                try:
-                    import os
-                    if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                        print("[LISTS] skip /i/user — already lists-locked", flush=True)
-                except Exception:
-                    pass
                 return
             self_url = f"https://x.com/i/user/{uid}"
             self._profile_resolve_attempted = True
@@ -2197,12 +2327,6 @@ class AccountColumn(QWidget):
                 )
             except Exception:
                 pass
-            try:
-                import os
-                if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                    print(f"[PROFILE] load self_url={self_url}", flush=True)
-            except Exception:
-                pass
             wv.load_url(self_url)
 
         try:
@@ -2220,16 +2344,6 @@ class AccountColumn(QWidget):
         rid = int(getattr(self, "_cookie_resolve_request_id", 0) or 0)
         target = getattr(self, "_session_resolve_target", None) or self._column_type
         if not self._resolve_request_alive(rid, target):
-            try:
-                import os
-                if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                    print(
-                        f"[RESOLVE] ignore stale redirect id={rid} "
-                        f"current={self._resolve_request_id} target={target} url={url!r}",
-                        flush=True,
-                    )
-            except Exception:
-                pass
             return
         if getattr(self, "_nav_target_lock", "") == "lists":
             return
@@ -2256,12 +2370,6 @@ class AccountColumn(QWidget):
                 self._apply_resolved_lists_url(u, request_id=rid)
                 return
             if not self._is_canonical_profile_url(u):
-                try:
-                    import os
-                    if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                        print(f"[LISTS] reject non-profile redirect url={u!r}", flush=True)
-                except Exception:
-                    pass
                 self._lists_show_failed_hub()
                 return
             self._apply_resolved_lists_url(u.rstrip("/") + "/lists", request_id=rid)
@@ -2278,12 +2386,6 @@ class AccountColumn(QWidget):
             self._url_bar.setToolTip(final)
         except Exception:
             pass
-        try:
-            import os
-            if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                print(f"[PROFILE] resolved via cookie/redirect url={final} target={target}", flush=True)
-        except Exception:
-            pass
         self._schedule_history_clear_when_on(final, rid)
 
     def _clear_profile_bootstrap_history(self) -> None:
@@ -2298,12 +2400,6 @@ class AccountColumn(QWidget):
             if hist is None:
                 return
             hist.clear()
-            try:
-                import os
-                if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                    print("[PROFILE] history cleared after resolve", flush=True)
-            except Exception:
-                pass
         except Exception:
             pass
 
@@ -2324,16 +2420,6 @@ class AccountColumn(QWidget):
         self._resolve_request_id = int(getattr(self, "_resolve_request_id", 0) or 0) + 1
         self._session_resolve_target = target
         self._nav_target_lock = ""
-        try:
-            import os
-            if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                print(
-                    f"[RESOLVE] begin id={self._resolve_request_id} "
-                    f"column={getattr(self, '_column_id', '')} target={target}",
-                    flush=True,
-                )
-        except Exception:
-            pass
         return self._resolve_request_id
 
     def _resolve_request_alive(self, request_id: int, target: str | None = None) -> bool:
@@ -2378,12 +2464,6 @@ class AccountColumn(QWidget):
             self._lists_show_failed_hub()
             return
         if request_id is not None and not self._resolve_request_alive(int(request_id), "lists"):
-            try:
-                import os
-                if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                    print(f"[LISTS] skip stale apply id={request_id} url={final}", flush=True)
-            except Exception:
-                pass
             return
         if self._is_canonical_profile_url(final) and not self._is_user_lists_url(final):
             final = final.rstrip("/") + "/lists"
@@ -2444,16 +2524,6 @@ class AccountColumn(QWidget):
         try:
             self._url_bar.setText(final)
             self._url_bar.setToolTip(final)
-        except Exception:
-            pass
-        try:
-            import os
-            if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                print(
-                    f"[LISTS] resolved url={final} already_there={already_there} "
-                    f"lock=lists id={getattr(self, '_resolve_request_id', 0)}",
-                    flush=True,
-                )
         except Exception:
             pass
         if already_there:
@@ -2725,7 +2795,6 @@ class AccountColumn(QWidget):
         def _done(result):
             status = "failed"
             url = ""
-            raw = result
             if isinstance(result, dict):
                 status = str(result.get("status") or "failed")
                 url = str(result.get("url") or "").strip()
@@ -2742,12 +2811,6 @@ class AccountColumn(QWidget):
                             status, url = "ok", s
                 elif s.startswith("http"):
                     status, url = "ok", s
-            try:
-                import os
-                if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                    print(f"[PROFILE] js_raw={raw!r} status={status} url={url!r}", flush=True)
-            except Exception:
-                pass
 
             if status == "ok" and url.startswith("http") and not self._is_session_bootstrap_url(url):
                 if self._column_type == "lists":
@@ -2854,6 +2917,18 @@ class AccountColumn(QWidget):
     def _on_restore_self_clicked(self, _checked: bool = False) -> None:
         if not self.is_individually_stowed():
             return
+        # ノブは隣の収納帯の上にもはみ出すので、押した位置の収納帯を展開する
+        win = self.window()
+        owner_at = getattr(win, "_stowed_hover_owner", None)
+        if callable(owner_at):
+            try:
+                from PySide6.QtGui import QCursor
+                owner = owner_at(QCursor.pos())
+                if owner is not None and owner is not self:
+                    owner.restore_self_requested.emit(owner)
+                    return
+            except Exception:
+                pass
         self.restore_self_requested.emit(self)
 
     def is_individually_stowed(self) -> bool:
@@ -2894,7 +2969,7 @@ class AccountColumn(QWidget):
             self.setFixedWidth(self.STOWED_WIDTH)
             for tab in list(getattr(self, "_tabs", None) or []):
                 try:
-                    tab.hide()
+                    self._set_tab_visible(tab, False)
                 except Exception:
                     pass
             try:
@@ -2925,7 +3000,7 @@ class AccountColumn(QWidget):
             if btn is None:
                 btn = QToolButton(self)
                 btn.setObjectName("stowed_restore_btn")
-                btn.setIcon(make_expand_h_icon("#c5d0e6", 14))
+                btn.setIcon(make_expand_h_icon(_COLOR_TEXT_SECONDARY, 14))
                 btn.setIconSize(QSize(14, 14))
                 btn.setFixedSize(22, 22)
                 # ネイティブ ToolTip「カラムを復帰」は不要（↔ボタン自体は維持）
@@ -2948,6 +3023,7 @@ class AccountColumn(QWidget):
                     " background-color: #1a2740;"
                     "}"
                 )
+                btn.setMouseTracking(True)
                 btn.installEventFilter(self)
                 self._stowed_restore_btn = btn
             btn.hide()
@@ -3005,10 +3081,52 @@ class AccountColumn(QWidget):
         finally:
             self.setUpdatesEnabled(True)
 
+    def _cover_webview_until_painted(self) -> None:
+        """再表示した WebView の最初のフレームが出るまで、ページ背景色の板で黒を隠す。"""
+        host = getattr(self, "_webview_host", None)
+        if host is None:
+            return
+        color = None
+        for tab in list(getattr(self, "_tabs", None) or []):
+            color = getattr(tab, "page_background", None) or color
+        if color is None:
+            # 自分が未取得なら、他カラムで取得済みの色を借りる
+            for col in list(getattr(self.window(), "_columns", None) or []):
+                for tab in list(getattr(col, "_tabs", None) or []):
+                    color = getattr(tab, "page_background", None) or color
+        if color is None:
+            return
+        cover = getattr(self, "_webview_cover", None)
+        if cover is None:
+            cover = QWidget(host)
+            cover.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            cover.setAutoFillBackground(True)
+            self._webview_cover = cover
+        pal = cover.palette()
+        pal.setColor(cover.backgroundRole(), color)
+        cover.setPalette(pal)
+        cover.setGeometry(host.rect())
+        cover.show()
+        cover.raise_()
+        QTimer.singleShot(160, cover.hide)
+
     def reveal_after_restore(self) -> None:
-        # fit で最終幅が付いたあとで body/WebView を出す
+        # fit と祖先Widgetの描画再開後に body / WebView を復帰する。
+        try:
+            self._cover_webview_until_painted()
+        except Exception:
+            pass
         try:
             self._body.show()
+            lay = self._body.layout()
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
+            host = getattr(self, "_webview_host", None)
+            if host is not None:
+                host.updateGeometry()
+                if hasattr(host, "sync_webview_geometry"):
+                    host.sync_webview_geometry()
         except Exception:
             pass
         try:
@@ -3018,12 +3136,20 @@ class AccountColumn(QWidget):
                 idx = int(getattr(self, "_current_tab", 0) or 0)
                 tabs = list(getattr(self, "_tabs", None) or [])
                 for i, tab in enumerate(tabs):
-                    if i == idx:
-                        tab.show()
-                    else:
-                        tab.hide()
+                    self._set_tab_visible(tab, i == idx)
             except Exception:
                 pass
+        try:
+            self._position_resize_handles()
+            self.update()
+        except Exception:
+            pass
+        # WebView の raise_ / geometry 確定後に、覆いを最前面へ置き直す
+        cover = getattr(self, "_webview_cover", None)
+        host = getattr(self, "_webview_host", None)
+        if cover is not None and host is not None and cover.isVisible():
+            cover.setGeometry(host.rect())
+            cover.raise_()
 
     def enterEvent(self, event) -> None:
         super().enterEvent(event)
@@ -3037,9 +3163,7 @@ class AccountColumn(QWidget):
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
                 h.setCursor(Qt.CursorShape.SizeHorCursor)
             # 個別展開↔のみ（共有UIはハンドル側で領域単位管理）
-            self._hide_other_stowed_restore_btns()
-            self._show_stowed_restore_btn()
-            self._show_stowed_name_label()
+            self._sync_stowed_hover()
 
     def mouseMoveEvent(self, event) -> None:
         win = self.window()
@@ -3051,12 +3175,7 @@ class AccountColumn(QWidget):
             if h is not None and h.isVisible():
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
                 h.setCursor(Qt.CursorShape.SizeHorCursor)
-            # すでに表示中なら毎移動で再表示しない
-            btn = getattr(self, "_stowed_restore_btn", None)
-            if btn is None or not btn.isVisible():
-                self._hide_other_stowed_restore_btns()
-                self._show_stowed_restore_btn()
-                self._show_stowed_name_label()
+            self._sync_stowed_hover()
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event) -> None:
@@ -3071,12 +3190,16 @@ class AccountColumn(QWidget):
         super().leaveEvent(event)
         if not self.is_individually_stowed():
             return
-        if self._cursor_over_stowed_restore_btn() or self._cursor_over_stowed_column():
-            QTimer.singleShot(0, self._maybe_release_stowed_hover)
-            return
-        self._fade_stowed_restore_btn(False)
-        self._fade_stowed_name_label(False)
-        QTimer.singleShot(0, self._maybe_release_stowed_hover)
+        # 隣の収納帯へ移った/ノブの上に出た/完全に離れた、のどれかは位置で決める
+        self._sync_stowed_hover()
+        QTimer.singleShot(0, self._sync_stowed_hover)
+
+    def _sync_stowed_hover(self) -> None:
+        """個別収納の↔・名前は、カーソル位置の収納帯だけに出す（全収納帯を一括で整合させる）。"""
+        win = self.window()
+        sync = getattr(win, "_sync_stowed_hover", None)
+        if callable(sync):
+            sync()
 
     def _cursor_over_stowed_restore_btn(self) -> bool:
         btn = getattr(self, "_stowed_restore_btn", None)
@@ -3094,33 +3217,6 @@ class AccountColumn(QWidget):
             return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
         except Exception:
             return False
-
-    def _left_normal_neighbor(self):
-        win = self.window()
-        cols = list(getattr(win, "_columns", None) or [])
-        try:
-            idx = cols.index(self)
-        except ValueError:
-            return None
-        for j in range(idx - 1, -1, -1):
-            c = cols[j]
-            try:
-                if not c.isVisible():
-                    continue
-                if getattr(c, "is_individually_stowed", lambda: False)():
-                    continue
-            except Exception:
-                continue
-            return c
-        return None
-
-    def _maybe_release_stowed_hover(self) -> None:
-        if not self.is_individually_stowed():
-            return
-        if self._cursor_over_stowed_column() or self._cursor_over_stowed_restore_btn():
-            return
-        self._fade_stowed_restore_btn(False)
-        self._fade_stowed_name_label(False)
 
     def _hide_stowed_restore_btn_now(self) -> None:
         btn = getattr(self, "_stowed_restore_btn", None)
@@ -3142,24 +3238,6 @@ class AccountColumn(QWidget):
             btn.hide()
         except Exception:
             pass
-
-    def _hide_other_stowed_restore_btns(self) -> None:
-        """他の個別収納の↔・名前を消す（自分だけ表示）。"""
-        win = self.window()
-        cols = getattr(win, "_columns", None) if win is not None else None
-        if not cols:
-            return
-        for c in cols:
-            if c is self:
-                continue
-            try:
-                if not getattr(c, "is_individually_stowed", lambda: False)():
-                    continue
-                # 即 clear で A→B 移動時の重なり残留を防ぐ（fade は自分の leave で）
-                c._hide_stowed_restore_btn_now()
-                c._hide_stowed_name_label_now()
-            except Exception:
-                pass
 
     def _stowed_profile_label_text(self) -> str:
         name = ""
@@ -3195,7 +3273,7 @@ class AccountColumn(QWidget):
         lbl.setStyleSheet(
             "QLabel#stowed_name_hover_lbl {"
             " color: #c5d0e6;"
-            " background-color: rgba(18, 24, 36, 0.94);"
+            " background-color: #141820;"
             " border: 1px solid #3d465c;"
             " border-radius: 6px;"
             " padding: 2px 7px;"
@@ -3441,33 +3519,11 @@ class AccountColumn(QWidget):
         if host is None:
             host = self.parentWidget() or self
             btn.setParent(host)
-        center = self.mapTo(host, self.rect().center())
-        bw = int(btn.width())
-        x = int(center.x() - bw / 2)
-        y = int(center.y() - btn.height() / 2)
-        # 見切れるときだけ最小限補正（host は window の子孫なので mapFrom を使う）
-        win = self.window()
-        if win is not None and host is not win:
-            left = int(host.mapFrom(win, QPoint(0, 0)).x())
-            right = int(host.mapFrom(win, QPoint(win.width(), 0)).x())
-            if x < left:
-                x = left
-            if x + bw > right:
-                x = right - bw
-            # 端に接しているときだけ中央側へ 1px
-            if x <= left:
-                x = left + 1
-            elif x + bw >= right:
-                x = right - bw - 1
-        elif win is not None:
-            if x < 0:
-                x = 0
-            if x + bw > win.width():
-                x = win.width() - bw
-            if x <= 0:
-                x = 1
-            elif x + bw >= win.width():
-                x = win.width() - bw - 1
+        top_left = self.mapTo(host, QPoint(0, 0))
+        bw = max(1, int(btn.width()))
+        bh = max(1, int(btn.height()))
+        x = int(round(top_left.x() + self.width() / 2.0 - bw / 2.0))
+        y = int(round(top_left.y() + self.height() / 2.0 - bh / 2.0))
         btn.move(x, y)
 
     def _on_back(self) -> None:
@@ -3510,15 +3566,6 @@ class AccountColumn(QWidget):
                 if self._is_canonical_profile_url(url) or (
                     self._is_session_bootstrap_url(url) and "/lists" not in (url or "")
                 ):
-                    try:
-                        import os
-                        if os.environ.get("MAYOTTER_PROFILE_DEBUG"):
-                            print(
-                                f"[LISTS] bounce late nav {url!r} → {lists_url!r}",
-                                flush=True,
-                            )
-                    except Exception:
-                        pass
                     if self._normalize_nav_url(url) != self._normalize_nav_url(lists_url):
                         self._current_web_url = lists_url
                         self._url_bar.setText(lists_url)
@@ -3649,7 +3696,7 @@ class AccountColumn(QWidget):
         if self._left_stowed_neighbor() is None:
             return
         p = QPainter(self)
-        p.fillRect(0, 0, 1, max(1, self.height()), QColor("#2a3140"))
+        p.fillRect(0, 0, 1, max(1, self.height()), themed_qcolor("#2a3140"))
         p.end()
 
     def resizeEvent(self, event: QResizeEvent) -> None:

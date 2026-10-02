@@ -5,13 +5,17 @@ import struct
 import wave
 from pathlib import Path
 
-BG_TOP = "#0f1117"
-BG_BOTTOM = "#181c26"
-PANEL_BORDER = "#2b3242"
-TITLE = "#f1f3f7"
-WAVE_ACTIVE = "#1d9bf0"
-WAVE_DIM = "#2f517d"
-REC_RED = "#e66464"
+from src.ui.theme import color as theme_color
+
+# 出力する動画の背景（画像が無いとき）。アプリのテーマに左右されず、半透明の白い波形が映える暗色にする
+VIDEO_BG = "#0f1117"
+
+def _theme_qcolor(role: str, alpha: int | None = None):
+    from PySide6.QtGui import QColor
+    c = QColor(theme_color(role))
+    if alpha is not None:
+        c.setAlpha(max(0, min(255, int(alpha))))
+    return c
 
 def decode_audio_to_wav(src: str | Path, dst: Path) -> Path | None:
     from src.media.ffmpeg_util import find_ffmpeg
@@ -83,6 +87,24 @@ def _load_mono_pcm(audio_path: str | Path) -> tuple[list[float], int, float]:
     except Exception:
         return [], 44100, 0.0
 
+def _level_for_analysis(samples: list[float], rate: int) -> list[float]:
+    """小さい録音でも波形が動くよう、解析用にだけ音量を揃える（出力音声は変えない）。"""
+    try:
+        import numpy as np
+    except Exception:
+        return samples
+    if len(samples) < rate:
+        return samples
+    x = np.asarray(samples, dtype=np.float64)
+    frame = max(1, rate // 10)
+    n = len(x) // frame
+    rms = np.sqrt((x[: n * frame].reshape(n, frame) ** 2).mean(axis=1))
+    loud = float(np.percentile(rms, 95))
+    if loud < 1e-4:
+        return samples
+    gain = max(1.0, min(30.0, 0.10 / loud))
+    return np.clip(x * gain, -1.0, 1.0).tolist()
+
 def _spectrum_bars_at_time(
     samples: list[float],
     rate: int,
@@ -93,7 +115,6 @@ def _spectrum_bars_at_time(
     prev: list[float] | None = None,
 ) -> tuple[list[float], dict]:
     import math
-    import os
 
     try:
         import numpy as np
@@ -159,11 +180,14 @@ def _spectrum_bars_at_time(
         energy = 0.0
         if np is not None:
             mask = (freqs >= f0) & (freqs < f1)
-            if np.any(mask):
+            if np.count_nonzero(mask) >= 2:
                 energy = float(np.mean(mag[mask]))
             else:
-                idx = int(np.argmin(np.abs(freqs - 0.5 * (f0 + f1))))
-                energy = float(mag[min(idx, len(mag) - 1)])
+                # 低域はFFTの1ビンが複数のバーにまたがる。最寄りビンの複製だと段差になるので
+                # 隣り合うビンの間を dB で線形補間する
+                fc = 0.5 * (f0 + f1)
+                db = np.interp(fc, freqs, 10.0 * np.log10(mag))
+                energy = float(10.0 ** (db / 10.0))
         else:
             count = 0
             for fk, mv in zip(freqs, mag):
@@ -228,15 +252,6 @@ def _spectrum_bars_at_time(
         "rms": float(rms),
         "peak_bar": int(max(range(n_bars), key=lambda i: levels[i])) if levels else 0,
     }
-    if os.environ.get("MAYOTTER_MEDIA_DEBUG"):
-        try:
-            print(
-                f"[AudioVisual] t={t_sec:.3f} low={low_e:.3f} mid={mid_e:.3f} "
-                f"high={high_e:.3f} rms={rms:.4f}",
-                flush=True,
-            )
-        except Exception:
-            pass
     return levels, info
 
 def _visual_map_levels(
@@ -379,7 +394,7 @@ def _dominant_bg_from_image(img, *, width: int, height: int):
     from collections import Counter, defaultdict
 
     if img is None or img.isNull():
-        return QColor(BG_TOP)
+        return QColor(VIDEO_BG)
     w, h = img.width(), img.height()
     step = max(1, min(w, h) // 48)
     CHROMA_MIN = 22
@@ -428,7 +443,7 @@ def _dominant_bg_from_image(img, *, width: int, height: int):
             best_bin = ranked[0][0]
         samples = hue_samples.get(best_bin) or []
         if not samples:
-            return QColor(BG_TOP)
+            return QColor(VIDEO_BG)
         n = len(samples)
         ar = sum(t[1] for t in samples) / n
         ag = sum(t[2] for t in samples) / n
@@ -436,7 +451,7 @@ def _dominant_bg_from_image(img, *, width: int, height: int):
         color = QColor(int(ar), int(ag), int(ab))
     else:
         if not neutral_buckets:
-            return QColor(BG_TOP)
+            return QColor(VIDEO_BG)
         (qr, qg, qb), _ = neutral_buckets.most_common(1)[0]
         color = QColor(int((qr << 3) + 4), int((qg << 3) + 4), int((qb << 3) + 4))
 
@@ -479,7 +494,7 @@ def _paint_frame(
     except Exception:
         pass
 
-    bg = bg_color if bg_color is not None else QColor(BG_TOP)
+    bg = bg_color if bg_color is not None else QColor(VIDEO_BG)
     p.fillRect(0, 0, width, height, bg)
 
     cx = width * 0.5
@@ -528,28 +543,13 @@ def _paint_frame(
     inner_rect = QRectF(cx - base_r, cy - base_r, base_r * 2.0, base_r * 2.0)
 
     p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QBrush(QColor(255, 255, 255, 175)))
+    p.setBrush(QBrush(QColor(255, 255, 255, 170)))
     p.drawPath(outer_path)
     p.setBrush(QBrush(bg))
     p.drawEllipse(inner_rect)
 
-    try:
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.save()
-        p.translate(0.7, 0.0)
-        p.setPen(QPen(QColor(255, 95, 95, 26), 1.15))
-        p.drawPath(outer_path)
-        p.restore()
-        p.save()
-        p.translate(-0.55, 0.0)
-        p.setPen(QPen(QColor(95, 135, 255, 22), 1.15))
-        p.drawPath(outer_path)
-        p.restore()
-    except Exception:
-        pass
-
     p.setBrush(Qt.BrushStyle.NoBrush)
-    p.setPen(QPen(QColor(255, 255, 255, 90), 1.0))
+    p.setPen(QPen(QColor(255, 255, 255, 110), 1.2))
     p.drawPath(outer_path)
 
     if center_image is not None and not center_image.isNull():
@@ -644,6 +644,51 @@ def write_mayotter_audio_frame(
     img.save(str(out), "PNG")
     return out
 
+def _pick_fps(samples, rate, dur, max_fps, width, height, center_img, bg_color) -> int:
+    """PCの速さに合わせてフレームレートを決める。
+
+    数フレームだけ実測し、変換全体が動画の長さ程度（最短20秒〜最長120秒）に収まる
+    最大のフレームレートを選ぶ。遅いPCでも変換が極端に長くならないようにする。
+    """
+    import time
+    from PySide6.QtGui import QImage
+
+    try:
+        img = QImage(width, height, QImage.Format.Format_RGB888)
+        levels = None
+        n_try = 5
+        t_an = t_fr = 0.0
+        for k in range(n_try):
+            t0 = time.perf_counter()
+            levels, _info = _spectrum_bars_at_time(
+                samples, rate, dur * (k + 0.5) / n_try, n_bars=128, fft_size=2048
+            )
+            t1 = time.perf_counter()
+            _paint_frame(
+                img, levels=_visual_map_levels(levels), width=width, height=height,
+                center_image=center_img, bg_color=bg_color,
+            )
+            bytes(img.constBits())
+            t2 = time.perf_counter()
+            t_an += t1 - t0
+            t_fr += t2 - t1
+        t_an /= n_try
+        t_fr /= n_try
+    except Exception:
+        return min(max_fps, 15)
+
+    budget = max(20.0, min(120.0, dur))
+    for fps in (30, 24, 15, 12):
+        if fps > max_fps:
+            continue
+        analysis_hz = 30.0 if fps >= 24 else 20.0
+        # x264 のエンコード時間は描画とほぼ同程度として 1.5 倍で見積もる
+        est = dur * (analysis_hz * t_an + fps * t_fr) * 1.5
+        if est <= budget:
+            return fps
+    return 12
+
+
 def generate_waveform_mp4(
     audio_path: str | Path,
     output_path: str | Path,
@@ -663,6 +708,7 @@ def generate_waveform_mp4(
     rotation: float = 0.0,
 ) -> Path:
     from PySide6.QtGui import QImage, QGuiApplication
+    import os
     import sys
 
     if QGuiApplication.instance() is None:
@@ -690,6 +736,7 @@ def generate_waveform_mp4(
             analysis_wav = decoded
 
     samples, rate, wav_dur = _load_mono_pcm(analysis_wav)
+    samples = _level_for_analysis(samples, rate)
 
     dur = duration_seconds
     if dur is None or dur <= 0:
@@ -715,8 +762,9 @@ def generate_waveform_mp4(
         except Exception:
             center_img = None
 
+    fps = _pick_fps(samples, rate, dur, fps, width, height, center_img, bg_color)
     n_frames = max(1, int(round(dur * fps)))
-    analysis_hz = max(float(fps), 30.0)
+    analysis_hz = 30.0 if fps >= 24 else 20.0
     n_analysis = max(2, int(round(dur * analysis_hz)) + 1)
     spectrum_frames: list[list[float]] = []
     rms_frames: list[float] = []
@@ -751,7 +799,9 @@ def generate_waveform_mp4(
         *af_args,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
+        "-preset", "fast" if fps >= 30 and (os.cpu_count() or 1) >= 6 else "veryfast",
+        "-crf", "18",
+        "-tune", "animation",
         "-c:a", "aac",
         "-b:a", "192k",
         "-ar", "44100",
@@ -863,8 +913,9 @@ def _write_ppm_fallback(path: Path, width: int, height: int) -> None:
             f.write(row)
 
 def make_recording_overlay(parent=None):
+    import time
     from PySide6.QtCore import Qt, QRectF, QTimer
-    from PySide6.QtGui import QColor, QFont, QPainter, QPen, QLinearGradient
+    from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QLinearGradient
     from PySide6.QtWidgets import QWidget
 
     class RecordingOverlay(QWidget):
@@ -878,8 +929,13 @@ def make_recording_overlay(parent=None):
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
             self.setFixedSize(340, 130)
             self._seconds = 0
-            self._levels: list[float] = [0.06] * 64
-            self._peak = 0.0
+            self._levels: list[float] = [0.05] * 96
+            self._disp: list[float] = [0.05] * 96
+            self._last_push: float | None = None
+            self._push_interval = 0.05
+            self._anim = QTimer(self)
+            self._anim.setInterval(16)
+            self._anim.timeout.connect(self._on_frame)
             self._mode = "recording"
             self._status_text = ""
             self._spin_angle = 0
@@ -924,46 +980,108 @@ def make_recording_overlay(parent=None):
             v = max(0.0, min(1.0, float(peak)))
             r = max(0.0, min(1.0, float(rms))) if rms else 0.0
             raw = max(v, r * 1.15)
-            self._peak = raw
             if raw <= 1e-6:
                 drawn = 0.05
             else:
                 drawn = min(1.0, (raw ** 0.55) * 2.4)
                 drawn = max(0.05, drawn)
+            now = time.perf_counter()
+            if self._last_push is not None:
+                # 次の入力までの間隔を、横スクロールの補間に使う
+                self._push_interval = max(0.02, min(0.2, now - self._last_push))
+            self._last_push = now
             self._levels = self._levels[1:] + [drawn]
+            self._disp = self._disp[1:] + [self._disp[-1]]
+
+        def showEvent(self, event) -> None:
+            super().showEvent(event)
+            self._anim.start()
+
+        def hideEvent(self, event) -> None:
+            self._anim.stop()
+            super().hideEvent(event)
+
+        def _on_frame(self) -> None:
+            # 表示値を目標値へ近づける（立ち上がりは速く、戻りはゆっくり）
+            out = []
+            for cur, tgt in zip(self._disp, self._levels):
+                k = 0.55 if tgt > cur else 0.18
+                out.append(cur + (tgt - cur) * k)
+            self._disp = out
             self.update()
+
+        def _wave_path(self, x0: float, width: float, cy: float, max_h: float):
+            from PySide6.QtCore import QPointF
+            from PySide6.QtGui import QPainterPath
+
+            n = len(self._disp)
+            dx = width / (n - 1)
+            interval = max(0.02, self._push_interval)
+            phase = 0.0
+            if self._last_push is not None:
+                phase = min(1.0, (time.perf_counter() - self._last_push) / interval)
+            # 最新の点は右端に固定し、全体を1点ぶんずつ左へ滑らかに流す
+            shift = (1.0 - phase) * dx
+            xs = [x0 + i * dx - dx + shift for i in range(n)]
+            amp = [max(1.2, max_h * v) for v in self._disp]
+            top = [QPointF(x, cy - a) for x, a in zip(xs, amp)]
+            bot = [QPointF(x, cy + a) for x, a in zip(xs, amp)]
+
+            def _smooth(path, pts, first_move: bool):
+                if first_move:
+                    path.moveTo(pts[0])
+                else:
+                    path.lineTo(pts[0])
+                for k in range(1, len(pts) - 1):
+                    mid = QPointF((pts[k].x() + pts[k + 1].x()) / 2, (pts[k].y() + pts[k + 1].y()) / 2)
+                    path.quadTo(pts[k], mid)
+                path.lineTo(pts[-1])
+
+            path = QPainterPath()
+            _smooth(path, top, True)
+            _smooth(path, list(reversed(bot)), False)
+            path.closeSubpath()
+            return path
 
         def paintEvent(self, event) -> None:
             p = QPainter(self)
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             w, h = self.width(), self.height()
             grad = QLinearGradient(0, 0, 0, h)
-            grad.setColorAt(0.0, QColor(BG_TOP))
-            grad.setColorAt(1.0, QColor(BG_BOTTOM))
-            p.setPen(QPen(QColor(PANEL_BORDER), 1.5))
+            grad.setColorAt(0.0, _theme_qcolor("BG"))
+            grad.setColorAt(1.0, _theme_qcolor("SURFACE"))
+            p.setPen(QPen(_theme_qcolor("BORDER"), 1.5))
             p.setBrush(grad)
             p.drawRoundedRect(QRectF(1, 1, w - 2, h - 2), 12, 12)
 
-            n = len(self._levels)
             margin_x = 18
-            usable = w - margin_x * 2
-            bar_w = max(2, usable // n - 1)
-            gap = bar_w + 1
-            total = n * gap
-            x0 = (w - total) / 2
+            x0 = margin_x
+            width = w - margin_x * 2
             cy = h * 0.42
             max_h = h * 0.34
-            p.setPen(Qt.PenStyle.NoPen)
-            for i, f in enumerate(self._levels):
-                bh = max(2.0, max_h * f)
-                alpha = 140 + int(115 * (i / max(1, n - 1)))
-                col = QColor(WAVE_ACTIVE)
-                col.setAlpha(min(255, alpha))
-                p.setBrush(col)
-                p.drawRoundedRect(QRectF(x0 + i * gap, cy - bh / 2, bar_w, bh), 1.2, 1.2)
+            base = _theme_qcolor("ACCENT_STRONG")
 
-            p.setPen(QPen(QColor(WAVE_DIM), 1))
-            p.drawLine(int(x0), int(cy), int(x0 + total), int(cy))
+            p.setPen(QPen(_theme_qcolor("BORDER", 150), 1))
+            p.drawLine(int(x0), int(cy), int(x0 + width), int(cy))
+
+            # 左端は透明にフェードし、新しい音ほどはっきり見せる
+            fill = QLinearGradient(x0, 0, x0 + width, 0)
+            for pos, a in ((0.0, 0), (0.25, 140), (1.0, 215)):
+                c = QColor(base)
+                c.setAlpha(a)
+                fill.setColorAt(pos, c)
+            edge = QLinearGradient(x0, 0, x0 + width, 0)
+            for pos, a in ((0.0, 0), (0.25, 200), (1.0, 255)):
+                c = QColor(base)
+                c.setAlpha(a)
+                edge.setColorAt(pos, c)
+            path = self._wave_path(x0, width, cy, max_h)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill)
+            p.drawPath(path)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QBrush(edge), 1.4))
+            p.drawPath(path)
 
             font2 = QFont()
             font2.setPixelSize(13)
@@ -971,17 +1089,17 @@ def make_recording_overlay(parent=None):
             p.setFont(font2)
             if self._mode == "processing":
                 cx, cy = w / 2 - 70, h - 20
-                p.setPen(QPen(QColor(WAVE_ACTIVE), 2.2))
+                p.setPen(QPen(_theme_qcolor("ACCENT_STRONG"), 2.2))
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawArc(QRectF(cx - 7, cy - 7, 14, 14), int(-self._spin_angle * 16), 270 * 16)
-                p.setPen(QColor(TITLE))
+                p.setPen(_theme_qcolor("TEXT"))
                 p.drawText(
                     QRectF(0, h - 30, w, 22),
                     int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
                     self._status_text or "音声を処理中…",
                 )
             elif self._mode == "error":
-                p.setPen(QColor(REC_RED))
+                p.setPen(_theme_qcolor("DANGER"))
                 p.drawText(
                     QRectF(12, h - 30, w - 24, 22),
                     int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
@@ -989,10 +1107,10 @@ def make_recording_overlay(parent=None):
                 )
             else:
                 m, s = divmod(self._seconds, 60)
-                p.setBrush(QColor(REC_RED))
+                p.setBrush(_theme_qcolor("DANGER"))
                 p.setPen(Qt.PenStyle.NoPen)
                 p.drawEllipse(QRectF(w / 2 - 56, h - 26, 9, 9))
-                p.setPen(QColor(TITLE))
+                p.setPen(_theme_qcolor("TEXT"))
                 p.drawText(
                     QRectF(0, h - 30, w, 22),
                     int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),

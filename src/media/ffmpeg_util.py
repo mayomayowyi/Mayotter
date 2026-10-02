@@ -244,6 +244,9 @@ TARGET_TP = -1.5
 TARGET_LRA = 11.0
 
 MAX_LOUDNORM_GAIN_DB = 10.0
+
+# 録音時のサンプル欠落で出るプチノイズを、音量調整の前に除く
+DECLICK_FILTER = "adeclick=w=55:o=75:a=2:t=2:b=2:m=a"
 MIN_USABLE_WAV_RMS = 0.0015
 
 def measure_loudness(path: str | Path) -> dict:

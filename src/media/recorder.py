@@ -115,6 +115,9 @@ class AudioRecorder(QObject):
         self._path: Path | None = None
         self._wave: wave.Wave_write | None = None
         self._seconds = 0
+        # インスタンスを持っておくと、Windows 側で既定の録音デバイスを変えたときも
+        # Qt のデバイス一覧が最新に保たれる
+        self._media_devices = QMediaDevices(self)
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._on_tick)
@@ -166,7 +169,11 @@ class AudioRecorder(QObject):
                 except Exception:
                     pass
 
-            device = QMediaDevices.defaultAudioInput()
+            # Windows で既定に設定されている録音デバイスを使う
+            device = next(
+                (d for d in QMediaDevices.audioInputs() if d.isDefault()),
+                QMediaDevices.defaultAudioInput(),
+            )
             if device.isNull():
                 _rec_log("default_input=null")
                 self.failed.emit("録音デバイスが見つかりません")

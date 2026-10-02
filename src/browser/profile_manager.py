@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
 from src.core.paths import APP_BASE_DIR, PROFILES_DIR
 
@@ -214,14 +215,28 @@ class ProfileManager:
             except Exception:
                 pass
 
+        try:
+            # ディスクキャッシュを広げ、画像・JS・動画の再取得を減らす（既定は自動で小さめ）。
+            # 7 アカウント分あるので 1 プロファイル 512MB を上限にする
+            profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+            profile.setHttpCacheMaximumSize(512 * 1024 * 1024)
+        except Exception:
+            pass
+
         profile.setHttpAcceptLanguage(ACCEPT_LANGUAGE)
         self._profiles[account_id] = profile
         return profile
 
     @staticmethod
     def _ptrace(account_id: str, stage: str, path: str = "", **extra) -> None:
+        import os
+        enabled = (
+            (os.environ.get("MAYOTTER_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
+            or (os.environ.get("MAYOTTER_ACCOUNT_TRACE") or "").strip().lower() in ("1", "true", "yes", "on")
+        )
+        if not enabled:
+            return
         try:
-            import os
             from src.core.paths import LOGS_DIR
 
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -340,17 +355,56 @@ class ProfileManager:
         return self._profiles.get(account_id)
 
     def remove(self, account_id: str, cleanup_data: bool = False) -> None:
-        self._profiles.pop(account_id, None)
-        if cleanup_data:
-            self.delete_profile_data(account_id)
-
-    def delete_profile_data(self, account_id: str) -> None:
         aid = (account_id or "").strip()
         if not aid:
             return
-        profile_dir = resolve_profile_path(aid)
-        if profile_dir.exists():
-            shutil.rmtree(profile_dir, ignore_errors=True)
+        self._profiles.pop(aid, None)
+        if cleanup_data:
+            self.delete_profile_data(aid)
+
+    def delete_profile_data(self, account_id: str) -> bool:
+        aid = (account_id or "").strip()
+        if not aid:
+            return False
+        try:
+            profiles_root = PROFILES_DIR.resolve()
+            profile_dir = resolve_profile_path(aid).resolve()
+        except OSError:
+            return False
+        if profile_dir.parent != profiles_root:
+            return False
+        if not profile_dir.exists():
+            return True
+        try:
+            shutil.rmtree(profile_dir)
+        except OSError:
+            return False
+        return not profile_dir.exists()
+
+    def cleanup_orphaned_profile_data(self, registered_account_ids: set[str]) -> list[str]:
+        registered = {
+            str(account_id or "").strip().lower()
+            for account_id in registered_account_ids
+            if str(account_id or "").strip()
+        }
+        try:
+            entries = list(PROFILES_DIR.iterdir())
+        except OSError:
+            return []
+
+        removed: list[str] = []
+        for entry in entries:
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            try:
+                canonical = str(UUID(entry.name))
+            except (ValueError, AttributeError):
+                continue
+            if entry.name.lower() != canonical or canonical in registered:
+                continue
+            if self.delete_profile_data(entry.name):
+                removed.append(entry.name)
+        return removed
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._profiles)

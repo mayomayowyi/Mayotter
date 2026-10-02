@@ -10,7 +10,7 @@ from collections.abc import Callable
 from urllib.parse import quote_plus
 
 from PySide6.QtCore import Qt, QUrl, Signal, QEvent, QTimer
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QMenu, QWidget
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import (
@@ -93,6 +93,7 @@ def convert_file_to_png(path: str) -> None:
     image.save(path, "PNG")
 
 import weakref
+from src.ui.theme import themed_qcolor
 _DOWNLOAD_VIEWS: dict[int, list[weakref.ref]] = {}
 
 _OFFSCREEN_CAPTURE_HOLDER: QWidget | None = None
@@ -227,6 +228,390 @@ def _capture_parent_for(view_self: QWidget) -> QWidget:
         pass
     return view_self
 
+
+def needs_interactive_auth_window(url: str) -> bool:
+    """OAuth / GIS / ログイン用 popup は URL 捕捉では成立しない。"""
+    text = (url or "").strip()
+    if not text or text.startswith("about:") or text.startswith("data:"):
+        return False
+    try:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(text)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        path = (parsed.path or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    # Google Identity Services / OAuth
+    if host == "accounts.google.com" or host.endswith(".google.com"):
+        if any(
+            s in path
+            for s in (
+                "/gsi/",
+                "/o/oauth2",
+                "/signin",
+                "/ServiceLogin",
+                "/v3/signin",
+                "/AddSession",
+                "/InteractiveLogin",
+                "/EmbeddedSetup",
+            )
+        ):
+            return True
+        if host == "accounts.google.com":
+            return True
+    if host in ("oauth2.googleapis.com", "www.googleapis.com"):
+        return True
+    # X / Twitter 認証ウィンドウ
+    if host in (
+        "api.twitter.com",
+        "api.x.com",
+        "accounts.x.com",
+        "accounts.twitter.com",
+    ):
+        return True
+    if host in ("x.com", "twitter.com", "www.x.com", "www.twitter.com", "mobile.x.com", "mobile.twitter.com"):
+        if any(s in path for s in ("/i/flow", "/oauth", "/account/login", "/login")):
+            return True
+    return False
+
+
+# owner_window の id -> 認証ポップアップの弱参照
+_AUTH_POPUPS: dict[int, list[weakref.ref]] = {}
+
+
+def register_auth_popup(owner_window: QWidget | None, popup: QWidget) -> None:
+    if owner_window is None or popup is None:
+        return
+    try:
+        key = int(id(owner_window))
+    except Exception:
+        return
+    refs = _AUTH_POPUPS.setdefault(key, [])
+    refs.append(weakref.ref(popup))
+
+    def _cleanup(*_args, k=key):
+        lst = _AUTH_POPUPS.get(k)
+        if not lst:
+            return
+        alive = [r for r in lst if r() is not None]
+        if alive:
+            _AUTH_POPUPS[k] = alive
+        else:
+            _AUTH_POPUPS.pop(k, None)
+
+    try:
+        popup.destroyed.connect(_cleanup)
+    except Exception:
+        pass
+
+
+class AuthPopupWindow(QWidget):
+    """Google / X 等の認証用 interactive popup。既存 overlay / 設定ダイアログと同一 chrome。"""
+
+    _RADIUS = 8
+
+    def __init__(self, web_view: QWebEngineView, owner_window: QWidget | None = None) -> None:
+        super().__init__(None)
+        self._web_view = web_view
+        self._closing = False
+        self._drag_pos = None
+
+        from PySide6.QtWidgets import (
+            QVBoxLayout, QHBoxLayout, QLabel, QToolButton, QFrame, QSizePolicy, QWidget,
+        )
+        from PySide6.QtCore import QSize
+        from PySide6.QtGui import QCursor
+
+        try:
+            from src.ui.theme import (
+                SURFACE, BORDER, TEXT, RADIUS_MD,
+            )
+            bg = SURFACE
+            border = BORDER
+            text = TEXT
+            radius = int(RADIUS_MD)
+        except Exception:
+            bg = "#181c26"
+            border = "#2b3242"
+            text = "#f1f3f7"
+            radius = 8
+        self._RADIUS = radius
+
+        self.setObjectName("mayotter_auth_popup")
+        self.setWindowTitle("認証")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        try:
+            self.setWindowFlags(
+                Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+            )
+        except Exception:
+            self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+
+        try:
+            from src.ui.window_polish import prepare_popup_chrome
+            self._native_rounding = prepare_popup_chrome(
+                self, background=bg, border_color=border, corner="round"
+            )
+        except Exception:
+            self._native_rounding = False
+        if not self._native_rounding:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        self.setStyleSheet(
+            f"QWidget#mayotter_auth_popup {{"
+            f" background:{bg if self._native_rounding else 'transparent'}; border:none; }}"
+        )
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # 内側 surface（既存ダイアログと同じ色・枠・角丸）
+        surface = QWidget(self)
+        surface.setObjectName("mayotter_auth_popup_surface")
+        surface.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        surface.setStyleSheet(
+            f"QWidget#mayotter_auth_popup_surface {{"
+            f" background-color: {bg};"
+            f" border: {'none' if self._native_rounding else f'1px solid {border}'};"
+            f" border-radius: {0 if self._native_rounding else radius}px;"
+            f"}}"
+        )
+        outer.addWidget(surface)
+        self._surface = surface
+
+        root = QVBoxLayout(surface)
+        root.setContentsMargins(1, 1, 1, 1)
+        root.setSpacing(0)
+
+        # タイトルバー（設定 / ダウンロード overlay と同型）
+        titlebar = QFrame(surface)
+        titlebar.setObjectName("auth_popup_titlebar")
+        titlebar.setFixedHeight(34)
+        titlebar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        titlebar.setStyleSheet(
+            "QFrame#auth_popup_titlebar { background: transparent; border: none; }"
+        )
+        title_l = QHBoxLayout(titlebar)
+        title_l.setContentsMargins(12, 0, 8, 0)
+        title_l.setSpacing(6)
+        title_l.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        title_lbl = QLabel("認証")
+        title_lbl.setObjectName("auth_popup_title")
+        title_lbl.setStyleSheet(
+            f"QLabel#auth_popup_title {{"
+            f" color: {text}; font-size: 13px; font-weight: 600;"
+            f" background: transparent; border: none;"
+            f"}}"
+        )
+        title_l.addWidget(title_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        title_l.addStretch(1)
+
+        close_btn = QToolButton(titlebar)
+        close_btn.setObjectName("auth_popup_close")
+        close_btn.setToolTip("閉じる")
+        close_btn.setFixedSize(24, 24)
+        close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        try:
+            from src.ui.icons import make_close_icon
+            close_btn.setText("")
+            close_btn.setIcon(make_close_icon("#aeb6c5", 12))
+            close_btn.setIconSize(QSize(12, 12))
+        except Exception:
+            close_btn.setText("×")
+        # win_close_btn と同一の hover（赤系）
+        close_btn.setStyleSheet(
+            "QToolButton#auth_popup_close {"
+            " background: transparent; border: none; border-radius: 4px;"
+            " color: #aeb6c5; font-size: 14px; padding: 0;"
+            "}"
+            "QToolButton#auth_popup_close:hover {"
+            " background-color: rgba(230, 100, 100, 0.3); color: #e66464;"
+            "}"
+            "QToolButton#auth_popup_close:pressed {"
+            " background-color: rgba(230, 100, 100, 0.45); color: #e66464;"
+            "}"
+        )
+        close_btn.clicked.connect(lambda: self.request_close())
+        title_l.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._close_btn = close_btn
+        root.addWidget(titlebar, 0)
+
+        try:
+            from src.ui.theme import install_hover_fade
+            install_hover_fade(close_btn)
+        except Exception:
+            pass
+
+        try:
+            web_view.setParent(surface)
+        except Exception:
+            pass
+        try:
+            web_view.setMinimumSize(0, 0)
+            web_view.setMaximumSize(16777215, 16777215)
+        except Exception:
+            pass
+        web_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        try:
+            web_view.setMinimumSize(400, 480)
+        except Exception:
+            pass
+        try:
+            web_view.setVisible(True)
+            web_view.show()
+        except Exception:
+            pass
+        root.addWidget(web_view, 1)
+
+        self.resize(520, 680)
+        self.setMinimumSize(420, 520)
+        self._apply_round_mask()
+
+        try:
+            page = web_view.page()
+            if page is not None and hasattr(page, "windowCloseRequested"):
+                page.windowCloseRequested.connect(self._on_window_close_requested)
+        except Exception:
+            pass
+
+        titlebar.mousePressEvent = self._title_mouse_press  # type: ignore
+        titlebar.mouseMoveEvent = self._title_mouse_move  # type: ignore
+        titlebar.mouseReleaseEvent = self._title_mouse_release  # type: ignore
+
+    def _apply_round_mask(self) -> None:
+        # 角丸は半透明ウィンドウ + 内側 QSS で描く。
+        # QRegion のマスクを掛けると角がギザギザになる。
+        try:
+            self.clearMask()
+            surface = getattr(self, "_surface", None)
+            if surface is not None:
+                surface.clearMask()
+        except Exception:
+            pass
+
+    def resizeEvent(self, event) -> None:
+        try:
+            super().resizeEvent(event)
+        except Exception:
+            pass
+        self._apply_round_mask()
+
+    def _title_mouse_press(self, event) -> None:
+        try:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                event.accept()
+                return
+        except Exception:
+            pass
+        try:
+            event.ignore()
+        except Exception:
+            pass
+
+    def _title_mouse_move(self, event) -> None:
+        try:
+            if self._drag_pos is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+                self.move(event.globalPosition().toPoint() - self._drag_pos)
+                event.accept()
+                return
+        except Exception:
+            pass
+        try:
+            event.ignore()
+        except Exception:
+            pass
+
+    def _title_mouse_release(self, event) -> None:
+        self._drag_pos = None
+        try:
+            event.accept()
+        except Exception:
+            pass
+
+    def _on_window_close_requested(self) -> None:
+        self.request_close()
+
+    def request_close(self, *, immediate: bool = False) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        if immediate:
+            self._finish_close()
+            return
+        try:
+            from src.ui.theme import menu_dropdown_hide
+            menu_dropdown_hide(self, on_finished=self._finish_close)
+        except Exception:
+            self._finish_close()
+
+    def _finish_close(self) -> None:
+        try:
+            self.hide()
+        except Exception:
+            pass
+        try:
+            self.close()
+        except Exception:
+            pass
+        try:
+            self.deleteLater()
+        except Exception:
+            pass
+
+    def closeEvent(self, event) -> None:
+        if not self._closing:
+            event.ignore()
+            self.request_close()
+            return
+        try:
+            super().closeEvent(event)
+        except Exception:
+            event.accept()
+
+    def show_animated(self) -> None:
+        try:
+            vw = self._web_view
+            if vw is not None:
+                try:
+                    vw.setMinimumSize(0, 0)
+                    vw.setMaximumSize(16777215, 16777215)
+                    vw.setMinimumSize(400, 480)
+                except Exception:
+                    pass
+                try:
+                    vw.setVisible(True)
+                    vw.show()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._apply_round_mask()
+        try:
+            from src.ui.theme import menu_dropdown_show
+            menu_dropdown_show(self)
+        except Exception:
+            self.show()
+            self.raise_()
+            try:
+                self.activateWindow()
+            except Exception:
+                pass
+        try:
+            if self._web_view is not None:
+                self._web_view.setFocus(Qt.FocusReason.OtherFocusReason)
+        except Exception:
+            pass
+
+
+
 def attach_download_handler(profile: QWebEngineProfile) -> None:
     if profile.property("mayotter_download_connected"):
         return
@@ -281,11 +666,40 @@ def handle_download_request(download) -> None:
     _emit_download_progress(download, suggested_name, path, 0.0, "started")
 
     def _on_progress(bytes_received, bytes_total):
-        if bytes_total > 0:
-            progress = bytes_received / bytes_total
-            _emit_download_progress(download, suggested_name, path, progress, "progress")
+        # Content-Length がある場合のみ 0..1 の確定進捗。
+        # 不明サイズは -1 未満のセンチネル + 受信バイトを UI に渡し、
+        # 偽パーセントや 0%→100% ジャンプを避ける。
+        br = max(0, int(bytes_received or 0))
+        if bytes_total and bytes_total > 0:
+            progress = max(0.0, min(1.0, float(br) / float(bytes_total)))
+        else:
+            # progress < -1 は「不定形」。小数部に受信MBを埋め込む方式ではなく
+            # 別引数が無い既存シグネチャを維持するため、
+            # progress = -(1.0 + br) で受信バイトを運ぶ。
+            progress = -(1.0 + float(br))
+        _emit_download_progress(download, suggested_name, path, progress, "progress")
 
-    if hasattr(download, "downloadProgress"):
+    # Qt6 の QWebEngineDownloadRequest に downloadProgress は無く、受信/総バイトの変更通知で進む。
+    _last_emit = {"t": 0.0, "br": -1}
+
+    def _on_bytes_changed(*_args):
+        now = time.monotonic()
+        br = int(download.receivedBytes() or 0)
+        done = bool(hasattr(download, "isFinished") and download.isFinished())
+        # 受信ごとの通知は多いので、約 60ms に1回へ間引く（最後の値は完了通知が確定させる）
+        if not done and now - _last_emit["t"] < 0.06:
+            return
+        if br == _last_emit["br"]:
+            return
+        _last_emit["t"] = now
+        _last_emit["br"] = br
+        _on_progress(br, int(download.totalBytes() or 0))
+
+    if hasattr(download, "receivedBytesChanged"):
+        download.receivedBytesChanged.connect(_on_bytes_changed)
+    if hasattr(download, "totalBytesChanged"):
+        download.totalBytesChanged.connect(_on_bytes_changed)
+    elif hasattr(download, "downloadProgress"):
         download.downloadProgress.connect(_on_progress)
     elif hasattr(download, "progress"):
         download.progress.connect(_on_progress)
@@ -316,10 +730,15 @@ def handle_download_request(download) -> None:
             is_completed = True
 
         _done["v"] = True
-        for sig_name in ("downloadProgress", "progress"):
+        for sig_name, slot in (
+            ("receivedBytesChanged", _on_bytes_changed),
+            ("totalBytesChanged", _on_bytes_changed),
+            ("downloadProgress", _on_progress),
+            ("progress", _on_progress),
+        ):
             if hasattr(download, sig_name):
                 try:
-                    getattr(download, sig_name).disconnect(_on_progress)
+                    getattr(download, sig_name).disconnect(slot)
                 except (TypeError, RuntimeError):
                     pass
 
@@ -406,8 +825,7 @@ class MayotterPage(QWebEnginePage):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         try:
-            from PySide6.QtGui import QColor
-            self.setBackgroundColor(QColor("#0b111f"))
+            self.setBackgroundColor(themed_qcolor("#0b111f"))
         except Exception:
             pass
         self.pending_attach_files: list[str] | None = None
@@ -422,7 +840,107 @@ class MayotterPage(QWebEnginePage):
             pass
         self._attach_choose_served = False
         self._attach_auto_mode = False
+        try:
+            if hasattr(self, "featurePermissionRequested"):
+                self.featurePermissionRequested.connect(self._on_feature_permission_requested)
+        except Exception:
+            pass
 
+    def _on_feature_permission_requested(self, origin, feature) -> None:
+        """マイク等のメディア権限要求をユーザー確認のうえ Granted/Denied する。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        try:
+            Feature = QWebEnginePage.FeaturePermission
+        except AttributeError:
+            try:
+                Feature = QWebEnginePage.Feature
+            except AttributeError:
+                Feature = None
+
+        audio_features = set()
+        if Feature is not None:
+            for name in ("MediaAudioCapture", "MediaAudioVideoCapture"):
+                val = getattr(Feature, name, None)
+                if val is not None:
+                    audio_features.add(val)
+
+        is_audio = feature in audio_features if audio_features else False
+        # マイク系以外（カメラ単独など）は拒否
+        if not is_audio:
+            try:
+                Permission = QWebEnginePage.PermissionPolicy
+                denied = getattr(Permission, "PermissionDeniedByUser", None)
+                if denied is None:
+                    denied = getattr(Permission, "DeniedByUser", None)
+                if denied is not None:
+                    self.setFeaturePermission(origin, feature, denied)
+            except Exception:
+                pass
+            return
+
+        host = ""
+        try:
+            if origin is not None and hasattr(origin, "host"):
+                host = (origin.host() or "").strip()
+            if not host and origin is not None and hasattr(origin, "toString"):
+                host = (origin.toString() or "").strip()
+        except Exception:
+            host = ""
+
+        scheme = ""
+        try:
+            if origin is not None and hasattr(origin, "scheme"):
+                scheme = (origin.scheme() or "").strip().lower()
+        except Exception:
+            scheme = ""
+
+        invalid = (
+            not host
+            or scheme in ("about", "data", "blob", "file")
+            or (isinstance(host, str) and host.startswith("about:"))
+        )
+
+        Permission = QWebEnginePage.PermissionPolicy
+        granted = getattr(Permission, "PermissionGrantedByUser", None)
+        if granted is None:
+            granted = getattr(Permission, "GrantedByUser", None)
+        denied = getattr(Permission, "PermissionDeniedByUser", None)
+        if denied is None:
+            denied = getattr(Permission, "DeniedByUser", None)
+
+        if invalid or granted is None or denied is None:
+            try:
+                if denied is not None:
+                    self.setFeaturePermission(origin, feature, denied)
+            except Exception:
+                pass
+            return
+
+        label = host or "このサイト"
+        parent = None
+        try:
+            parent = self.view()
+        except Exception:
+            parent = None
+        if parent is None:
+            try:
+                parent = self.parent()
+            except Exception:
+                parent = None
+
+        reply = QMessageBox.question(
+            parent,
+            "マイクの使用",
+            f"{label} がマイクの使用を要求しています。許可しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        policy = granted if reply == QMessageBox.StandardButton.Yes else denied
+        try:
+            self.setFeaturePermission(origin, feature, policy)
+        except Exception:
+            pass
 
     def chooseFiles(self, mode, old_files, accepted_mime_types):
         import os
@@ -1005,8 +1523,7 @@ class XWebView(QWebEngineView):
         page = MayotterPage(profile, self)
         apply_webengine_security_settings(page)
         try:
-            from PySide6.QtGui import QColor
-            page.setBackgroundColor(QColor("#0b111f"))
+            page.setBackgroundColor(themed_qcolor("#0b111f"))
         except Exception:
             pass
         return page
@@ -1082,6 +1599,54 @@ class XWebView(QWebEngineView):
             self._apply_x_shortcut_policy()
         except Exception:
             pass
+        self._schedule_page_background()
+
+    # 右端中央の要素から親をたどり、最初に不透明な背景色を返す（新しく出る領域は右端側）
+    _PAGE_BG_JS = (
+        "(function(){function bg(e){while(e){var c=getComputedStyle(e).backgroundColor;"
+        r"if(c&&!/rgba\(.*,\s*0\)$/.test(c)&&c!=='transparent')return c;e=e.parentElement;}return '';}"
+        "var e=document.elementFromPoint(Math.max(1,window.innerWidth-4),Math.floor(window.innerHeight/2));"
+        "return bg(e)||bg(document.body)||'';})()"
+    )
+
+    # 最後に確認できたページ背景色（未取得なら None）
+    page_background: QColor | None = None
+
+    def _schedule_page_background(self) -> None:
+        # 下地色は RenderWidgetHostView が安定してからでないと反映されないため、遅延を分けて掛け直す
+        for ms in (0, 600, 1800):
+            QTimer.singleShot(ms, self.apply_page_background)
+
+    def apply_page_background(self) -> None:
+        """ページの実背景色を WebEngine の下地色へ反映する。
+
+        リサイズや再表示で新しく出る領域は下地色で塗られる。未設定だと黒になり、
+        カラム境界の移動・収納の展開で黒い残像として見える。
+        """
+        if not self.isVisible():
+            return
+        try:
+            self.page().runJavaScript(self._PAGE_BG_JS, self._on_page_background_probed)
+        except Exception:
+            pass
+
+    def _on_page_background_probed(self, value) -> None:
+        m = re.match(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", str(value or ""))
+        if not m:
+            return
+        r, g, b = (min(255, int(x)) for x in m.groups())
+        self.page_background = QColor(r, g, b)
+        page = self.page()
+        try:
+            # 同じ色の再設定は Qt に無視されることがあるため、一度ずらしてから設定する
+            page.setBackgroundColor(QColor(r - 1 if r > 0 else r + 1, g, b))
+            page.setBackgroundColor(QColor(r, g, b))
+        except Exception:
+            pass
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._schedule_page_background()
 
     def _apply_x_shortcut_policy(self) -> None:
         try:
@@ -1152,6 +1717,11 @@ class XWebView(QWebEngineView):
             else QWebEngineContextMenuRequest.MediaType.MediaTypeNone
         )
         has_image = media_type == QWebEngineContextMenuRequest.MediaType.MediaTypeImage
+        has_video = (
+            media_type == QWebEngineContextMenuRequest.MediaType.MediaTypeVideo
+            and request is not None
+            and request.mediaUrl().isValid()
+        )
         selection = (request.selectedText() if request is not None else "") or ""
 
         can_cut = False
@@ -1241,6 +1811,16 @@ class XWebView(QWebEngineView):
                 "リンクのURLをコピー",
                 lambda: self.page().triggerAction(QWebEnginePage.WebAction.CopyLinkToClipboard),
             )
+            add("規定のブラウザで開く", lambda url=link_url: open_in_default_browser(url))
+            add(
+                "リンク先を保存",
+                lambda: self.page().triggerAction(QWebEnginePage.WebAction.DownloadLinkToDisk),
+            )
+        if not has_link:
+            page_url = self.url().toString()
+            if page_url:
+                menu.addSeparator()
+                add("規定のブラウザで開く", lambda url=page_url: open_in_default_browser(url))
         if has_image:
             menu.addSeparator()
             add(
@@ -1254,6 +1834,12 @@ class XWebView(QWebEngineView):
                 lambda: self.page().triggerAction(
                     QWebEnginePage.WebAction.DownloadImageToDisk
                 ),
+            )
+        if has_video:
+            menu.addSeparator()
+            add(
+                "動画を保存",
+                lambda: self.page().triggerAction(QWebEnginePage.WebAction.DownloadMediaToDisk),
             )
         if selection:
             menu.addSeparator()
@@ -1271,33 +1857,47 @@ class XWebView(QWebEngineView):
 
     def createWindow(self, kind) -> QWebEngineView:
         owner = self
+        owner_win = None
+        try:
+            owner_win = self.window()
+        except Exception:
+            owner_win = None
 
         class _CapturePage(QWebEnginePage):
 
             def __init__(self, profile, parent=None):
                 super().__init__(profile, parent)
                 self._routed = False
-                self._last_url = ""
+                self._interactive = False
+                self._view_ref = None
 
             def acceptNavigationRequest(self, url, navigation_type, is_main_frame):
                 if not is_main_frame:
-                    return False
+                    # 認証 popup 内の subframe は許可
+                    return True if self._interactive else False
                 text = url.toString() if hasattr(url, "toString") else str(url)
                 text = (text or "").strip()
                 if not text or text.startswith("about:") or text.startswith("data:"):
                     return True
-                print(
-                    f"[CapturePage] nav url={text[:160]!r} routed={self._routed}",
-                    flush=True,
-                )
+                if self._interactive:
+                    return True
                 if self._routed:
                     return False
-                self._last_url = text
 
                 try:
                     extracted = extract_google_redirect_target(text) or ""
                 except Exception:
                     extracted = ""
+                decision = extracted or text
+
+                # 認証セッションは URL 捕捉せず実 window で継続
+                try:
+                    if needs_interactive_auth_window(decision) or needs_interactive_auth_window(text):
+                        self._promote_interactive(text)
+                        return True
+                except Exception:
+                    pass
+
                 if extracted:
                     self._route_final(extracted)
                     return False
@@ -1311,17 +1911,68 @@ class XWebView(QWebEngineView):
                 self._route_final(text)
                 return False
 
+            def _promote_interactive(self, url_text: str) -> None:
+                if self._interactive or self._routed:
+                    return
+                self._interactive = True
+                vw = self._view_ref
+                if vw is None:
+                    return
+                try:
+                    # capture 用の強制 hide / 1x1 固定を解除
+                    vw._mayotter_interactive = True
+                    try:
+                        vw.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, False)
+                        vw.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+                    except Exception:
+                        pass
+                    vw.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                    try:
+                        # capture 時の setFixedSize(1,1) を外す
+                        vw.setMinimumSize(0, 0)
+                        vw.setMaximumSize(16777215, 16777215)
+                    except Exception:
+                        pass
+                    try:
+                        vw.setWindowFlags(Qt.WindowType.Widget)
+                    except Exception:
+                        pass
+                    try:
+                        vw.setVisible(True)
+                        vw.show()
+                    except Exception:
+                        pass
+                    # Mayotter デザインのコンテナで包む
+                    popup = AuthPopupWindow(vw, owner_win)
+                    register_auth_popup(owner_win, popup)
+                    popup.show_animated()
+                except Exception:
+                    # フォールバック: 従来の素の window 化
+                    try:
+                        vw.setMinimumSize(420, 520)
+                        vw.setMaximumSize(16777215, 16777215)
+                        vw.resize(520, 640)
+                        vw.setWindowFlags(
+                            Qt.WindowType.Window
+                            | Qt.WindowType.WindowCloseButtonHint
+                            | Qt.WindowType.WindowTitleHint
+                        )
+                        vw.setWindowTitle("認証")
+                        vw.setParent(None)
+                        vw.show()
+                        vw.raise_()
+                        vw.activateWindow()
+                        register_auth_popup(owner_win, vw)
+                    except Exception:
+                        pass
+
             def _route_final(self, final_url: str) -> None:
-                if self._routed:
+                if self._routed or self._interactive:
                     return
                 final_url = (final_url or "").strip()
                 if not final_url or final_url.startswith("about:"):
                     return
                 self._routed = True
-                print(
-                    f"[CapturePage] final url={final_url[:160]!r}",
-                    flush=True,
-                )
                 if not _nav_begin(final_url):
                     return
                 try:
@@ -1332,21 +1983,33 @@ class XWebView(QWebEngineView):
         class _CaptureView(QWebEngineView):
 
             def show(self) -> None:
+                if getattr(self, "_mayotter_interactive", False):
+                    return super().show()
                 return
 
             def showNormal(self) -> None:
+                if getattr(self, "_mayotter_interactive", False):
+                    return super().showNormal()
                 return
 
             def showFullScreen(self) -> None:
+                if getattr(self, "_mayotter_interactive", False):
+                    return super().showFullScreen()
                 return
 
             def showMaximized(self) -> None:
+                if getattr(self, "_mayotter_interactive", False):
+                    return super().showMaximized()
                 return
 
             def showMinimized(self) -> None:
+                if getattr(self, "_mayotter_interactive", False):
+                    return super().showMinimized()
                 return
 
             def setVisible(self, visible: bool) -> None:
+                if getattr(self, "_mayotter_interactive", False):
+                    return super().setVisible(visible)
                 super().setVisible(False)
 
             def showEvent(self, event) -> None:
@@ -1354,6 +2017,8 @@ class XWebView(QWebEngineView):
                     super().showEvent(event)
                 except Exception:
                     pass
+                if getattr(self, "_mayotter_interactive", False):
+                    return
                 try:
                     self.hide()
                     self.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
@@ -1362,16 +2027,29 @@ class XWebView(QWebEngineView):
                     pass
 
             def raise_(self) -> None:
+                if getattr(self, "_mayotter_interactive", False):
+                    return super().raise_()
                 return
 
             def activateWindow(self) -> None:
+                if getattr(self, "_mayotter_interactive", False):
+                    return super().activateWindow()
                 return
 
             def setWindowState(self, state) -> None:
+                if getattr(self, "_mayotter_interactive", False):
+                    return super().setWindowState(state)
                 return
+
+            def closeEvent(self, event) -> None:
+                try:
+                    super().closeEvent(event)
+                except Exception:
+                    event.accept()
 
         parent = _capture_parent_for(self)
         view = _CaptureView(parent)
+        view._mayotter_interactive = False
         view.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
         view.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         view.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
@@ -1384,22 +2062,28 @@ class XWebView(QWebEngineView):
         view.move(0, 0)
         view.hide()
         page = _CapturePage(self.page().profile(), view)
+        page._view_ref = view
         view.setPage(page)
 
         def _on_capture_load(ok, pg=page, vw=view):
             try:
-                if getattr(pg, "_routed", False):
+                if getattr(pg, "_routed", False) or getattr(pg, "_interactive", False):
                     return
                 u = pg.url().toString() if pg.url() is not None else ""
                 u = (u or "").strip()
                 if not u or u.startswith("about:"):
                     return
                 try:
+                    if needs_interactive_auth_window(u):
+                        pg._promote_interactive(u)
+                        return
+                except Exception:
+                    pass
+                try:
                     if is_google_click_redirector(u):
                         return
                 except Exception:
                     pass
-                print(f"[CapturePage] loadFinished route url={u[:160]!r}", flush=True)
                 pg._route_final(u)
             except Exception:
                 pass
@@ -1414,6 +2098,11 @@ class XWebView(QWebEngineView):
         self._pending_capture_views.append(view)
 
         def _drop():
+            try:
+                if getattr(page, "_interactive", False):
+                    return
+            except Exception:
+                pass
             try:
                 self._pending_capture_views.remove(view)
             except ValueError:
@@ -1538,12 +2227,23 @@ class XWebView(QWebEngineView):
                 cur = self.page().url().toString() if self.page() is not None else ""
             except Exception:
                 cur = self._current_url or ""
-            if cur and _norm(cur) == _norm(url):
-                self._current_url = url
-                return
+            # about:blank や空URLで本来の復元ロードを打ち切らない
+            if cur and not cur.startswith("about:") and not cur.startswith("data:"):
+                if _norm(cur) == _norm(url):
+                    self._current_url = url
+                    return
         except Exception:
             pass
         self._current_url = url
+        try:
+            page = self.page()
+            if page is not None and hasattr(page, "setLifecycleState"):
+                from PySide6.QtWebEngineCore import QWebEnginePage
+                if hasattr(page, "lifecycleState"):
+                    if page.lifecycleState() != QWebEnginePage.LifecycleState.Active:
+                        page.setLifecycleState(QWebEnginePage.LifecycleState.Active)
+        except Exception:
+            pass
         self.page().load(QUrl(url))
 
     def get_current_url(self) -> str:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 
 def main() -> int:
     os.environ.setdefault("MAYOTTER_MEDIA_DEBUG", "1")

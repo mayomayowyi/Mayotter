@@ -364,68 +364,76 @@ def write_windows_apply_script(
 ) -> Path | None:
     tmp = ensure_update_tmp()
     script = tmp / "apply_update.bat"
-    src = str(staged_root.resolve())
-    dst = str(install_dir.resolve())
-    exe = str((Path(install_dir) / exe_name).resolve())
+    # パスはBAT本文に書かず、起動時に環境変数で渡す（日本語パスの文字化け回避）
     pkg_exe = "Mayotter.exe"
     content = f"""@echo off
 setlocal EnableExtensions
 chcp 65001 >nul
 set "PID={int(parent_pid)}"
-set "SRC={src}"
-set "DST={dst}"
-set "EXE={exe}"
+set "SRC=%MAYOTTER_UPD_SRC%"
+set "DST=%MAYOTTER_UPD_DST%"
+set "EXE=%MAYOTTER_UPD_EXE%"
 set "PKG_EXE={pkg_exe}"
 set "LOG=%~dp0apply_update.log"
 echo [Mayotter updater] start > "%LOG%"
 echo PID=%PID% SRC=%SRC% DST=%DST% EXE=%EXE% >> "%LOG%"
 echo [Mayotter updater] waiting for PID %PID% ... >> "%LOG%"
+set /a _w=0
 :waitloop
 tasklist /FI "PID eq %PID%" 2>nul | findstr /C:"%PID%" >nul
-if not errorlevel 1 (
-  timeout /t 1 /nobreak >nul
-  goto waitloop
-)
-echo [Mayotter updater] parent exited >> "%LOG%"
+if errorlevel 1 goto waited
+set /a _w+=1
+if %_w% GEQ 120 goto waited
+ping -n 2 127.0.0.1 >nul 2>&1
+goto waitloop
+:waited
+echo [Mayotter updater] parent exited (wait=%_w%) >> "%LOG%"
 set /a _tries=0
 :waitexe
 tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | findstr /I "{exe_name}" >nul
 if errorlevel 1 goto apply
 set /a _tries+=1
 if %_tries% GEQ 45 goto apply
-timeout /t 1 /nobreak >nul
+ping -n 2 127.0.0.1 >nul 2>&1
 goto waitexe
 :apply
-timeout /t 1 /nobreak >nul
+ping -n 2 127.0.0.1 >nul 2>&1
 echo [Mayotter updater] applying files ... >> "%LOG%"
-if not exist "%SRC%" (
-  echo [Mayotter updater] missing staged source >> "%LOG%"
-  exit /b 1
-)
+if not exist "%SRC%" goto missing_src
 rem DST は実行中 EXE のディレクトリ（フォルダ名は Mayotter である必要はない）
 robocopy "%SRC%" "%DST%" /E /XD data data_dev update_tmp /R:5 /W:2 /NFL /NDL /NJH /NJS /NC /NS
 set "RC=%ERRORLEVEL%"
 echo [Mayotter updater] robocopy RC=%RC% >> "%LOG%"
-if %RC% GEQ 8 (
-  echo [Mayotter updater] robocopy failed RC=%RC% >> "%LOG%"
-  exit /b 1
-)
-if /I not "%PKG_EXE%"=="{exe_name}" (
-  if exist "%DST%\\%PKG_EXE%" (
-    copy /Y "%DST%\\%PKG_EXE%" "%EXE%" >> "%LOG%" 2>&1
-  )
-)
-if exist "%EXE%" (
-  echo [Mayotter updater] starting %EXE% >> "%LOG%"
-  start "" "%EXE%"
-) else if exist "%DST%\\%PKG_EXE%" (
-  echo [Mayotter updater] starting %DST%\\%PKG_EXE% >> "%LOG%"
-  start "" "%DST%\\%PKG_EXE%"
-) else (
-  echo [Mayotter updater] exe missing: %EXE% >> "%LOG%"
-  exit /b 1
-)
+if %RC% GEQ 8 goto rc_fail
+cd /d "%DST%"
+if errorlevel 1 goto cd_fail
+if exist "%PKG_EXE%" goto start_pkg
+if exist "%EXE%" goto start_exe
+echo [Mayotter updater] exe missing: %EXE% >> "%LOG%"
+exit /b 1
+:start_pkg
+echo [Mayotter updater] starting %PKG_EXE% in %CD% >> "%LOG%"
+start "" /D "%DST%" "%PKG_EXE%"
+goto started
+:start_exe
+echo [Mayotter updater] starting %EXE% >> "%LOG%"
+start "" /D "%DST%" "%EXE%"
+goto started
+:missing_src
+echo [Mayotter updater] missing staged source >> "%LOG%"
+exit /b 1
+:rc_fail
+echo [Mayotter updater] robocopy failed RC=%RC% >> "%LOG%"
+exit /b 1
+:cd_fail
+echo [Mayotter updater] cd failed: %DST% >> "%LOG%"
+exit /b 1
+:started
 echo [Mayotter updater] done >> "%LOG%"
+if exist "%SRC%" rd /s /q "%SRC%" 2>nul
+for %%F in ("%~dp0*.zip") do del /q "%%~F" 2>nul
+for %%F in ("%~dp0*.bin") do del /q "%%~F" 2>nul
+start "" /b cmd.exe /c "ping -n 3 127.0.0.1 >nul & del /q "%~f0""
 endlocal
 exit /b 0
 """
@@ -435,9 +443,13 @@ exit /b 0
     except Exception:
         return None
 
-def launch_apply_helper(script_path: Path) -> bool:
+def launch_apply_helper(
+    script_path: Path,
+    env_extra: dict[str, str] | None = None,
+) -> bool:
     import sys
     import subprocess
+    import os
 
     if not script_path or not Path(script_path).is_file():
         return False
@@ -448,15 +460,22 @@ def launch_apply_helper(script_path: Path) -> bool:
         cwd = str(Path(script_path).resolve().parent)
         create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-        # start /b で親プロセスから切り離し、終了後も BAT が生き残るようにする
+        env = os.environ.copy()
+        if env_extra:
+            env.update(env_extra)
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
         subprocess.Popen(
-            f'start "" /b cmd.exe /c "{script}"',
+            ["cmd.exe", "/c", script],
             cwd=cwd,
-            shell=True,
+            env=env,
+            shell=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=create_no_window | new_group,
+            startupinfo=si,
             close_fds=True,
         )
         return True
@@ -490,6 +509,11 @@ def prepare_and_launch_self_update(
     )
     if script is None:
         return False, "更新ヘルパーの作成に失敗しました。"
-    if not launch_apply_helper(script):
+    env_extra = {
+        "MAYOTTER_UPD_SRC": str(Path(staged).resolve()),
+        "MAYOTTER_UPD_DST": str(Path(install).resolve()),
+        "MAYOTTER_UPD_EXE": str((Path(install) / apply_exe).resolve()),
+    }
+    if not launch_apply_helper(script, env_extra):
         return False, "更新ヘルパーの起動に失敗しました。"
     return True, "更新を適用しています。アプリを再起動します…"

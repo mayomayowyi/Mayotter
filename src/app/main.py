@@ -6,16 +6,27 @@ def main() -> int:
     import os
 
     flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
-    extra = "--disable-webgpu --disable-gpu-shader-disk-cache"
+    # 通信まわりだけを強める。GPU 描画系のフラグは黒残像など描画不具合の原因になり得るので触らない。
+    #  - 並列ダウンロード: Range 対応サーバーの大きなファイルを複数接続で取得
+    #  - QUIC/HTTP3: 接続確立の往復を減らす
+    extra = (
+        "--disable-webgpu --disable-gpu-shader-disk-cache "
+        "--enable-parallel-downloading --enable-quic "
+        "--enable-features=ParallelDownloading"
+    )
     if "--disable-webgpu" not in flags:
         os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (flags + " " + extra).strip()
-    try:
-        from src.browser.cdp_poc import ensure_remote_debugging_env, cdp_poc_enabled
-        port = ensure_remote_debugging_env(9222)
-        if cdp_poc_enabled() and port:
-            print(f"[CDP_POC] remote debugging port={port} (opt-in)", flush=True)
-    except Exception as exc:
-        print(f"[CDP_POC] env setup skipped: {exc!r}", flush=True)
+    cdp_enabled = (os.environ.get("MAYOTTER_CDP_POC") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    if cdp_enabled:
+        try:
+            from src.browser.cdp_poc import ensure_remote_debugging_env
+            port = ensure_remote_debugging_env(9222)
+            if port:
+                print(f"[CDP_POC] remote debugging port={port} (opt-in)", flush=True)
+        except Exception as exc:
+            print(f"[CDP_POC] env setup skipped: {exc!r}", flush=True)
 
     from src.core.edition import get_edition
     from src.core.paths import DATA_DIR, ensure_directories
@@ -53,17 +64,34 @@ def main() -> int:
         QPushButton,
         QToolButton,
     )
-    from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer, QSize, QRectF
-    from PySide6.QtGui import QPainterPath, QRegion
+    from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer, QSize
 
     from src.browser.profile_manager import ProfileManager
     from src.core.settings import SettingsManager
     from src.core.single_instance import InstanceLock
-    from src.ui.main_window import MainWindow
 
     APP_NAME = "Mayotter"
 
     app = QApplication(sys.argv)
+    settings_manager = SettingsManager()
+    try:
+        from src.ui.theme import set_theme, install_theme_filter, apply_theme_to_application
+        set_theme(settings_manager.get_ui_theme())
+        install_theme_filter(app)
+        apply_theme_to_application(app)
+    except Exception:
+        pass
+    try:
+        from src.ui.window_polish import install_window_polish
+        install_window_polish(app)
+    except Exception:
+        pass
+    # ツールチップは共通の角丸サーフェスで表示する
+    try:
+        from src.ui.theme import install_fade_tooltips
+        install_fade_tooltips(app)
+    except Exception:
+        pass
 
     lock = InstanceLock(DATA_DIR)
     if not lock.try_acquire():
@@ -83,6 +111,7 @@ def main() -> int:
             dlg.setWindowFlags(
                 Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
             )
+            dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
             dlg.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             dlg.setMinimumWidth(360)
             if apply_overlay_theme is not None:
@@ -102,7 +131,7 @@ def main() -> int:
             close_tb = QToolButton()
             if make_close_icon is not None:
                 try:
-                    close_tb.setIcon(make_close_icon("#93a5c4", 12))
+                    close_tb.setIcon(make_close_icon("#c5d0e6", 12))
                     close_tb.setIconSize(QSize(12, 12))
                 except Exception:
                     pass
@@ -131,9 +160,7 @@ def main() -> int:
 
             def _apply_round_mask():
                 try:
-                    path = QPainterPath()
-                    path.addRoundedRect(QRectF(0, 0, max(1, dlg.width()), max(1, dlg.height())), 10, 10)
-                    dlg.setMask(QRegion(path.toFillPolygon().toPolygon()))
+                    dlg.clearMask()
                 except Exception:
                     pass
 
@@ -260,7 +287,7 @@ def main() -> int:
     except Exception:
         icon = None
 
-    settings_manager = SettingsManager()
+    from src.ui.main_window import MainWindow
     profile_manager = ProfileManager()
     window = MainWindow(profile_manager, settings_manager)
     try:
@@ -283,8 +310,7 @@ def main() -> int:
     return code
 
 def _show_startup_update_notice(parent, version: str) -> None:
-    from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer, QRectF
-    from PySide6.QtGui import QPainterPath, QRegion
+    from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer
     from PySide6.QtWidgets import (
         QDialog, QVBoxLayout, QHBoxLayout, QLabel, QToolButton, QWidget,
     )
@@ -367,12 +393,8 @@ def _show_startup_update_notice(parent, version: str) -> None:
 
     def _apply_round_mask():
         try:
-            r = surface.rect()
-            if r.width() <= 0 or r.height() <= 0:
-                return
-            path = QPainterPath()
-            path.addRoundedRect(QRectF(r), float(RADIUS_MD), float(RADIUS_MD))
-            surface.setMask(QRegion(path.toFillPolygon().toPolygon()))
+            surface.clearMask()
+            dlg.clearMask()
         except Exception:
             pass
 
@@ -484,27 +506,55 @@ def _show_startup_update_notice(parent, version: str) -> None:
         pass
 
 def _schedule_startup_update_check(app, window, settings_manager) -> None:
-    from PySide6.QtCore import QTimer
+    from PySide6.QtCore import QThread, QTimer, Signal
 
-    def _run():
+    class _StartupUpdateWorker(QThread):
+        result_ready = Signal(object)
+
+        def __init__(self, repo: str, parent=None) -> None:
+            super().__init__(parent)
+            self._repo = repo
+
+        def run(self) -> None:
+            info = None
+            try:
+                from src.core.updater import check_for_update
+                info = check_for_update(github_repo=self._repo)
+            except Exception:
+                info = None
+            self.result_ready.emit(info)
+
+    def _start():
         try:
             if settings_manager is None:
                 return
             if not getattr(settings_manager, "get_auto_check_updates", lambda: False)():
                 return
-            from src.core.updater import check_for_update
-
             repo = ""
             if hasattr(settings_manager, "get_github_repo"):
                 repo = settings_manager.get_github_repo()
-            info = check_for_update(github_repo=repo)
-            if info is None:
-                return
-            _show_startup_update_notice(window, getattr(info, "version", "") or "")
+            worker = _StartupUpdateWorker(repo, app)
+            app._mayotter_startup_update_worker = worker
+
+            def _done(info):
+                if info is not None:
+                    _show_startup_update_notice(window, getattr(info, "version", "") or "")
+
+            def _cleanup():
+                try:
+                    app._mayotter_startup_update_worker = None
+                except Exception:
+                    pass
+                worker.deleteLater()
+
+            worker.result_ready.connect(_done)
+            worker.finished.connect(_cleanup)
+            worker.start()
         except Exception:
             pass
 
-    QTimer.singleShot(2500, _run)
+    # 起動直後の WebEngine 生成と競合しないよう遅らせる（通信自体は別スレッド）
+    QTimer.singleShot(2500, _start)
 
 if __name__ == "__main__":
     sys.exit(main())
