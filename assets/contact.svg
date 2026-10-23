@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="580" height="146" viewBox="0 0 580 146">
+  <title>お問い合わせ</title>
+  <rect width="580" height="146" rx="72" fill="#202020"/>
+  <rect x="38" y="44" width="82" height="61" rx="12" fill="none" stroke="#fff" stroke-width="8"/>
+  <path d="M44 51 79 77 114 51" fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="154" y="98" fill="#fff" font-family="Arial, 'Yu Gothic', 'Noto Sans JP', sans-serif" font-size="60" font-weight="600">お問い合わせ</text>
+</svg>
