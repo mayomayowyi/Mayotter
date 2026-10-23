@@ -34,3 +34,16 @@ Mayotterは個人が開発している非公式のXクライアントであり�
 本アプリの利用に伴うトラブルや損害について、開発者は法令で認められる範囲で責任を負いません。ご自身の判断と責任においてご利用ください。
 
 ソースコードの利用条件については[LICENSE](./LICENSE)をご確認ください。
+
+## お問い合わせ・開発支援
+
+<p>
+  <a href="https://mayoel.pages.dev/contact/">
+    <img src="assets/contact.svg" alt="お問い合わせ" width="192">
+  </a>
+  <a href="https://ko-fi.com/mayomayoi">
+    <img src="https://storage.ko-fi.com/cdn/kofi3.png" alt="Ko-fiで開発を支援" width="192">
+  </a>
+</p>
+
+不具合の報告やご要望はお問い合わせから。開発支援はKo-fiで受け付けています。
