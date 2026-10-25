@@ -35,7 +35,13 @@ TweetDeckのようにX（Twitter）のタイムラインを複数カラムで表
 - **セットアップ版**（公開されている場合）：インストーラーの案内に従ってインストールし、Mayotterを起動します。
 
 ## 使い方
+
+### 操作説明動画
+
 https://github.com/user-attachments/assets/2b2e85a2-ddcd-45ef-87ac-a207be3cd51e
+
+### 基本操作
+
 1. **Mayotterを起動する**  
    初回起動時に言語選択画面が表示された場合は、日本語・English・简体中文から選択します。
 2. **Xアカウントを追加する**  
