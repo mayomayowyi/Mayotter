@@ -1,6 +1,7 @@
 
 
 from __future__ import annotations
+from src.core.i18n import tr
 
 import math
 import time
@@ -21,7 +22,6 @@ from src.ui.icons import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QCheckBox,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.browser.webview import normalize_user_input_url
+from src.ui.animated_choice import AnimatedCheckBox as QCheckBox
 from src.ui.theme import themed_qcolor, color as theme_color
 
 def rounded_overlay_mask(width: int, height: int, radius: int = 8) -> QRegion:
@@ -268,12 +269,12 @@ def install_dark_lineedit_menu(line_edit) -> None:
         undo_ok = can_edit and bool(getattr(le, "isUndoAvailable", lambda: False)())
         redo_ok = can_edit and bool(getattr(le, "isRedoAvailable", lambda: False)())
 
-        act_undo = QAction("元に戻す", menu)
-        act_redo = QAction("やり直す", menu)
-        act_cut = QAction("切り取り", menu)
-        act_copy = QAction("コピー", menu)
-        act_paste = QAction("貼り付け", menu)
-        act_sel = QAction("すべて選択", menu)
+        act_undo = QAction(tr('元に戻す'), menu)
+        act_redo = QAction(tr('やり直す'), menu)
+        act_cut = QAction(tr('切り取り'), menu)
+        act_copy = QAction(tr('コピー'), menu)
+        act_paste = QAction(tr('貼り付け'), menu)
+        act_sel = QAction(tr('すべて選択'), menu)
 
         act_undo.setEnabled(undo_ok)
         act_redo.setEnabled(redo_ok)
@@ -345,7 +346,7 @@ class UrlOverlay(QWidget):
         self._go_btn.setIcon(make_forward_icon(_COLOR_SECONDARY, 14))
         self._go_btn.setIconSize(QSize(14, 14))
         self._go_btn.setFixedSize(28, 28)
-        self._go_btn.setToolTip("移動")
+        self._go_btn.setToolTip(tr('移動'))
         self._go_btn.clicked.connect(self._navigate)
         row.addWidget(self._go_btn)
 
@@ -463,11 +464,11 @@ class TextPromptOverlay(QWidget):
         row = QHBoxLayout()
         row.setSpacing(6)
         row.addStretch(1)
-        self._cancel_btn = QPushButton("キャンセル")
+        self._cancel_btn = QPushButton(tr('キャンセル'))
         self._cancel_btn.setObjectName("text_prompt_cancel")
         self._cancel_btn.clicked.connect(self.close_overlay)
         row.addWidget(self._cancel_btn)
-        self._ok_btn = QPushButton("保存")
+        self._ok_btn = QPushButton(tr('保存'))
         self._ok_btn.setObjectName("text_prompt_ok")
         self._ok_btn.setEnabled(False)
         self._ok_btn.clicked.connect(self._confirm)
@@ -477,7 +478,7 @@ class TextPromptOverlay(QWidget):
         self.hide()
 
     def open_prompt(
-        self, title: str, initial: str = "", ok_text: str = "保存", allow_empty: bool = False
+        self, title: str, initial: str = "", ok_text: str = tr('保存'), allow_empty: bool = False
     ) -> None:
         self._allow_empty = bool(allow_empty)
         self._title_label.setText(title)
@@ -588,14 +589,23 @@ class _NoComboArrowStyle(QProxyStyle):
 class AccountComboBox(QComboBox):
 
     ARROW_ZONE = 22
+    CORNER_RADIUS = 6
+
+    def _popup_item_font(self, index: int) -> QFont | None:
+        """ポップアップ項目ごとのフォント。既定は None（フォントを変えない）。必要な子クラスだけ上書きする。"""
+        return None
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("column_add_combo")
-        self.setStyle(_NoComboArrowStyle(self.style()))
+        # QProxyStyle は baseStyle を所有する。共有のアプリスタイルを渡すと、
+        # コンボの破棄で他のウィジェットのスタイルまで破棄してしまう。
+        combo_style = _NoComboArrowStyle()
+        combo_style.setParent(self)
+        self.setStyle(combo_style)
         self._list_popup: QFrame | None = None
         self.setStyleSheet(
-            "QComboBox#column_add_combo {"
+            "QComboBox {"
             "  background-color: #141e30;"
             "  border: 1px solid #1d2d44;"
             "  border-radius: 6px;"
@@ -603,21 +613,28 @@ class AccountComboBox(QComboBox):
             "  color: #eaf1fb;"
             "  min-height: 24px;"
             "}"
-            "QComboBox#column_add_combo::drop-down {"
+            "QComboBox::drop-down {"
             "  border: none;"
             "  width: 28px;"
             "}"
-            "QComboBox#column_add_combo::down-arrow {"
+            "QComboBox::down-arrow {"
             "  image: none; border: none; width: 0px; height: 0px;"
             "}"
         )
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        from PySide6.QtGui import QPainter, QPen
+        from PySide6.QtGui import QPainter, QPainterPath, QPen
         from PySide6.QtCore import Qt as _Qt
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # 角丸の外側まで塗ると右端の角が四角くなるため、枠の内側へクリップする。
+        clip = QPainterPath()
+        clip.addRoundedRect(
+            QRectF(1.0, 1.0, self.width() - 2.0, self.height() - 2.0),
+            self.CORNER_RADIUS, self.CORNER_RADIUS,
+        )
+        p.setClipPath(clip)
         div_x = self.width() - self.ARROW_ZONE
         p.fillRect(div_x, 1, self.ARROW_ZONE - 1, self.height() - 2, themed_qcolor("#141e30"))
         p.setPen(QPen(themed_qcolor("#1d2d44"), 1))
@@ -788,6 +805,7 @@ class AccountComboBox(QComboBox):
             lay.setContentsMargins(3, 3, 3, 3)
             lay.setSpacing(0)
             lst = QListWidget(pop)
+            lst.installEventFilter(self)
             lst.setObjectName("account_combo_list")
             lst.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             lst.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -805,6 +823,9 @@ class AccountComboBox(QComboBox):
             item = QListWidgetItem(self.itemText(i))
             item.setData(Qt.ItemDataRole.UserRole, i)
             item.setSizeHint(_QSize(w - 12, row_h))
+            font = self._popup_item_font(i)
+            if font is not None:
+                item.setFont(font)
             lst.addItem(item)
         cur = self.currentIndex()
         if 0 <= cur < lst.count():
@@ -825,6 +846,24 @@ class AccountComboBox(QComboBox):
             max_h = row_h * 14
         list_h = min(content_h, max_h)
         h = list_h + 6
+        ax, ay = int(gp.x()), int(gp.y() + 2)
+        if getattr(self._list_popup, "_mayotter_embedded_popup", False):
+            owner = self._list_popup.parentWidget()
+            if owner is not None:
+                local_y = owner.mapFromGlobal(_QPoint(ax, ay)).y()
+                # 埋め込みポップアップはダイアログの外へ描画できないため、
+                # 下に入りきらない場合は上へ開き、それも足りなければ高さを縮める。
+                space_below = owner.height() - 2 - local_y
+                space_above = local_y - 4 - self.height()
+                if h > space_below:
+                    if space_above > space_below:
+                        ay -= self.height() + h + 4
+                        if space_above - 2 < h:
+                            list_h = max(row_h, space_above - 8)
+                            h = list_h + 6
+                    else:
+                        list_h = max(row_h, space_below - 6)
+                        h = list_h + 6
         lst.setFixedHeight(list_h)
 
         self._list_popup.setFixedSize(w, h)
@@ -861,7 +900,6 @@ class AccountComboBox(QComboBox):
                     wh.setTransientParent(oh)
             except Exception:
                 pass
-        ax, ay = int(gp.x()), int(gp.y() + 2)
         if getattr(self._list_popup, "_mayotter_embedded_popup", False):
             owner = self._list_popup.parentWidget()
             if owner is not None:
@@ -889,6 +927,28 @@ class AccountComboBox(QComboBox):
             self._list_popup.show()
             self._list_popup.raise_()
         self._install_popup_outside_filter()
+        lst.setFocus(Qt.FocusReason.PopupFocusReason)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_F4 or (
+            event.key() == Qt.Key.Key_Down and event.modifiers() & Qt.KeyboardModifier.AltModifier
+        ):
+            self.showPopup()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is getattr(self, '_list_widget', None) and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
+                if not getattr(self._list_popup, '_mayotter_fading_out', False):
+                    if event.key() == Qt.Key.Key_Escape:
+                        self.hidePopup()
+                    else:
+                        self._on_popover_item(self._list_widget.currentItem())
+                    self.setFocus(Qt.FocusReason.PopupFocusReason)
+                return True
+        return super().eventFilter(obj, event)
 
     def hidePopup(self) -> None:
         import time as _time
@@ -988,20 +1048,27 @@ class AccountComboBox(QComboBox):
         self.hidePopup()
 
     def refresh_theme(self) -> None:
+        # テーマ再適用後も、実際の objectName に一致するローカル QSS を保持する。
+        # 強度欄だけは 24px のコンパクト表示なので、通常の min-height を使わない。
+        selector = f"QComboBox#{self.objectName()}"
+        compact = self.objectName() == "audio_denoise_strength"
+        padding = "1px 0px 1px 6px" if compact else "2px 22px 2px 6px"
+        min_height = 18 if compact else 24
+        arrow_width = 22 if compact else 28
         self.setStyleSheet(
-            "QComboBox#column_add_combo {"
+            f"{selector} {{"
             f"  background-color: {theme_color('SURFACE_SUNKEN')};"
             f"  border: 1px solid {theme_color('BORDER')};"
             f"  border-radius: 6px;"
-            f"  padding: 2px 22px 2px 6px;"
+            f"  padding: {padding};"
             f"  color: {theme_color('TEXT')};"
-            f"  min-height: 24px;"
+            f"  min-height: {min_height}px;"
             "}"
-            "QComboBox#column_add_combo::drop-down {"
+            f"{selector}::drop-down {{"
             "  border: none;"
-            "  width: 28px;"
+            f"  width: {arrow_width}px;"
             "}"
-            "QComboBox#column_add_combo::down-arrow {"
+            f"{selector}::down-arrow {{"
             "  image: none; border: none; width: 0px; height: 0px;"
             "}"
         )
@@ -1015,24 +1082,24 @@ class ColumnAddOverlay(QWidget):
     closed = Signal()
 
     _SOURCE_TYPE_DEFS: list[tuple[str, str]] = [
-        ("home", "ホーム"),
-        ("notifications", "通知"),
-        ("favorites", "お気に入り"),
-        ("profile", "プロフィール"),
-        ("lists", "リスト"),
-        ("search", "検索"),
+        ("home", 'ホーム'),
+        ("notifications", '通知'),
+        ("favorites", 'お気に入り'),
+        ("profile", 'プロフィール'),
+        ("lists", 'リスト'),
+        ("search", '検索'),
         ("direct_messages", "DM"),
         ("grok", "Grok"),
-        ("scheduled", "予約"),
-        ("unsent", "未送信"),
+        ("scheduled", '予約'),
+        ("unsent", '未送信'),
     ]
 
     _INPUT_PLACEHOLDERS: dict[str, str] = {
-        "search": "検索キーワード",
+        "search": '検索キーワード',
     }
 
     _INPUT_LABELS: dict[str, str] = {
-        "search": "キーワード:",
+        "search": 'キーワード:',
     }
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -1051,25 +1118,25 @@ class ColumnAddOverlay(QWidget):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(4)
 
-        self._title_label = QLabel("カラムを追加")
+        self._title_label = QLabel(tr('カラムを追加'))
         self._title_label.setObjectName("text_prompt_title")
         layout.addWidget(self._title_label)
 
         acct_row = QHBoxLayout()
         acct_row.setSpacing(6)
-        acct_label = QLabel("アカウント:")
+        acct_label = QLabel(tr('アカウント:'))
         acct_row.addWidget(acct_label)
         self._account_combo = AccountComboBox()
         acct_row.addWidget(self._account_combo, 1)
         layout.addLayout(acct_row)
 
-        type_label = QLabel("情報源:")
+        type_label = QLabel(tr('情報源:'))
         layout.addWidget(type_label)
         self._type_buttons: dict[str, QPushButton] = {}
         type_grid = QGridLayout()
         type_grid.setSpacing(4)
         for i, (stype, label) in enumerate(self._SOURCE_TYPE_DEFS):
-            btn = QPushButton(label)
+            btn = QPushButton(tr(label))
             btn.setObjectName("column_add_type_btn")
             btn.setCheckable(True)
             btn.setAutoExclusive(True)
@@ -1165,11 +1232,11 @@ class ColumnAddOverlay(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(6)
         btn_row.addStretch(1)
-        self._cancel_btn = QPushButton("キャンセル")
+        self._cancel_btn = QPushButton(tr('キャンセル'))
         self._cancel_btn.setObjectName("text_prompt_cancel")
         self._cancel_btn.clicked.connect(self.close_overlay)
         btn_row.addWidget(self._cancel_btn)
-        self._ok_btn = QPushButton("追加")
+        self._ok_btn = QPushButton(tr('追加'))
         self._ok_btn.setObjectName("text_prompt_ok")
         self._ok_btn.clicked.connect(self._confirm)
         btn_row.addWidget(self._ok_btn)
@@ -1454,8 +1521,8 @@ class ColumnAddOverlay(QWidget):
         was_input = source_type_needs_input(prev)
 
         if needs_input:
-            self._input_label.setText(self._INPUT_LABELS.get(source_type, "入力:"))
-            self._dynamic_input.setPlaceholderText(self._INPUT_PLACEHOLDERS.get(source_type, ""))
+            self._input_label.setText(tr(self._INPUT_LABELS.get(source_type, '入力:')))
+            self._dynamic_input.setPlaceholderText(tr(self._INPUT_PLACEHOLDERS.get(source_type, "")))
             if not was_input:
                 self._dynamic_input.clear()
 
@@ -1556,9 +1623,9 @@ class ColumnAddOverlay(QWidget):
             except Exception:
                 pass
 
-        self._input_label.setText(self._INPUT_LABELS.get("search", "キーワード:"))
+        self._input_label.setText(tr(self._INPUT_LABELS.get("search", 'キーワード:')))
         self._dynamic_input.setPlaceholderText(
-            self._INPUT_PLACEHOLDERS.get("search", "検索キーワード")
+            tr(self._INPUT_PLACEHOLDERS.get("search", '検索キーワード'))
         )
         try:
             self._dynamic_input.clearFocus()
@@ -1804,46 +1871,46 @@ class ColumnAddOverlay(QWidget):
 
     _SEARCH_OP_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
         (
-            "投稿者",
+            '投稿者',
             [
-                ("from:", "from: @ユーザー名", "指定したユーザーの投稿"),
-                ("to:", "to: @ユーザー名", "指定したユーザーへの投稿"),
-                ("@", "@ユーザー名", "ユーザーへのメンション"),
-                ("list:", "list: リストID", "指定したリストの投稿"),
+                ("from:", 'from: @ユーザー名', '指定したユーザーの投稿'),
+                ("to:", 'to: @ユーザー名', '指定したユーザーへの投稿'),
+                ("@", '@ユーザー名', 'ユーザーへのメンション'),
+                ("list:", 'list: リストID', '指定したリストの投稿'),
             ],
         ),
         (
-            "期間",
+            '期間',
             [
-                ("since:", "since: YYYY/MM/DD", "指定した日付以降"),
-                ("until:", "until: YYYY/MM/DD", "指定した日付以前"),
+                ("since:", "since: YYYY/MM/DD", '指定した日付以降'),
+                ("until:", "until: YYYY/MM/DD", '指定した日付以前'),
             ],
         ),
         (
-            "メディア",
+            'メディア',
             [
-                ("filter:media", "filter:media", "画像・動画あり"),
-                ("filter:images", "filter:images", "画像付きの投稿"),
-                ("filter:videos", "filter:videos", "動画を含む投稿"),
-                ("filter:links", "filter:links", "リンクあり"),
+                ("filter:media", "filter:media", '画像・動画あり'),
+                ("filter:images", "filter:images", '画像付きの投稿'),
+                ("filter:videos", "filter:videos", '動画を含む投稿'),
+                ("filter:links", "filter:links", 'リンクあり'),
             ],
         ),
         (
-            "投稿属性",
+            '投稿属性',
             [
-                ("filter:replies", "filter:replies", "返信のみ"),
-                ("-filter:replies", "-filter:replies", "返信を除外"),
-                ("filter:native_video", "filter:native_video", "X内の動画"),
-                ("filter:verified", "filter:verified", "認証アカウント"),
-                ("filter:news", "filter:news", "ニュースリンク"),
+                ("filter:replies", "filter:replies", '返信のみ'),
+                ("-filter:replies", "-filter:replies", '返信を除外'),
+                ("filter:native_video", "filter:native_video", 'X内の動画'),
+                ("filter:verified", "filter:verified", '認証アカウント'),
+                ("filter:news", "filter:news", 'ニュースリンク'),
             ],
         ),
         (
-            "反応数",
+            '反応数',
             [
-                ("min_faves:", "min_faves: n", "指定した数以上のいいね"),
-                ("min_retweets:", "min_retweets: n", "指定した数以上のリポスト"),
-                ("min_replies:", "min_replies: n", "指定した数以上の返信"),
+                ("min_faves:", "min_faves: n", '指定した数以上のいいね'),
+                ("min_retweets:", "min_retweets: n", '指定した数以上のリポスト'),
+                ("min_replies:", "min_replies: n", '指定した数以上の返信'),
             ],
         ),
     ]
@@ -1873,7 +1940,7 @@ class ColumnAddOverlay(QWidget):
             "}"
         )
         for title, ops in self._SEARCH_OP_GROUPS:
-            lab = QLabel(title)
+            lab = QLabel(tr(title))
             lab.setStyleSheet(f"color:{TEXT_MUTED}; font-size:9px; padding:0;")
             lab.setFixedHeight(12)
             lay.addWidget(lab)
@@ -1881,9 +1948,9 @@ class ColumnAddOverlay(QWidget):
             row.setSpacing(3)
             row.setContentsMargins(0, 0, 0, 0)
             for token, label, tip in ops:
-                b = QPushButton(label)
+                b = QPushButton(tr(label))
                 b.setCursor(Qt.CursorShape.PointingHandCursor)
-                b.setToolTip(tip)
+                b.setToolTip(tr(tip))
                 b.setStyleSheet(chip_ss)
                 b.setFlat(True)
                 b.setFixedHeight(20)
@@ -1903,8 +1970,8 @@ class ColumnAddOverlay(QWidget):
         self._preset_combo.activated.connect(self._on_preset_selected)
         preset_row.addWidget(self._preset_combo, 1)
         for text, tip, slot in (
-            ("保存", "今の検索条件を保存", self._save_current_search),
-            ("削除", "選んだ保存済み検索を削除", self._delete_selected_search),
+            (tr('保存'), tr('今の検索条件を保存'), self._save_current_search),
+            (tr('削除'), tr('選んだ保存済み検索を削除'), self._delete_selected_search),
         ):
             b = QPushButton(text)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1950,7 +2017,7 @@ class ColumnAddOverlay(QWidget):
             return
         combo.blockSignals(True)
         combo.clear()
-        combo.addItem("保存した検索…", "")
+        combo.addItem(tr('保存した検索…'), "")
         for item in self._saved_searches():
             combo.addItem(item["name"], item["query"])
         if select_name:
@@ -2075,18 +2142,18 @@ class ConfirmOverlay(QWidget):
         self._message_label.setWordWrap(True)
         layout.addWidget(self._message_label)
 
-        self._dont_show_checkbox = QCheckBox("今後この確認を表示しない")
+        self._dont_show_checkbox = QCheckBox(tr('今後この確認を表示しない'))
         self._dont_show_checkbox.setObjectName("confirm_dont_show")
         layout.addWidget(self._dont_show_checkbox)
 
         row = QHBoxLayout()
         row.setSpacing(6)
         row.addStretch(1)
-        self._cancel_btn = QPushButton("キャンセル")
+        self._cancel_btn = QPushButton(tr('キャンセル'))
         self._cancel_btn.setObjectName("confirm_cancel")
         self._cancel_btn.clicked.connect(self._reject)
         row.addWidget(self._cancel_btn)
-        self._ok_btn = QPushButton("削除")
+        self._ok_btn = QPushButton(tr('削除'))
         self._ok_btn.setObjectName("confirm_delete")
         self._ok_btn.clicked.connect(self._accept)
         row.addWidget(self._ok_btn)
@@ -2176,20 +2243,20 @@ class DownloadItem:
             if self.size_unknown or (isinstance(self.progress, (int, float)) and self.progress < 0):
                 br = int(getattr(self, "bytes_received", 0) or 0)
                 if br >= 1024 * 1024:
-                    return f"ダウンロード中… {br / (1024 * 1024):.1f} MB 受信中"
+                    return tr('ダウンロード中… {v0:.1f} MB 受信中', v0=br / (1024 * 1024))
                 if br >= 1024:
-                    return f"ダウンロード中… {br / 1024:.0f} KB 受信中"
+                    return tr('ダウンロード中… {v0:.0f} KB 受信中', v0=br / 1024)
                 if br > 0:
-                    return f"ダウンロード中… {br} B 受信中"
-                return "ダウンロード中…"
+                    return tr('ダウンロード中… {v0} B 受信中', v0=br)
+                return tr('ダウンロード中…')
             pct = int(max(0.0, min(1.0, float(self.progress))) * 100)
-            return f"ダウンロード中… {pct}%"
+            return tr('ダウンロード中… {v0}%', v0=pct)
         if s == "completed":
-            return "完了"
+            return tr('完了')
         if s == "cancelled":
-            return "キャンセル"
+            return tr('キャンセル', context='download_status')
         if s == "failed":
-            return "失敗"
+            return tr('失敗')
         return s or ""
 
 
@@ -2291,7 +2358,7 @@ class DownloadOverlay(QWidget):
         title_row = QHBoxLayout()
         title_row.setContentsMargins(0, 0, 0, 0)
         title_row.setSpacing(4)
-        title = QLabel("ダウンロード履歴")
+        title = QLabel(tr('ダウンロード履歴'))
         title.setObjectName("download_overlay_title")
         title_row.addWidget(title, 1)
         close_btn = QToolButton()
@@ -2299,7 +2366,7 @@ class DownloadOverlay(QWidget):
         close_btn.setText("")
         close_btn.setIcon(make_close_icon(_COLOR_TEXT_SECONDARY, 12))
         close_btn.setIconSize(QSize(12, 12))
-        close_btn.setToolTip("閉じる")
+        close_btn.setToolTip(tr('閉じる'))
         close_btn.setFixedSize(22, 22)
         close_btn.clicked.connect(self.close_overlay)
         title_row.addWidget(close_btn, 0)
@@ -2452,7 +2519,7 @@ class DownloadOverlay(QWidget):
         close_row_btn.setIcon(make_close_icon(_COLOR_TEXT_SECONDARY, 10))
         close_row_btn.setIconSize(QSize(10, 10))
         close_row_btn.setFixedSize(20, 20)
-        close_row_btn.setToolTip("履歴から削除")
+        close_row_btn.setToolTip(tr('履歴から削除'))
         close_row_btn.setStyleSheet(
             "QToolButton { background:transparent; border:none; border-radius:4px; }"
             "QToolButton:hover { background:transparent; border:none; }"
@@ -2499,13 +2566,13 @@ class DownloadOverlay(QWidget):
 
         action_btns = [
             _mk_btn(
-                make_file_open_icon(_COLOR_SECONDARY, 12), "ファイルを開く",
+                make_file_open_icon(_COLOR_SECONDARY, 12), tr('ファイルを開く'),
                 lambda: self._open_file(item)),
             _mk_btn(
-                make_folder_icon(_COLOR_SECONDARY, 12), "フォルダを開く",
+                make_folder_icon(_COLOR_SECONDARY, 12), tr('フォルダを開く'),
                 lambda: self._open_folder(item)),
             _mk_btn(
-                make_trash_icon(_COLOR_DANGER, 12), "ファイルを削除",
+                make_trash_icon(_COLOR_DANGER, 12), tr('ファイルを削除'),
                 lambda: self._delete_file_and_history(item), danger=True),
         ]
         for b in action_btns:
@@ -2544,7 +2611,7 @@ class DownloadOverlay(QWidget):
             b.setVisible(not busy)
         if label is not None:
             if busy and not (item.size_unknown or item.progress < 0) and bar is not None:
-                label.setText(f"ダウンロード中… {int(round(bar._shown * 100))}%")
+                label.setText(tr('ダウンロード中… {v0}%', v0=int(round(bar._shown * 100))))
             else:
                 label.setText(item.status_label())
 
@@ -2556,7 +2623,7 @@ class DownloadOverlay(QWidget):
             return
         if item.size_unknown or item.progress < 0:
             return
-        label.setText(f"ダウンロード中… {int(round(value * 100))}%")
+        label.setText(tr('ダウンロード中… {v0}%', v0=int(round(value * 100))))
 
     def _on_item_double_clicked(self, list_item) -> None:
         row = self._list.itemWidget(list_item) if list_item is not None else None
@@ -2730,7 +2797,7 @@ class DownloadIconButton(QPushButton):
         self.setObjectName("download_icon_btn")
         self.setFixedWidth(28)
         self.setFixedHeight(24)
-        self.setToolTip("ダウンロード履歴")
+        self.setToolTip(tr('ダウンロード履歴'))
 
         # アイコンは paintEvent で不透明度を変えながら自前で描く
         self._icon = make_download_icon(_COLOR_ACCENT_SOFT, 14)
@@ -2751,7 +2818,6 @@ class DownloadIconButton(QPushButton):
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
 
-    # ---- 外部 API（既存の呼び出し口を維持） -------------------------------
     def set_progress(self, progress: float) -> None:
         if progress is not None and float(progress) < 0.0:
             self._indeterminate = True
@@ -2784,7 +2850,6 @@ class DownloadIconButton(QPushButton):
         self._icon = make_download_icon(_COLOR_ACCENT_SOFT, 14)
         self.update()
 
-    # ---- 内部 -------------------------------------------------------------
     def _reset(self) -> None:
         # リングはフェードアウトしてから消す（値は消えきるまで保持）
         if self._done_t > 1.2:

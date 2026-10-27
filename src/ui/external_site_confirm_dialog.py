@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.core.i18n import tr
 
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QToolButton, QVBoxLayout, QWidget
@@ -42,7 +43,7 @@ class ExternalSiteConfirmDialog(QDialog):
 
         self.setObjectName("mayotter_external_confirm_dialog")
         self.setModal(True)
-        self.setWindowTitle("外部サイト")
+        self.setWindowTitle(tr('外部サイト'))
         self.setWindowFlags(
             Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
         )
@@ -85,7 +86,7 @@ class ExternalSiteConfirmDialog(QDialog):
 
         title_row = QHBoxLayout()
         title_row.setContentsMargins(0, 0, 0, 0)
-        title_lbl = QLabel("外部サイト")
+        title_lbl = QLabel(tr('外部サイト'))
         title_lbl.setStyleSheet(
             f"color:{TEXT}; font-size:14px; font-weight:600; background:transparent;"
         )
@@ -105,7 +106,7 @@ class ExternalSiteConfirmDialog(QDialog):
         title_row.addWidget(close_tb)
         v.addLayout(title_row)
 
-        body = QLabel("外部サイトを開こうとしています")
+        body = QLabel(tr('外部サイトを開こうとしています'))
         body.setStyleSheet(
             f"color:{TEXT}; font-size:12px; background:transparent;"
         )
@@ -122,7 +123,7 @@ class ExternalSiteConfirmDialog(QDialog):
         )
         v.addWidget(url_lbl)
 
-        note = QLabel("このサイトはXではありません。")
+        note = QLabel(tr('このサイトはXではありません。'))
         note.setStyleSheet(
             f"color:{TEXT_MUTED}; font-size:11px; background:transparent;"
         )
@@ -139,13 +140,13 @@ class ExternalSiteConfirmDialog(QDialog):
         btn_row.setSpacing(6)
         btn_row.addStretch(1)
         btn_cancel = QToolButton()
-        btn_cancel.setText("キャンセル")
+        btn_cancel.setText(tr('キャンセル'))
         btn_cancel.setStyleSheet(_btn_ss)
         btn_browser = QToolButton()
-        btn_browser.setText("既定ブラウザで開く")
+        btn_browser.setText(tr('既定ブラウザで開く'))
         btn_browser.setStyleSheet(_btn_ss)
         btn_app = QToolButton()
-        btn_app.setText("Mayotter内で開く")
+        btn_app.setText(tr('Mayotter内で開く'))
         btn_app.setStyleSheet(_btn_ss)
         btn_row.addWidget(btn_browser)
         btn_row.addWidget(btn_app)
@@ -279,13 +280,13 @@ class ExternalSiteConfirmDialog(QDialog):
                     btn.setIconSize(QSize(12, 12))
                     break
             for lbl in self.findChildren(QLabel):
-                if lbl.text() == "外部サイト":
+                if lbl.text() == tr('外部サイト'):
                     lbl.setStyleSheet(f"color:{color('TEXT')}; font-size:14px; font-weight:600; background:transparent;")
-                elif lbl.text() == "外部サイトを開こうとしています":
+                elif lbl.text() == tr('外部サイトを開こうとしています'):
                     lbl.setStyleSheet(f"color:{color('TEXT')}; font-size:12px; background:transparent;")
                 elif lbl.text() == self._url:
                     lbl.setStyleSheet(f"color:{color('TEXT_SECONDARY')}; font-size:11px; background:transparent;")
-                elif lbl.text() == "このサイトはXではありません。":
+                elif lbl.text() == tr('このサイトはXではありません。'):
                     lbl.setStyleSheet(f"color:{color('TEXT_MUTED')}; font-size:11px; background:transparent;")
             for btn in self.findChildren(QToolButton):
                 if btn.objectName() in ("btn_cancel", "btn_browser", "btn_app"):

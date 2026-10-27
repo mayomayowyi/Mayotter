@@ -1,7 +1,7 @@
-
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 def _get_app_base_dir() -> Path:
@@ -28,7 +28,9 @@ def _audio_visual_for_edition(base: Path, edition: str) -> Path:
 
 APP_BASE_DIR = _get_app_base_dir()
 _EDITION = _edition_name()
-DATA_DIR = _data_dir_for_edition(APP_BASE_DIR, _EDITION)
+IS_INSTALLED = bool(getattr(sys, "frozen", False) and (APP_BASE_DIR / "mayotter-installed.ini").is_file())
+DATA_DIR = (Path(os.environ["LOCALAPPDATA"]) / "Mayotter" if IS_INSTALLED
+            else _data_dir_for_edition(APP_BASE_DIR, _EDITION))
 PROFILES_DIR = DATA_DIR / "profiles"
 CONFIG_DIR = DATA_DIR / "config"
 CACHE_DIR = DATA_DIR / "cache"
@@ -36,14 +38,21 @@ TEMP_DIR = DATA_DIR / "temp"
 MEDIA_TEMP_DIR = TEMP_DIR / "media"
 LOGS_DIR = DATA_DIR / "logs"
 RECORDINGS_DIR = DATA_DIR / "recordings"
-AUDIO_VISUAL_DIR = _audio_visual_for_edition(APP_BASE_DIR, _EDITION)
+AUDIO_VISUAL_DIR = DATA_DIR / "audio_visual" if IS_INSTALLED else _audio_visual_for_edition(APP_BASE_DIR, _EDITION)
 SETTINGS_FILE = CONFIG_DIR / "app.json"
 
 def default_recordings_dir() -> Path:
     return RECORDINGS_DIR
 
+def default_recording_wav_dir() -> Path:
+    return RECORDINGS_DIR if IS_INSTALLED else APP_BASE_DIR / "data" / "recordings"
+
 def default_audio_visual_dir() -> Path:
     return AUDIO_VISUAL_DIR
+
+def bundled_audio_visual_image() -> Path:
+    """初期状態の音声投稿画像。同梱ロゴを正方形に収めたもの（角が切れない）。"""
+    return Path(__file__).resolve().parents[1] / "ui" / "assets" / "mayotter_cover.png"
 
 def ensure_directories() -> None:
     for d in (

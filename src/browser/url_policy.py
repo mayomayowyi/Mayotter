@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+from src.core.i18n import tr
 
 from typing import Literal
 from urllib.parse import urlsplit, parse_qs, unquote
@@ -115,7 +116,7 @@ def builtin_allowed_external_groups() -> list[tuple[str, list[str]]]:
     google = sorted(_GOOGLE_REGISTRABLE)
     grok_bases = sorted({h.removeprefix("www.") for h in _GROK_REGISTRABLE})
     return [
-        ("Google関連", google),
+        (tr('Google関連'), google),
         ("Grok", grok_bases),
     ]
 

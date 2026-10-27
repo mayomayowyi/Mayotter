@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 THEME_DARK = "dark"
 THEME_NADESHIKO = "nadeshiko"
 THEME_BABY_BLUE = "baby_blue"
 THEME_BORDEAUX = "bordeaux"
 THEME_PURE_PURPLE = "pure_purple"
+THEME_GRAPE_PURPLE = "grape_purple"
 
 # 暗い背景のテーマ（DWMのダークモード指定などに使う）
-_DARK_THEMES = (THEME_DARK, THEME_BORDEAUX, THEME_PURE_PURPLE)
+_DARK_THEMES = (THEME_DARK, THEME_BORDEAUX, THEME_PURE_PURPLE, THEME_GRAPE_PURPLE)
 
 _THEMES = {
     THEME_DARK: {
@@ -162,6 +165,37 @@ _THEMES = {
         "TRANSITION_FG": "#f3eef3",
         "TRANSITION_FLARE": "#e6d5ee",
     },
+    THEME_GRAPE_PURPLE: {
+        # grape purple: InaCounter の紫紺ベースの配色を参考にした暗色テーマ。
+        # 面は紫がかった紺（window #25223B / panel #312C4A）、枠は淡い藤色、
+        # アクセントは葡萄のような明るいラベンダーにする。
+        "BG": "#25223B",
+        "WEB_BG": "#211F36",
+        "SURFACE": "#312C4A",
+        "SURFACE_RAISED": "#3B3554",
+        "SURFACE_HOVER": "#494261",
+        "SURFACE_SUNKEN": "#221F35",
+        "BORDER": "#514A70",
+        "BORDER_STRONG": "#6A6288",
+        "BORDER_ACCENT": "#7569B1",
+        "TEXT": "#F1EDFA",
+        "TEXT_BRIGHT": "#F9F5FF",
+        "TEXT_SECONDARY": "#C4BDDC",
+        "TEXT_MUTED": "#AEA7C9",
+        "ICON": "#C6B7FB",
+        "ACCENT": "#A99BE0",
+        "ACCENT_STRONG": "#CCBDF5",
+        "ACCENT_SOFT": "#BCB5D7",
+        "SUCCESS": "#AFD2B6",
+        "DANGER": "#ED9DAF",
+        "DANGER_BG": "#4B354F",
+        "DANGER_BORDER": "#795875",
+        "SCROLL_HANDLE": "#6B608B",
+        "SCROLL_HANDLE_HOVER": "#8478A8",
+        "TRANSITION_BG": "#25223B",
+        "TRANSITION_FG": "#F1EDFA",
+        "TRANSITION_FLARE": "#C6B7FB",
+    },
 }
 
 _CURRENT_THEME = THEME_DARK
@@ -246,6 +280,12 @@ _RGBA_TARGET = {
         "BLUE_29": (201, 174, 219),
         "DANGER": (255, 166, 189),
     },
+    THEME_GRAPE_PURPLE: {
+        "BLUE_148": (169, 155, 224),
+        "BLUE_122": (204, 189, 245),
+        "BLUE_29": (169, 155, 224),
+        "DANGER": (237, 157, 175),
+    },
 }
 
 RADIUS_SM = 6
@@ -295,6 +335,7 @@ def available_themes() -> tuple[tuple[str, str], ...]:
         (THEME_BABY_BLUE, "baby blue"),
         (THEME_BORDEAUX, "bordeaux"),
         (THEME_PURE_PURPLE, "pure purple"),
+        (THEME_GRAPE_PURPLE, "grape purple"),
     )
 
 def color(role: str) -> str:
@@ -321,12 +362,17 @@ def themed_qcolor(value: str):
     return QColor(map_color(value))
 
 def remap_stylesheet(css: str, target_theme: str | None = None) -> str:
-    import re
     if not css:
         return css
     theme_id = str(target_theme or _CURRENT_THEME).strip().lower()
     if theme_id not in _THEMES:
         theme_id = THEME_DARK
+    return _remap_stylesheet_cached(css, theme_id)
+
+@lru_cache(maxsize=256)
+def _remap_stylesheet_cached(css: str, theme_id: str) -> str:
+    import re
+
     target_values = _THEMES[theme_id]
     role_by_hex = dict(_LEGACY_ROLE)
     for values in _THEMES.values():
@@ -363,6 +409,17 @@ def remap_stylesheet(css: str, target_theme: str | None = None) -> str:
     )
     for token, target in placeholders.items():
         out = out.replace(token, target)
+    # スピンボタンの +/- 画像は色ではなくファイルパスのため、明るいテーマでは
+    # 暗いグリフへ差し替える（apply_overlay_theme は dark 基準で組み立て後に
+    # remap するため、ここで target 別に解決する必要がある）。
+    if theme_id in (THEME_NADESHIKO, THEME_BABY_BLUE):
+        out = out.replace("spin_plus.png", "spin_plus_dark.png").replace(
+            "spin_minus.png", "spin_minus_dark.png"
+        )
+    else:
+        out = out.replace("spin_plus_dark.png", "spin_plus.png").replace(
+            "spin_minus_dark.png", "spin_minus.png"
+        )
     return out
 
 _apply_theme_tokens()
@@ -374,7 +431,7 @@ def _refresh_widget_icons(widget) -> None:
             make_settings_icon, make_close_icon, make_edit_icon,
             make_edge_dock_icon, make_minimize_icon, make_maximize_icon,
             make_restore_icon, make_stop_icon, make_mic_icon,
-            make_chevron_left_icon, make_plus_icon, make_forward_icon,
+            make_chevron_left_icon, make_stow_right_icon, make_plus_icon, make_forward_icon,
             make_back_icon, make_home_icon, make_download_icon,
             make_folder_icon, make_chevron_down_icon,
             _COLOR_SECONDARY, _COLOR_TEXT, _COLOR_ACCENT_SOFT,
@@ -401,6 +458,8 @@ def _refresh_widget_icons(widget) -> None:
                     widget.setIcon(make_close_icon(_COLOR_SECONDARY, 12))
             elif obj_name == "dock_chrome_chevron":
                 widget.setIcon(make_chevron_left_icon(_COLOR_SECONDARY, 12))
+            elif obj_name == "dock_chrome_left_chevron":
+                widget.setIcon(make_stow_right_icon(_COLOR_SECONDARY, 12))
             elif obj_name == "record_btn":
                 rec = widget.property("recording")
                 if rec == "true" or str(rec).lower() == "true":
@@ -496,9 +555,14 @@ def overlay_stylesheet(theme_id: str | None = None) -> str:
     TEXT_SECONDARY = values["TEXT_SECONDARY"]
     TEXT_MUTED = values["TEXT_MUTED"]
     ACCENT = values["ACCENT"]
+    SURFACE_HOVER = values["SURFACE_HOVER"]
     _assets = Path(__file__).resolve().parent / "assets"
-    _plus = (_assets / "spin_plus.png").as_posix()
-    _minus = (_assets / "spin_minus.png").as_posix()
+    if target in (THEME_NADESHIKO, THEME_BABY_BLUE):
+        _plus = (_assets / "spin_plus_dark.png").as_posix()
+        _minus = (_assets / "spin_minus_dark.png").as_posix()
+    else:
+        _plus = (_assets / "spin_plus.png").as_posix()
+        _minus = (_assets / "spin_minus.png").as_posix()
     css = f"""
         QWidget#mayotter_settings_dialog, QWidget#download_overlay,
         QWidget#url_overlay, QWidget#text_prompt_overlay,
@@ -554,20 +618,23 @@ def overlay_stylesheet(theme_id: str | None = None) -> str:
         QSpinBox::up-button, QSpinBox::down-button {{
             subcontrol-origin: border;
             width: 16px;
-            background-color: #252b38;
+            background-color: {SURFACE_HOVER};
             border-left: 1px solid {BORDER};
+            border-right: 1px solid {BORDER};
         }}
         QSpinBox::up-button {{
             subcontrol-position: top right;
             border-top-right-radius: {RADIUS_SM}px;
+            border-top: 1px solid {BORDER};
             border-bottom: 1px solid {BORDER};
         }}
         QSpinBox::down-button {{
             subcontrol-position: bottom right;
             border-bottom-right-radius: {RADIUS_SM}px;
+            border-bottom: 1px solid {BORDER};
         }}
         QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
-            background-color: #323a4c;
+            background-color: {BORDER};
         }}
         QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{
             background-color: {BORDER_STRONG};
@@ -593,6 +660,31 @@ def overlay_stylesheet(theme_id: str | None = None) -> str:
         QPushButton:pressed {{ background-color: {BORDER_STRONG}; }}
         QToolButton {{ background: transparent; border: none; border-radius: 4px; color: {TEXT_SECONDARY}; }}
         QToolButton:hover {{ background-color: rgba(148, 178, 230, 0.12); }}
+        QLabel#settings_support_heading {{ color: {TEXT}; font-size: 12px; font-weight: 700; }}
+        QLabel#settings_support_note {{ color: {TEXT_MUTED}; font-size: 11px; }}
+        #settings_support_separator {{ border: none; background: {BORDER_STRONG}; max-height: 1px; }}
+        #settings_kofi_button, #settings_github_star_button, #settings_support_contact_button {{
+            font-size: 11px; font-weight: 600; padding: 0 4px;
+            min-height: 32px;
+        }}
+        #settings_kofi_button {{
+            color: white; background-color: #227DB8;
+            border: 1px solid #16669B; border-radius: 17px;
+        }}
+        #settings_kofi_button:hover {{ background-color: #3196D0; border-color: #2479AC; }}
+        #settings_kofi_button:pressed {{ background-color: #166A9D; }}
+        #settings_github_star_button {{
+            color: #F5F7FA; background-color: #24292F;
+            border: 1px solid #434B55; border-radius: 17px;
+        }}
+        #settings_github_star_button:hover {{ background-color: #3A424B; border-color: #738194; }}
+        #settings_github_star_button:pressed {{ background-color: #15191E; }}
+        #settings_support_contact_button {{
+            color: #F5F7FA; background-color: #46608A;
+            border: 1px solid #35496A; border-radius: 17px;
+        }}
+        #settings_support_contact_button:hover {{ background-color: #5573A3; border-color: #6383B6; }}
+        #settings_support_contact_button:pressed {{ background-color: #384F73; }}
         QToolButton#download_action_btn {{
             background-color: transparent; border: 1px solid transparent; border-radius: 5px;
         }}
@@ -771,7 +863,8 @@ def apply_theme_to_application(app) -> None:
             _retint_widget_stylesheet(widget)
             try:
                 if widget.__class__.__name__ != "XWebView" and not widget.inherits("QWebEngineView"):
-                    widget.setPalette(pal)
+                    if widget.palette() != pal:
+                        widget.setPalette(pal)
             except Exception:
                 pass
             try:
@@ -782,13 +875,6 @@ def apply_theme_to_application(app) -> None:
                 widget.update()
             except Exception:
                 pass
-    except Exception:
-        pass
-    # allWidgets に含まれないトップレベルも更新する
-    try:
-        for widget in app.topLevelWidgets():
-            _refresh_widget_icons(widget)
-            widget.update()
     except Exception:
         pass
 
@@ -815,7 +901,8 @@ def install_theme_filter(app) -> None:
             return False
 
     filt = _ThemeFilter(app)
-    app.installEventFilter(filt)
+    from src.ui.app_event_filter import install_app_event_filter
+    install_app_event_filter(app, filt)
     app._mayotter_theme_filter = filt
 
 def apply_overlay_theme(widget) -> None:
@@ -957,12 +1044,24 @@ def menu_dropdown_show(widget, *, duration_ms: int = POPOVER_OPEN_MS) -> None:
             widget._mayotter_show_group = opacity
             return
 
-        widget.show()
-        widget.raise_()
-        try:
-            widget._mayotter_fading_out = False
-        except Exception:
-            pass
+        if getattr(widget, "_mayotter_embedded_popup", False):
+            from PySide6.QtWidgets import QGraphicsOpacityEffect
+            effect = QGraphicsOpacityEffect(widget)
+            effect.setOpacity(0.0)
+            widget.setGraphicsEffect(effect)
+            widget.show()
+            widget.raise_()
+            opacity = QPropertyAnimation(effect, b"opacity", widget)
+            opacity.setDuration(int(duration_ms))
+            opacity.setStartValue(0.0)
+            opacity.setEndValue(1.0)
+            opacity.setEasingCurve(QEasingCurve.Type.OutCubic)
+            opacity.start()
+            widget._mayotter_show_anim = opacity
+        else:
+            widget.show()
+            widget.raise_()
+        widget._mayotter_fading_out = False
     except Exception:
         try:
             widget.setGraphicsEffect(None)
@@ -1058,12 +1157,24 @@ def menu_dropdown_hide(widget, *, duration_ms: int = POPOVER_CLOSE_MS, on_finish
         except Exception:
             pass
 
-        # effect を外す
-        try:
-            widget.setGraphicsEffect(None)
-        except Exception:
-            pass
+        if not is_native_child and getattr(widget, "_mayotter_embedded_popup", False):
+            from PySide6.QtWidgets import QGraphicsOpacityEffect
+            effect = widget.graphicsEffect()
+            if not isinstance(effect, QGraphicsOpacityEffect):
+                effect = QGraphicsOpacityEffect(widget)
+                effect.setOpacity(1.0)
+                widget.setGraphicsEffect(effect)
+            opacity = QPropertyAnimation(effect, b"opacity", widget)
+            opacity.setDuration(max(40, int(duration_ms * effect.opacity())))
+            opacity.setStartValue(effect.opacity())
+            opacity.setEndValue(0.0)
+            opacity.setEasingCurve(QEasingCurve.Type.InCubic)
+            opacity.finished.connect(_done)
+            opacity.start()
+            widget._mayotter_hide_anim = opacity
+            return
 
+        widget.setGraphicsEffect(None)
         if is_native_child or not is_top:
             _done()
             return

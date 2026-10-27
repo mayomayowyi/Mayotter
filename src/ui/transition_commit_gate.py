@@ -4,6 +4,7 @@ import ctypes
 import sys
 import time
 from collections.abc import Callable, Iterable
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QPointF, QRect, QRectF, QTimer, QVariantAnimation, QEasingCurve, Qt
 from PySide6.QtGui import (
@@ -11,6 +12,7 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QRegion,
 )
 from PySide6.QtWidgets import QWidget
@@ -43,10 +45,17 @@ class _TransitionCurtain(QWidget):
         self._source_edge: str | None = None
         self._target_edge: str | None = None
         self._shell_motion = False
+        self._content_only = False
+        self._logo = QPixmap()
         self._source_column_count = 1
         self._target_column_count = 1
 
     def invalidate_theme_cache(self) -> None:
+        if not self._logo.isNull():
+            painter = QPainter(self._logo)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            painter.fillRect(self._logo.rect(), QColor(theme_color("TEXT_MUTED")))
+            painter.end()
         self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
@@ -103,15 +112,22 @@ class _TransitionCurtain(QWidget):
         target: QRect,
         source_edge: str | None = None,
         target_edge: str | None = None,
+        *,
+        content_only: bool = False,
     ) -> None:
         self._transition_source = QRect(source)
         self._transition_target = QRect(target)
         self._source_edge = source_edge if source_edge in ("left", "right", "top", "bottom") else None
         self._target_edge = target_edge if target_edge in ("left", "right", "top", "bottom") else None
+        self._content_only = content_only
         self._shell_motion = bool(
-            (self._source_edge is not None or self._target_edge is not None)
+            not content_only
+            and (self._source_edge is not None or self._target_edge is not None)
             and self._source_edge != self._target_edge
         )
+        if content_only and self._logo.isNull():
+            self._logo.load(str(Path(__file__).resolve().parent / "assets" / "mayotter_cat.png"))
+            self.invalidate_theme_cache()
         self._source_column_count = self._column_count_for_edge(self._source_edge)
         self._target_column_count = self._column_count_for_edge(self._target_edge)
         # ON/OFF を含め、transition surface 自体を source→target geometry へ動かす。
@@ -205,11 +221,34 @@ class _TransitionCurtain(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        if self.shell_motion_active:
+        if self._content_only:
+            self._paint_content_transition(painter, rect, alpha)
+        elif self.shell_motion_active:
             self._paint_window_transfer(painter, rect, alpha)
         else:
             self._paint_shell_rect(painter, rect, alpha, header=True)
         painter.end()
+
+    def _paint_content_transition(self, painter: QPainter, rect: QRectF, alpha: int) -> None:
+        self._paint_shell_rect(painter, rect, alpha, header=False)
+        if self._logo.isNull():
+            return
+        enter = self._smootherstep01(self._phase(self._transition_progress, 0.0, 0.42))
+        scale = min(
+            240.0 / self._logo.width(),
+            rect.width() * 0.42 / self._logo.width(),
+            rect.height() * 0.30 / self._logo.height(),
+        ) * (0.96 + 0.04 * enter)
+        width, height = self._logo.width() * scale, self._logo.height() * scale
+        bounds = QRectF(
+            rect.center().x() - width * 0.5,
+            rect.center().y() - height * 0.5 + 6.0 * (1.0 - enter),
+            width, height,
+        )
+        painter.save()
+        painter.setOpacity(alpha / 255.0 * 0.8 * enter)
+        painter.drawPixmap(bounds, self._logo, QRectF(self._logo.rect()))
+        painter.restore()
 
     def _paint_shell_rect(
         self, painter: QPainter, rect: QRectF, alpha: int, *, header: bool
@@ -555,12 +594,15 @@ class TransitionCommitGate(QObject):
     _WORLD_ID = 1
 
     _CURTAIN_IN_MS = 42
-    _SHELL_FADE_IN_MS = 72
+    _SHELL_FADE_IN_MS = 48
     _MORPH_MIN_MS = 145
     _MORPH_MAX_MS = 205
-    _SHELL_MOTION_MS = 1120
+    _SHELL_MOTION_MS = 860
     _CURTAIN_OUT_MS = 96
-    _SHELL_FADE_OUT_MS = 150
+    _SHELL_FADE_OUT_MS = 100
+    _CONTENT_MOTION_MS = 280
+    _CONTENT_FADE_IN_MS = 140
+    _CONTENT_FADE_OUT_MS = 140
     _PROBE_SIZE = 10
 
     def __init__(self, window) -> None:
@@ -595,6 +637,7 @@ class TransitionCommitGate(QObject):
         self._shell_only_had_mask = False
         self._source_edge: str | None = None
         self._target_edge: str | None = None
+        self._content_only = False
 
     def invalidate_theme_cache(self) -> None:
         curtain = self._curtain
@@ -620,13 +663,10 @@ class TransitionCommitGate(QObject):
         )
 
     def _ensure_window_opaque(self) -> None:
-        """Dock transition中はMainWindowのopacity animationを持ち越さない。"""
-        try:
-            stop = getattr(self._window, "_stop_window_opacity_anim", None)
-            if callable(stop):
-                stop()
-        except Exception:
-            pass
+        """Dock transition中はMainWindowを不透明に保つ。"""
+        stop_fade = getattr(self._window, "_stop_window_state_fade", None)
+        if stop_fade is not None:
+            stop_fade()
         try:
             if abs(float(self._window.windowOpacity()) - 1.0) > 0.001:
                 self._window.setWindowOpacity(1.0)
@@ -712,8 +752,79 @@ class TransitionCommitGate(QObject):
         self._cover_anim = anim
         anim.start()
 
-    def begin(self, target_geometry: QRect, finalize: Callable[[], None]) -> None:
+    def cover_content(
+        self, target_geometry: QRect, continuation: Callable[[], None]
+    ) -> bool:
+        """ワーク切替用の content-only cover。
+
+        ロゴ付きカーテンを旧コンテンツの上へフェードインし、覆い切ってから
+        continuation() へ本体の差し替えを任せる。開始できたら True。
+        """
+        if self.busy:
+            return False
+
         self._ensure_window_opaque()
+        source = QRect(self._window.geometry())
+        target = QRect(target_geometry)
+        if (
+            not source.isValid()
+            or not target.isValid()
+            or source.width() <= 1
+            or source.height() <= 1
+            or target.width() <= 1
+            or target.height() <= 1
+        ):
+            return False
+
+        edge = (
+            getattr(self._window, "_edge_dock_direction", None)
+            if getattr(self._window, "_edge_dock_enabled", False)
+            else None
+        )
+        self._content_only = True
+        self._source_edge = edge
+        self._target_edge = edge
+        self._source_geometry = QRect(source)
+        self._target_geometry = QRect(target)
+        self._source_region = self._window_mask_or_full(source)
+        self._shell_only_had_mask = False
+        self._shell_only_region = QRegion()
+        try:
+            current = self._window.mask()
+            if current is not None and not current.isEmpty():
+                self._shell_only_had_mask = True
+                self._shell_only_region = QRegion(current)
+        except Exception:
+            pass
+        self._ensure_curtain(source, target)
+
+        curtain = self._curtain
+        if curtain is None:
+            return False
+
+        curtain.configure_transition(source, target, edge, edge, content_only=True)
+        curtain.set_transition_progress(0.0)
+        curtain.set_frame_global(source)
+        curtain.set_alpha(0.0)
+        curtain.show()
+        curtain.raise_()
+
+        anim = QVariantAnimation(self)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setDuration(self._CONTENT_FADE_IN_MS)
+        anim.setEasingCurve(QEasingCurve(QEasingCurve.Type.InOutSine))
+        anim.valueChanged.connect(lambda value: self._set_cover_alpha(float(value)))
+        anim.finished.connect(lambda cb=continuation: self._finish_content_cover(cb))
+        self._cover_anim = anim
+        anim.start()
+        return True
+
+    def begin(
+        self, target_geometry: QRect, finalize: Callable[[], None], *, content_only: bool = False
+    ) -> None:
+        self._ensure_window_opaque()
+        self._content_only = content_only
         self._generation += 1
         generation = self._generation
         self._active = True
@@ -753,6 +864,16 @@ class TransitionCommitGate(QObject):
                 self._curtain.raise_()
         else:
             self._resize_curtain_canvas(self._source_geometry, target)
+
+        if content_only and self._curtain is not None:
+            edge = (
+                getattr(self._window, "_edge_dock_direction", None)
+                if getattr(self._window, "_edge_dock_enabled", False) else None
+            )
+            self._source_edge = self._target_edge = edge
+            self._curtain.configure_transition(
+                self._source_geometry, target, edge, edge, content_only=True
+            )
 
         # 本体は morph 中に一切見せない。window region を毎フレーム変更しない。
         self._park_window_hidden()
@@ -1054,6 +1175,36 @@ class TransitionCommitGate(QObject):
         except Exception:
             pass
 
+    def _set_cover_alpha(self, value: float) -> None:
+        curtain = self._curtain
+        if curtain is None:
+            return
+        try:
+            curtain.set_alpha(value)
+        except Exception:
+            pass
+
+    def _finish_content_cover(self, continuation: Callable[[], None]) -> None:
+        self._stop_animation("cover")
+        if getattr(self._window, "_close_fade_done", False):
+            # 終了フェード中は差し替えず、カーテンだけ片付ける。
+            self.cancel(finalize=False)
+            return
+        curtain = self._curtain
+        if curtain is not None:
+            try:
+                curtain.set_alpha(1.0)
+                curtain.raise_()
+            except Exception:
+                pass
+        # 覆い切るまでは本体を出したままにし、ここで初めて差し替えを始める。
+        self._park_window_hidden()
+        try:
+            continuation()
+        except Exception:
+            self.cancel(finalize=False)
+            raise
+
     def _resolve_transition_edges(
         self, source_edge: str | None, target_edge: str | None
     ) -> tuple[str | None, str | None]:
@@ -1129,7 +1280,11 @@ class TransitionCommitGate(QObject):
         # morph開始時の前面確保はここで一度だけ（毎tick raise_ は廃止）。
         curtain.raise_()
 
-        if self._same_geometry(start, end) and not curtain.shell_motion_active:
+        if (
+            self._same_geometry(start, end)
+            and not curtain.shell_motion_active
+            and not self._content_only
+        ):
             curtain.set_frame_global(end)
             self._morph_done = True
             self._stage_target_window()
@@ -1153,10 +1308,13 @@ class TransitionCommitGate(QObject):
             lambda value, g=generation, a=QRect(start), b=QRect(end):
             self._on_morph_value(g, a, b, float(value))
         )
+        if self._content_only:
+            anim.setDuration(self._CONTENT_MOTION_MS)
+            anim.setEasingCurve(QEasingCurve(QEasingCurve.Type.Linear))
         anim.finished.connect(lambda g=generation: self._finish_morph(g))
         self._morph_anim = anim
         if curtain.shell_motion_active:
-            curtain.start_shell_motion(self._SHELL_MOTION_MS)
+            curtain.start_shell_motion(anim.duration())
         anim.start()
 
     def _on_morph_value(
@@ -1168,7 +1326,9 @@ class TransitionCommitGate(QObject):
         if curtain is None:
             return
         try:
-            if curtain.shell_motion_active:
+            if self._content_only:
+                curtain.set_transition_progress(value)
+            elif curtain.shell_motion_active:
                 curtain.set_transition_progress(value)
                 curtain.set_frame_global(self._transfer_rect(start, end, value))
             else:
@@ -1445,6 +1605,8 @@ class TransitionCommitGate(QObject):
             else self._CURTAIN_OUT_MS
         )
         anim.setEasingCurve(QEasingCurve(QEasingCurve.Type.InOutSine))
+        if self._content_only:
+            anim.setDuration(self._CONTENT_FADE_OUT_MS)
         anim.valueChanged.connect(
             lambda value, g=generation: self._on_fade_value(g, float(value))
         )
@@ -1608,6 +1770,7 @@ class TransitionCommitGate(QObject):
         return region
 
     def _reset_geometry_state(self) -> None:
+        self._content_only = False
         self._source_geometry = QRect()
         self._target_geometry = QRect()
         self._source_region = QRegion()

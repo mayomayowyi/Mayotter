@@ -1,0 +1,44 @@
+{
+  "_comment": "Pinned third-party components bundled into the Windows distribution by packaging/stage_third_party.py. Update version, url and sha256 together.",
+  "ffmpeg": {
+    "name": "FFmpeg (Gyan.dev full build)",
+    "version": "9.0",
+    "license": "GPL-3.0-or-later (--enable-gpl --enable-version3, no --enable-nonfree)",
+    "url": "https://github.com/GyanD/codexffmpeg/releases/download/9.0/ffmpeg-9.0-full_build.zip",
+    "sha256": "f42f0c4b04eae3ac918707ff66e3e0ff0cee527bfa6d322624d4bc1160d5055e",
+    "sha256_source": "winget-pkgs manifests/g/Gyan/FFmpeg/9.0/Gyan.FFmpeg.installer.yaml (InstallerSha256)",
+    "archive_root": "ffmpeg-9.0-full_build",
+    "files": {
+      "bin/ffmpeg.exe": "ffmpeg.exe",
+      "LICENSE": "LICENSE.txt",
+      "README.txt": "BUILD_README.txt"
+    },
+    "source": {
+      "commit": "d32b387f2b",
+      "url": "https://github.com/FFmpeg/FFmpeg/archive/d32b387f2b.tar.gz",
+      "url_note": "exact FFmpeg commit stated in the build's README.txt ('Source Code'); GitHub archives are not byte-stable, so the SHA-256 is recorded at build time",
+      "release_tarball": "https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz",
+      "build_info": "https://www.gyan.dev/ffmpeg/builds/",
+      "external_libraries": "listed in BUILD_README.txt; their sources are not fetched by the build (see packaging/licenses/README.md)"
+    }
+  },
+  "python": {
+    "requirements": "packaging/requirements-dist.txt",
+    "packages": {
+      "onnxruntime": "1.29.0",
+      "numpy": "2.5.3"
+    }
+  },
+  "deepfilternet3": {
+    "name": "DeepFilterNet3 (ONNX model)",
+    "file": "DeepFilterNet3_onnx.tar.gz",
+    "url": "https://github.com/Rikorose/DeepFilterNet/raw/main/models/DeepFilterNet3_onnx.tar.gz",
+    "sha256": "c94d91f70911001c946e0fabb4aa9adc37045f45a03b56008cb0c8244cb63616",
+    "source": "https://github.com/Rikorose/DeepFilterNet",
+    "license": "upstream code MIT OR Apache-2.0; model weights redistribution not conclusively documented",
+    "license_files": [
+      "LICENSE-MIT",
+      "LICENSE-APACHE"
+    ]
+  }
+}

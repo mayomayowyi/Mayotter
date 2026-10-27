@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+from src.core.i18n import tr
 
 import struct
 import wave
@@ -100,6 +101,31 @@ def _is_fatal_error(err) -> bool:
         return False
     return True
 
+_CAPTURE_BUFFER_SECONDS = 4
+# 音量メーターは最新区間だけで十分。停止明けの大きなチャンク全体を Python で走査しない
+_METER_WINDOW_SECONDS = 0.05
+
+
+def audio_device_id_text(device) -> str:
+    """QAudioDevice.id() (QByteArray) を設定保存用の文字列にする。Windows では ASCII のエンドポイントID。"""
+    return bytes(device.id()).decode("utf-8", "replace")
+
+
+def resolve_input_device(preferred_id: str):
+    """優先マイクの QAudioDevice を現在の接続状況から解決する。
+
+    戻り値は (device, 状態)。状態は "default"（指定なし）/ "preferred"（一致）/
+    "fallback"（指定IDが未接続のため既定へ退避）。保存済みIDはここでは触らない。
+    """
+    devices = QMediaDevices.audioInputs()
+    if preferred_id:
+        for d in devices:
+            if audio_device_id_text(d) == preferred_id:
+                return d, "preferred"
+    default = next((d for d in devices if d.isDefault()), QMediaDevices.defaultAudioInput())
+    return default, ("fallback" if preferred_id else "default")
+
+
 class AudioRecorder(QObject):
 
     started = Signal()
@@ -111,6 +137,8 @@ class AudioRecorder(QObject):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._source: QAudioSource | None = None
+        # 設定で選んだマイクのID。空なら Windows の既定。start() のたびに呼び出し側が設定する
+        self.preferred_device_id = ""
         self._io: QIODevice | None = None
         self._path: Path | None = None
         self._wave: wave.Wave_write | None = None
@@ -149,6 +177,7 @@ class AudioRecorder(QObject):
         self._ready_delay_warn_ms = 100.0
         self._ready_delay_crit_ms = 250.0
         self._crit_log_budget = 8
+        self._capture_overflow_count = 0
 
     @property
     def is_recording(self) -> bool:
@@ -169,14 +198,14 @@ class AudioRecorder(QObject):
                 except Exception:
                     pass
 
-            # Windows で既定に設定されている録音デバイスを使う
-            device = next(
-                (d for d in QMediaDevices.audioInputs() if d.isDefault()),
-                QMediaDevices.defaultAudioInput(),
-            )
+            device, source = resolve_input_device(self.preferred_device_id)
+            if source == "fallback":
+                _rec_log(
+                    f"preferred microphone unavailable id={self.preferred_device_id!r} → fallback to default"
+                )
             if device.isNull():
                 _rec_log("default_input=null")
-                self.failed.emit("録音デバイスが見つかりません")
+                self.failed.emit(tr('録音デバイスが見つかりません'))
                 return
 
             try:
@@ -184,7 +213,9 @@ class AudioRecorder(QObject):
                 dev_id = device.id()
             except Exception:
                 desc, dev_id = "?", "?"
-            _rec_log(f"default_input={desc!r}")
+            _rec_log(f"input_source={source} default_input={desc!r}")
+            _rec_log(f"selected_device_id={self.preferred_device_id!r}")
+            _rec_log(f"actual_device_id={dev_id!r} actual_device_description={desc!r}")
             _rec_log(f"device_description={desc!r}")
             _rec_log(f"device_id={dev_id!r}")
 
@@ -230,8 +261,11 @@ class AudioRecorder(QObject):
                 self._capture_bytes_per_sample = 2
             self._bytes_per_sample = 2
             try:
-                bytes_per_sec = max(1, self._rate * self._channels * 2)
-                req_buf = max(16384, bytes_per_sec // 2)
+                # Qt 6.10+ の QAudioSource は録音スレッドがこの容量のリングバッファへ書き込み、
+                # 満杯になると溢れた PCM を捨てる（無音挿入なしで詰めるのでブチッと鳴る）。
+                # GUI スレッドが数百 ms 止まっても欠落しないよう、取り込み形式で 4 秒分を確保する。
+                bytes_per_sec = max(1, self._rate * self._channels * self._capture_bytes_per_sample)
+                req_buf = max(16384, int(bytes_per_sec * _CAPTURE_BUFFER_SECONDS))
                 self._buffer_size_requested = req_buf
                 self._source.setBufferSize(req_buf)
                 try:
@@ -269,6 +303,7 @@ class AudioRecorder(QObject):
             self._bytes_per_read_min = 0
             self._bytes_per_read_max = 0
             self._crit_log_budget = 8
+            self._capture_overflow_count = 0
 
             self._io = self._source.start()
             err = self._source.error()
@@ -279,12 +314,12 @@ class AudioRecorder(QObject):
             )
 
             if self._io is None:
-                self.failed.emit("録音を開始できませんでした（入力ストリームなし）")
+                self.failed.emit(tr('録音を開始できませんでした（入力ストリームなし）'))
                 self._cleanup_partial()
                 return
 
             if not _is_no_error(err):
-                self.failed.emit(f"録音を開始できませんでした（{_error_name(err)}）")
+                self.failed.emit(tr('録音を開始できませんでした（{v0}）', v0=_error_name(err)))
                 self._cleanup_partial()
                 return
 
@@ -309,7 +344,7 @@ class AudioRecorder(QObject):
         except Exception as exc:
             _rec_log(f"start exception: {exc!r}")
             self._cleanup_partial()
-            self.failed.emit(f"録音を開始できませんでした: {exc}")
+            self.failed.emit(tr('録音を開始できませんでした: {v0}', v0=exc))
 
     def stop(self) -> None:
         if not self._active:
@@ -385,7 +420,8 @@ class AudioRecorder(QObject):
             f"interval_mean_ms={mean_interval!r} interval_max_ms={self._ready_interval_max_ms!r} "
             f"delay_count_ge_{int(self._ready_delay_warn_ms)}ms={self._ready_delay_count} "
             f"critical_count_ge_{int(self._ready_delay_crit_ms)}ms={self._ready_critical_count} "
-            f"read_bytes_min={self._bytes_per_read_min} read_bytes_max={self._bytes_per_read_max}"
+            f"read_bytes_min={self._bytes_per_read_min} read_bytes_max={self._bytes_per_read_max} "
+            f"capture_overflow={self._capture_overflow_count}"
         )
         if delta is not None and abs(float(delta)) >= 0.05:
             _rec_log(
@@ -397,64 +433,10 @@ class AudioRecorder(QObject):
                 f"readyRead_DELAY_SUMMARY delays={self._ready_delay_count} "
                 f"critical={self._ready_critical_count} max_ms={self._ready_interval_max_ms:.1f}"
             )
-        try:
-            import os
-            keep_on = bool(
-                os.environ.get("MAYOTTER_KEEP_REC_WAV")
-                or os.environ.get("MAYOTTER_MEDIA_DEBUG")
-            )
-            if path is not None and path.is_file() and size > 44 and keep_on:
-                import shutil
-                from datetime import datetime as _dt
-                from src.media.media_converter import media_temp_dir
-                stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
-                dest = media_temp_dir() / f"keep_{stamp}_{path.name}"
-                shutil.copy2(str(path), str(dest))
-                _rec_log(
-                    f"kept_rec_wav={dest} "
-                    f"pcm_sec={pcm_sec!r} sample_count={sample_count!r} "
-                    f"rate={self._rate} channels={self._channels}"
-                )
-                try:
-                    side = dest.with_suffix(".diag.txt")
-                    side.write_text(
-                        "\n".join(
-                            [
-                                f"wav={dest}",
-                                f"source_temp={path}",
-                                f"rate={self._rate}",
-                                f"channels={self._channels}",
-                                f"sample_format={_sample_format_name(self._sample_format)}",
-                                f"capture_bytes_per_sample={self._capture_bytes_per_sample}",
-                                f"wav_bytes_per_sample={self._bytes_per_sample}",
-                                f"buffer_requested={self._buffer_size_requested}",
-                                f"buffer_actual={self._buffer_size_actual}",
-                                f"bytes_written={self._bytes_written}",
-                                f"sample_count={sample_count}",
-                                f"ready_count={self._ready_count}",
-                                f"pcm_sec={pcm_sec}",
-                                f"wall_sec={wall_sec}",
-                                f"pcm_minus_wall={delta}",
-                                f"interval_mean_ms={mean_interval}",
-                                f"interval_max_ms={self._ready_interval_max_ms}",
-                                f"delay_count={self._ready_delay_count}",
-                                f"critical_count={self._ready_critical_count}",
-                                f"read_bytes_min={self._bytes_per_read_min}",
-                                f"read_bytes_max={self._bytes_per_read_max}",
-                            ]
-                        )
-                        + "\n",
-                        encoding="utf-8",
-                    )
-                    _rec_log(f"kept_rec_diag={side}")
-                except Exception as side_exc:
-                    _rec_log(f"kept_rec_diag_failed={side_exc!r}")
-        except Exception as exc:
-            _rec_log(f"keep_rec_wav_failed={exc!r}")
         if path is not None and path.is_file() and size > 44:
             self.stopped.emit(str(path))
         else:
-            self.failed.emit("録音ファイルを保存できませんでした（データなし）")
+            self.failed.emit(tr('録音ファイルを保存できませんでした（データなし）'))
 
     def cancel(self) -> None:
         if not self._active and self._path is None:
@@ -498,11 +480,18 @@ class AudioRecorder(QObject):
         _rec_log(f"stateChanged={_state_name(state)} error={_error_name(err)}")
         if not self._active:
             return
+        # 取り込み開始後の IdleState は、Qt のリングバッファ満杯による PCM 破棄を意味する
+        if self._bytes_written > 0 and _state_name(state).endswith("IdleState"):
+            self._capture_overflow_count += 1
+            _rec_log(
+                f"capture_OVERFLOW count={self._capture_overflow_count} "
+                f"buffer_actual={self._buffer_size_actual} total_bytes={self._bytes_written}"
+            )
         if _is_fatal_error(err):
             self._active = False
             self._timer.stop()
             self._pcm_watch.stop()
-            self.failed.emit(f"録音エラー: {_error_name(err)}")
+            self.failed.emit(tr('録音エラー: {v0}', v0=_error_name(err)))
             self._cleanup_partial()
 
     def _on_pcm_timeout(self) -> None:
@@ -525,7 +514,7 @@ class AudioRecorder(QObject):
             pass
         self._cleanup_partial()
         self.failed.emit(
-            "録音データが取得できませんでした（マイク権限または入力デバイスを確認してください）"
+            tr('録音データが取得できませんでした（マイク権限または入力デバイスを確認してください）')
         )
 
     def _on_ready_read(self) -> None:
@@ -616,7 +605,9 @@ class AudioRecorder(QObject):
                 >= int(getattr(self, "_level_min_interval_ms", 50))
             ):
                 self._last_level_emit_ms = now
-                peak, rms = self._meter_int16(pcm16)
+                frame_bytes = max(1, self._channels * 2)
+                tail = int(self._rate * _METER_WINDOW_SECONDS) * frame_bytes
+                peak, rms = self._meter_int16(pcm16[-tail:] if tail > 0 else pcm16)
                 self.level.emit(peak, rms)
         except Exception as exc:
             _rec_log(f"readyRead error: {exc!r}")

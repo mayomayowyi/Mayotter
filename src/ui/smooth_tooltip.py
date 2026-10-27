@@ -42,6 +42,10 @@ class _MinimalTooltip(QWidget):
         self._hiding = False
         self._source = None
         self._text = ""
+        self._follow_timer = QTimer(self)
+        self._follow_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._follow_timer.setInterval(16)
+        self._follow_timer.timeout.connect(self._follow_cursor)
 
     def _surface_path(self, offset_y: float = 0.0) -> QPainterPath:
         rect = QRectF(self.rect()).adjusted(3.5, 3.5 + offset_y, -3.5, -3.5 + offset_y)
@@ -82,7 +86,9 @@ class _MinimalTooltip(QWidget):
         self._label.setText(text)
         self._label.adjustSize()
         self.adjustSize()
-        self._place(global_pos)
+        if not self.isVisible():
+            self._place(global_pos)
+        self._follow_timer.start()
 
         self._anim.stop()
         self._hiding = False
@@ -105,6 +111,7 @@ class _MinimalTooltip(QWidget):
         self._anim.start()
 
     def hide_tip(self, *, immediate: bool = False) -> None:
+        self._follow_timer.stop()
         self._anim.stop()
         if immediate or not self.isVisible():
             self._hiding = False
@@ -129,7 +136,10 @@ class _MinimalTooltip(QWidget):
         elif self.isVisible():
             self.setWindowOpacity(1.0)
 
-    def _place(self, global_pos: QPoint) -> None:
+    def _follow_cursor(self) -> None:
+        self._place(QCursor.pos(), smooth=True)
+
+    def _place(self, global_pos: QPoint, *, smooth: bool = False) -> None:
         pos = QPoint(global_pos) + QPoint(11, 16)
         screen = QGuiApplication.screenAt(global_pos) or QGuiApplication.primaryScreen()
         if screen is None:
@@ -141,7 +151,15 @@ class _MinimalTooltip(QWidget):
         y = min(max(area.top() + 6, pos.y()), area.bottom() - h - 6)
         if y < global_pos.y() and global_pos.y() - h - 10 >= area.top():
             y = global_pos.y() - h - 10
-        self.move(x, y)
+        target = QPoint(x, y)
+        if smooth:
+            delta = target - self.pos()
+            if delta.manhattanLength() > 2:
+                target = self.pos() + QPoint(round(delta.x() * 0.4), round(delta.y() * 0.4))
+                target.setX(min(max(area.left() + 6, target.x()), area.right() - w - 6))
+                target.setY(min(max(area.top() + 6, target.y()), area.bottom() - h - 6))
+        if target != self.pos():
+            self.move(target)
 
 
 class TooltipController(QObject):
@@ -212,6 +230,7 @@ def install_smooth_tooltips(app: QApplication) -> TooltipController | None:
     if existing is not None:
         return existing
     controller = TooltipController(app)
-    app.installEventFilter(controller)
+    from src.ui.app_event_filter import install_app_event_filter
+    install_app_event_filter(app, controller)
     app._mayotter_tooltip_controller = controller
     return controller

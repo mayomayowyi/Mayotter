@@ -47,10 +47,6 @@ class BoundaryActionOverlay(QWidget):
         self._breathe_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
         self._breathe_anim.setLoopCount(-1)
         self._breathe_anim.valueChanged.connect(self._on_breathe)
-        try:
-            self.winId()
-        except Exception:
-            pass
 
     def refresh_theme(self) -> None:
         self._icon_stow_left = make_stow_left_icon(_COLOR_ACCENT_SOFT, 14)

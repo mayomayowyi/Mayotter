@@ -28,6 +28,17 @@ packaging/cache/
 .venv/
 venv/
 env/
+*.egg-info/
+*.whl
+audio_visual/
+audio_visual_dev/
+.env
+.env.*
+!.env.example
+tools/ffmpeg/
+tools/denoise/*.tar.gz
+tools/denoise/*.onnx
+packaging/validation/
 
 .vscode/
 .idea/

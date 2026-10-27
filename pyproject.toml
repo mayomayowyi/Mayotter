@@ -4,21 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mayotter"
-version = "1.0.8"
+version = "1.1.2"
 description = "複数のXアカウントを表示するアプリ"
+readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = [
     "PySide6>=6.6.1",
     "numpy>=1.24",
+    "onnxruntime>=1.20",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-qt>=4.2",
-    "ruff>=0.6",
-]
+diagnostics = ["psutil>=5.9"]
+build = ["pyinstaller>=6.0"]
 
+[tool.setuptools]
+license-files = ["LICENSE", "packaging/licenses/DeepFilterNet/LICENSE-*", "src/ui/assets/fonts/OFL.txt"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.setuptools.package-data]
+"src.ui" = ["assets/*.png", "assets/fonts/*.otf", "assets/fonts/OFL.txt"]
+"src.core" = ["update_helper.ps1"]
 
 [tool.ruff]
 line-length = 100

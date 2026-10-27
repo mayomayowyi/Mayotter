@@ -1,0 +1,11 @@
+# Windows distribution AI runtime, installed by build scripts with --require-hashes.
+onnxruntime==1.29.0 \
+    --hash=sha256:4acf2b4948b7ede87221ca6332344b8facdc8059d6ac751a7d367d04532b02dd \
+    --hash=sha256:e2128f31f449e922c62dbe5d8b6b7b079f0bcaf2d56a102fa203cb6e5bb5ab19 \
+    --hash=sha256:2945e1f82f81f27e88decea88c7861f45baea23818950d467bf3909aa303119e \
+    --hash=sha256:4a3129ae56e70d2618ff773920166916310370a7e3cacb60b9e0e8910092725f
+numpy==2.5.3 \
+    --hash=sha256:0a59a421a32580a009e8a1751345bf829631b990dc1794b80514ab722b435def \
+    --hash=sha256:a5fa86b80fd24bcd1aff83ad23be44ea323de3f787be8f8b15d4a65621e25321 \
+    --hash=sha256:71cad2b2a7451ab79d8f5e71b453485b6775963d5cf794179144a7463fe6e8ec \
+    --hash=sha256:2c25dfa72943e4336ddb6b0ee4277b47a0c85bede0807530ec68103bf58e2c10

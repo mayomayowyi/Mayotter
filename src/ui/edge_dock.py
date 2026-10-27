@@ -101,8 +101,7 @@ class EdgeDetector(QObject):
 
     def set_pinned_open(self, pinned: bool) -> None:
         self._pinned_open = pinned
-        if pinned:
-            self._hide_timer.stop()
+        self._hide_timer.stop()
 
     def set_params(
         self,

@@ -111,7 +111,6 @@ def make_reset_widths_icon(color: str = _COLOR_SECONDARY, size: int = 12) -> QIc
     p.end()
     return QIcon(pm)
 
-# --- 線アイコン（24 グリッドの SVG を現在テーマ色で描く） -------------------------
 # 太さ・端・角をすべて共通にして、ボタンごとの見た目の揃いを保つ。
 # 設定（歯車）と幅リセット（循環矢印）は上の手描き実装をそのまま使う。
 
@@ -127,6 +126,7 @@ _SVG_ICONS: dict[str, tuple[str, bool]] = {
         False,
     ),
     "chevron_down": ('<path d="m5.5 8.5 6.5 7 6.5-7"/>', False),
+    "chevron_up": ('<path d="m5.5 15.5 6.5-7 6.5 7"/>', False),
     "chevron_left": ('<path d="m15.5 5.5-6.5 6.5 6.5 6.5"/>', False),
     "chevron_right": ('<path d="m8.5 5.5 6.5 6.5-6.5 6.5"/>', False),
     "back": ('<path d="M19 12H5.5M11 6.5 5.5 12l5.5 5.5"/>', False),
@@ -175,6 +175,7 @@ _GRIP_DOTS = "".join(
     f'<circle cx="{x}" cy="{y}" r="1.35"/>' for x in (9.3, 14.7) for y in (7, 12, 17)
 )
 _SVG_ICONS["column_grip"] = (_GRIP_DOTS, True)
+_SVG_ICONS["star"] = ('<path d="m12 3 2.65 5.7 6.25.75-4.6 4.3 1.15 6.2L12 17l-5.45 2.95 1.15-6.2-4.6-4.3 6.25-.75z"/>', True)
 
 
 def _svg_icon(name: str, color: str, size: int, weight: float = 1.0) -> QIcon:
@@ -201,6 +202,44 @@ def _svg_icon(name: str, color: str, size: int, weight: float = 1.0) -> QIcon:
     return QIcon(pm)
 
 
+def make_kofi_cup_icon(size: int = 18) -> QIcon:
+    # Ko-fiのカップ＋ハートを、追加画像やネット接続なしで描く。
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path fill="white" d="M3.6 5.5h13.1v10.2c0 2.2-1.8 4-4 4H7.6c-2.2 0-4-1.8-4-4z"/>'
+        '<path d="M16 7.2h2.3c4.5 0 4.5 8.3-1.4 8.3H16" '
+        'fill="none" stroke="white" stroke-width="2.7" stroke-linecap="round"/>'
+        '<path fill="#FF6276" d="M10.3 10.4c-2.2-2.9-5.3.4-2.4 3.1l2.4 2.3 2.5-2.3c2.9-2.7-.2-6-2.5-3.1z"/>'
+        '</svg>'
+    )
+    pm, painter = _blank(size)
+    QSvgRenderer(QByteArray(svg.encode("utf-8"))).render(painter, QRectF(0, 0, size, size))
+    painter.end()
+    return QIcon(pm)
+
+
+def make_star_icon(size: int = 17) -> QIcon:
+    return _svg_icon("star", "#F5D36B", size)
+
+
+def make_tally_flower_icon(size: int = 18) -> QIcon:
+    # Tallyのお問い合わせ用に、白い5枚の花びら＋中心の花形をSVGで描く。
+    # 画像の拡大に頼らず、どのサイズでも輪郭がぼやけない。
+    petals = "".join(
+        f'<ellipse cx="12" cy="8.2" rx="2.7" ry="4.1" transform="rotate({72 * i} 12 12)"/>'
+        for i in range(5)
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        f'<g fill="white">{petals}'
+        '<circle cx="12" cy="12" r="2.6"/></g></svg>'
+    )
+    pm, painter = _blank(size)
+    QSvgRenderer(QByteArray(svg.encode("utf-8"))).render(painter, QRectF(0, 0, size, size))
+    painter.end()
+    return QIcon(pm)
+
+
 def make_close_icon(color: str = _COLOR_SECONDARY, size: int = 12) -> QIcon:
     return _svg_icon("close", color, size)
 
@@ -218,6 +257,9 @@ def make_restore_icon(color: str = _COLOR_SECONDARY, size: int = 12) -> QIcon:
 
 def make_chevron_down_icon(color: str = _COLOR_SECONDARY, size: int = 14) -> QIcon:
     return _svg_icon("chevron_down", color, size)
+
+def make_chevron_up_icon(color: str = _COLOR_SECONDARY, size: int = 14) -> QIcon:
+    return _svg_icon("chevron_up", color, size)
 
 def make_chevron_left_icon(color: str = _COLOR_SECONDARY, size: int = 12) -> QIcon:
     return _svg_icon("chevron_left", color, size)
@@ -319,7 +361,27 @@ class _ThemedIconEngine(QIconEngine):
     def _raw(self) -> QIcon:
         return self._builder(*self._args, **self._kwargs)
 
+    _SHARED: dict = {}
+
     def pixmap(self, size, mode, state) -> QPixmap:
+        # 描画・レイアウトのたびに SVG を描き直すと重いので、テーマ・サイズごとに使い回す
+        try:
+            from src.ui.theme import get_theme_id
+            key = (
+                self._builder.__name__, self._args, tuple(sorted(self._kwargs.items())),
+                get_theme_id(), size.width(), size.height(), mode, state,
+            )
+            hash(key)
+        except Exception:
+            return self._pixmap_uncached(size, mode, state)
+        cache = self._SHARED
+        if key not in cache:
+            if len(cache) > 400:
+                cache.clear()
+            cache[key] = self._pixmap_uncached(size, mode, state)
+        return cache[key]
+
+    def _pixmap_uncached(self, size, mode, state) -> QPixmap:
         pm = self._raw().pixmap(size, QIcon.Mode.Normal, state)
         if mode == QIcon.Mode.Disabled and not pm.isNull():
             # 無効時は薄くする（QSS の color はアイコンに効かないため）
@@ -351,4 +413,3 @@ def _themed(builder):
 
 for _name in [n for n in list(globals()) if n.startswith("make_") and n.endswith("_icon")]:
     globals()[_name] = _themed(globals()[_name])
-

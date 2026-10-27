@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.core.i18n import tr
 
 from pathlib import Path
 from typing import Callable
@@ -16,12 +17,12 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
-    QProgressBar,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from src.ui.progress import SmoothProgressBar
 
 try:
     from src.ui.theme import (
@@ -55,10 +56,7 @@ class _DownloadWorker(QThread):
         try:
             from src.core.updater import (
                 download_release_asset,
-                clear_update_tmp,
             )
-
-            clear_update_tmp()
 
             def _cb(received, total):
                 try:
@@ -73,13 +71,12 @@ class _DownloadWorker(QThread):
             )
             if path is None:
                 self.err.emit(
-                    "ダウンロードまたは検証に失敗しました。"
-                    "（SHA-256不一致・ネットワークエラーの可能性があります）"
+                    tr('ダウンロードまたは検証に失敗しました。（SHA-256不一致・ネットワークエラーの可能性があります）')
                 )
                 return
             self.ok.emit(str(path))
         except Exception as exc:
-            self.err.emit(f"ダウンロード中にエラーが発生しました。\n{exc}")
+            self.err.emit(tr('ダウンロード中にエラーが発生しました。\n{v0}', v0=exc))
 
 
 class UpdateDialog(QDialog):
@@ -158,12 +155,12 @@ class UpdateDialog(QDialog):
         v.setContentsMargins(12, 10, 12, 12)
         v.setSpacing(8)
 
-        title = QLabel("アップデート")
+        title = QLabel(tr('アップデート'))
         title.setStyleSheet(
             f"color:{TEXT}; font-size:14px; font-weight:600; background:transparent;"
         )
         v.addWidget(title)
-        self._body = QLabel("確認しています…")
+        self._body = QLabel(tr('確認しています…'))
         self._body.setWordWrap(True)
         self._body.setStyleSheet(f"color:{TEXT}; font-size:12px; background:transparent;")
         v.addWidget(self._body)
@@ -171,22 +168,11 @@ class UpdateDialog(QDialog):
         prog_row = QHBoxLayout()
         prog_row.setContentsMargins(0, 2, 0, 0)
         prog_row.setSpacing(10)
-        self._progress = QProgressBar()
+        # 表示値はこのダイアログが自前で補間するので、メーター側の補間は使わない
+        self._progress = SmoothProgressBar(animate=False)
         self._progress.setObjectName("mayotter_update_progress")
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
-        self._progress.setTextVisible(False)
-        self._progress.setFixedHeight(12)
-        self._progress.setMinimumWidth(180)
-        self._progress.setStyleSheet(
-            f"QProgressBar#mayotter_update_progress {{"
-            f" background:{SURFACE_RAISED}; border:1px solid {BORDER};"
-            f" border-radius:6px; text-align:center; }}"
-            f"QProgressBar#mayotter_update_progress::chunk {{"
-            f" background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
-            f"  stop:0 #3d6aa8, stop:0.45 {ACCENT}, stop:1 #6a9be0);"
-            f" border-radius:5px; margin:1px; }}"
-        )
         self._progress.hide()
         self._pct_lbl = QLabel("")
         self._pct_lbl.setObjectName("mayotter_update_pct")
@@ -209,13 +195,13 @@ class UpdateDialog(QDialog):
         btn_row.addStretch(1)
 
         self._primary_btn = QToolButton()
-        self._primary_btn.setText("はい")
+        self._primary_btn.setText(tr('はい'))
         self._primary_btn.setStyleSheet(btn_ss)
         self._primary_btn.hide()
         self._secondary_btn = QToolButton()
-        self._secondary_btn.setText("いいえ")
+        self._secondary_btn.setText(tr('いいえ'))
         self._secondary_btn.setStyleSheet(btn_ss)
-        self._secondary_btn.setText("閉じる")
+        self._secondary_btn.setText(tr('閉じる'))
         btn_row.addWidget(self._primary_btn)
         btn_row.addWidget(self._secondary_btn)
         v.addLayout(btn_row)
@@ -289,6 +275,8 @@ class UpdateDialog(QDialog):
         self.finishedClosing.emit()
 
     def _fade_close(self):
+        if self._state.get('busy'):
+            return
         if self._state.get("closing"):
             return
         self._state["closing"] = True
@@ -314,7 +302,7 @@ class UpdateDialog(QDialog):
         self._progress.hide()
         self._pct_lbl.hide()
         self._primary_btn.hide()
-        self._secondary_btn.setText("閉じる")
+        self._secondary_btn.setText(tr('閉じる'))
         self._secondary_btn.setEnabled(True)
         self._secondary_btn.show()
         try:
@@ -380,10 +368,10 @@ class UpdateDialog(QDialog):
         if info is None or self._state.get("busy"):
             return
         if not getattr(info, "download_url", None):
-            self._show_message("アップデートファイルを取得できませんでした。")
+            self._show_message(tr('アップデートファイルを取得できませんでした。'))
             return
         self._set_busy(True)
-        self._body.setText("ダウンロード中…")
+        self._body.setText(tr('ダウンロード中…'))
         self._progress.setRange(0, 100)
         self._anim_state["display"] = 0.0
         self._anim_state["target"] = 0
@@ -428,12 +416,12 @@ class UpdateDialog(QDialog):
             mark_download_complete(Path(path_str), info)
             frozen = bool(getattr(sys, "frozen", False))
             if frozen and sys.platform.startswith("win"):
-                self._body.setText("更新を適用しています…")
+                self._body.setText(tr('更新を適用しています…'))
                 self._apply_display_value(100)
                 ok, msg = prepare_and_launch_self_update(Path(path_str))
                 if not ok:
                     self._set_busy(False)
-                    self._show_message(msg or "更新の適用に失敗しました。")
+                    self._show_message(msg or tr('更新の適用に失敗しました。'))
                     return
                 self._body.setText(msg)
                 self._progress.hide()
@@ -444,15 +432,15 @@ class UpdateDialog(QDialog):
                 if self._on_apply_success is not None:
                     QTimer.singleShot(400, self._on_apply_success)
             else:
+                from src.core.updater import discard_update
+                discard_update(Path(path_str).parent)
                 self._set_busy(False)
                 self._show_message(
-                    "ダウンロードが完了しました。\n"
-                    "（開発実行中は自動置換を行いません。"
-                    "配布版では再起動して更新が適用されます）"
+                    tr('ダウンロードが完了しました。\n（開発実行中は自動置換を行いません。配布版では再起動して更新が適用されます）')
                 )
         except Exception as exc:
             self._set_busy(False)
-            self._show_message(f"更新処理に失敗しました。\n{exc}")
+            self._show_message(tr('更新処理に失敗しました。\n{v0}', v0=exc))
 
     def _on_ok(self, path_str: str):
         try:
@@ -472,6 +460,14 @@ class UpdateDialog(QDialog):
         self._set_busy(False)
         self._show_message(msg)
 
+    def reject(self):
+        if not self._state.get('busy'):
+            self._fade_close()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.reject()
+
     def _on_yes(self):
         self._start_download()
 
@@ -486,17 +482,17 @@ class UpdateDialog(QDialog):
 
             info = check_for_update(github_repo=self._github_repo)
             if info is None:
-                self._show_message("新しいバージョンはありません。")
+                self._show_message(tr('新しいバージョンはありません。'))
                 return
             self._state["info"] = info
             self._body.setText(
-                f"最新版を確認しました（{info.version}）。\n今すぐ更新しますか？"
+                tr('最新版を確認しました（{v0}）。\n今すぐ更新しますか？', v0=info.version)
             )
             self._progress.hide()
             self._pct_lbl.hide()
-            self._secondary_btn.setText("いいえ")
+            self._secondary_btn.setText(tr('いいえ'))
             self._secondary_btn.setEnabled(True)
-            self._primary_btn.setText("はい")
+            self._primary_btn.setText(tr('はい'))
             self._primary_btn.show()
             self._primary_btn.setEnabled(True)
             try:
@@ -511,7 +507,7 @@ class UpdateDialog(QDialog):
             self._secondary_btn.clicked.connect(self._on_no)
             self._relayout()
         except Exception:
-            self._show_message("アップデートの確認中にエラーが発生しました。")
+            self._show_message(tr('アップデートの確認中にエラーが発生しました。'))
 
     def refresh_theme(self) -> None:
         try:
@@ -532,17 +528,6 @@ class UpdateDialog(QDialog):
                 if lbl.objectName() in ("mayotter_update_surface", "mayotter_update_progress", "mayotter_update_pct"):
                     continue
                 lbl.setStyleSheet(f"color:{color('TEXT')}; font-size:12px; background:transparent;")
-            prog = self.findChild(QProgressBar, "mayotter_update_progress")
-            if prog:
-                prog.setStyleSheet(
-                    f"QProgressBar#mayotter_update_progress {{"
-                    f" background:{color('SURFACE_RAISED')}; border:1px solid {color('BORDER')};"
-                    f" border-radius:6px; text-align:center; }}"
-                    f"QProgressBar#mayotter_update_progress::chunk {{"
-                    f" background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
-                    f"  stop:0 {color('BORDER_ACCENT')}, stop:0.45 {color('ACCENT')}, stop:1 {color('ACCENT_STRONG')});"
-                    f" border-radius:5px; margin:1px; }}"
-                )
             for btn in self.findChildren(QToolButton):
                 if btn.objectName() in ("primary_btn", "secondary_btn"):
                     btn.setStyleSheet(

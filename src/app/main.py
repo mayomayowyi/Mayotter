@@ -1,3 +1,4 @@
+from src.core.i18n import tr
 
 
 import sys
@@ -6,6 +7,8 @@ def main() -> int:
     import os
 
     flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    from src.browser.tls_security import require_safe_chromium_flags
+    require_safe_chromium_flags(flags)
     # 通信まわりだけを強める。GPU 描画系のフラグは黒残像など描画不具合の原因になり得るので触らない。
     #  - 並列ダウンロード: Range 対応サーバーの大きなファイルを複数接続で取得
     #  - QUIC/HTTP3: 接続確立の往復を減らす
@@ -74,6 +77,10 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     settings_manager = SettingsManager()
+    from src.core.i18n import set_language
+    from src.ui.fonts import apply_language_font
+    set_language(settings_manager.get_ui_language())
+    apply_language_font(app, settings_manager.get_ui_language())
     try:
         from src.ui.theme import set_theme, install_theme_filter, apply_theme_to_application
         set_theme(settings_manager.get_ui_theme())
@@ -144,8 +151,7 @@ def main() -> int:
             root.addLayout(title_row)
 
             msg = QLabel(
-                "すでに同じデータ領域でMayotterが起動しています。\n"
-                f"（{DATA_DIR}）"
+                tr('すでに同じデータ領域でMayotterが起動しています。\n（{v0}）', v0=DATA_DIR)
             )
             msg.setWordWrap(True)
             msg.setStyleSheet("color:#eaf1fb; font-size:12px;")
@@ -153,7 +159,7 @@ def main() -> int:
 
             btn_row = QHBoxLayout()
             btn_row.addStretch(1)
-            ok_btn = QPushButton("OK")
+            ok_btn = QPushButton(tr('OK'))
             ok_btn.setMinimumWidth(56)
             btn_row.addWidget(ok_btn)
             root.addLayout(btn_row)
@@ -237,6 +243,52 @@ def main() -> int:
         return 1
     app._mayotter_instance_lock = lock
 
+    from src.core.paths import IS_INSTALLED
+    if IS_INSTALLED:
+        from src.core.single_instance import create_installer_mutex
+        app._mayotter_installer_mutex = create_installer_mutex()
+        from src.ui.migration_dialog import run_startup_migration
+        from src.core import portable_migration as _migration
+        try:
+            status_before = _migration.read_state(DATA_DIR).get('status')
+        except (OSError, ValueError, _migration.MigrationError):
+            status_before = None
+        if not run_startup_migration(DATA_DIR):
+            lock.release()
+            return 1
+        try:
+            imported_now = status_before != 'complete' and _migration.read_state(DATA_DIR).get('status') == 'complete'
+        except (OSError, ValueError, _migration.MigrationError):
+            imported_now = False
+        if imported_now:
+            # 移行したプロファイル（Cookie・ログイン状態）は、移行の前後で WebEngine を一度も初期化していない
+            # 新しいプロセスで読み込む。最初に開くプロファイルだけ引き継ぎが不完全に見える問題への安全策（初回のみ）
+            from src.app.restart import launch_after_exit
+            _migration.diagnose(DATA_DIR, 'restart_after_import')
+            launch_after_exit()
+            lock.release()
+            return 0
+        settings_manager = SettingsManager()
+        set_language(settings_manager.get_ui_language())
+        apply_language_font(app, settings_manager.get_ui_language())
+        from src.ui.theme import set_theme, apply_theme_to_application
+        set_theme(settings_manager.get_ui_theme())
+        apply_theme_to_application(app)
+
+
+    from src.core.paths import PROFILES_DIR
+    if settings_manager.needs_language_selection(PROFILES_DIR):
+        from src.ui.language_dialog import choose_first_language
+        if not choose_first_language(settings_manager):
+            lock.release()
+            return 0
+
+    if settings_manager.get_ui_language() == 'zh-CN':
+        from PySide6.QtCore import QLibraryInfo, QTranslator
+        translator = QTranslator(app)
+        if translator.load('qtbase_zh_CN', QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)):
+            app.installTranslator(translator)
+            app._qt_language_translator = translator
 
     try:
         app.setStyleSheet(
@@ -253,6 +305,8 @@ def main() -> int:
         )
     except Exception:
         pass
+    # 初回の言語選択の結果を反映し、setStyleSheet で戻ったメニュー等のフォントも揃える
+    apply_language_font(app, settings_manager.get_ui_language())
     app.setApplicationName(APP_NAME)
     try:
         app.setApplicationVersion(APP_VERSION)
@@ -301,12 +355,33 @@ def main() -> int:
         _schedule_startup_update_check(app, window, settings_manager)
     except Exception:
         pass
+    if IS_INSTALLED:
+        # 移行後のSetup版が起動し、移行したアカウントを読み込めたら、旧ZIP版の削除を提案する
+        def offer_legacy_removal():
+            try:
+                from src.core.paths import APP_BASE_DIR as program_dir
+                from src.ui.migration_dialog import offer_legacy_removal as offer
+                if window.isVisible():
+                    offer(DATA_DIR, set(getattr(window, '_known_accounts', {})), window, (program_dir, DATA_DIR))
+            except Exception:
+                pass
+        QTimer.singleShot(2500, offer_legacy_removal)
 
     code = app.exec()
     try:
         lock.release()
     except Exception:
         pass
+    if getattr(window, '_restart_requested', False):
+        from src.app.restart import launch_after_exit
+        try:
+            window._shutdown_trace('language_restart_waiter_start')
+            launch_after_exit()
+            window._shutdown_trace('language_restart_waiter_started')
+        except OSError as exc:
+            window.setEnabled(True)
+            window._show_settings_error_dialog(tr('再起動できませんでした。Mayotterを起動し直してください。\n{v0}',
+                                                  language=settings_manager.get_ui_language(), v0=exc))
     return code
 
 def _show_startup_update_notice(parent, version: str) -> None:
@@ -333,7 +408,7 @@ def _show_startup_update_notice(parent, version: str) -> None:
     dlg = QDialog(parent)
     dlg.setObjectName("mayotter_startup_update_notice")
     dlg.setModal(False)
-    dlg.setWindowTitle("アップデート")
+    dlg.setWindowTitle(tr('アップデート'))
     dlg.setWindowFlags(
         Qt.WindowType.Dialog
         | Qt.WindowType.FramelessWindowHint
@@ -362,13 +437,13 @@ def _show_startup_update_notice(parent, version: str) -> None:
     v.setContentsMargins(16, 14, 16, 14)
     v.setSpacing(10)
 
-    title = QLabel("アップデート")
+    title = QLabel(tr('アップデート'))
     title.setStyleSheet(
         f"color:{TEXT}; font-size:14px; font-weight:600; background:transparent;"
     )
     v.addWidget(title)
 
-    body = QLabel(f"新しいバージョンがあります: {ver}")
+    body = QLabel(tr('新しいバージョンがあります: {v0}', v0=ver))
     body.setWordWrap(True)
     body.setStyleSheet(f"color:{TEXT}; font-size:12px; background:transparent;")
     v.addWidget(body)
@@ -382,10 +457,10 @@ def _show_startup_update_notice(parent, version: str) -> None:
     row = QHBoxLayout()
     row.addStretch(1)
     check_btn = QToolButton()
-    check_btn.setText("今すぐ確認")
+    check_btn.setText(tr('今すぐ確認'))
     check_btn.setStyleSheet(_btn_ss)
     later_btn = QToolButton()
-    later_btn.setText("あとで")
+    later_btn.setText(tr('あとで'))
     later_btn.setStyleSheet(_btn_ss)
     row.addWidget(check_btn)
     row.addWidget(later_btn)

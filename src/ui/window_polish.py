@@ -383,5 +383,6 @@ def install_window_polish(app) -> None:
     if app is None or getattr(app, "_mayotter_window_polish_filter", None) is not None:
         return
     filt = _WindowPolishFilter(app)
-    app.installEventFilter(filt)
+    from src.ui.app_event_filter import install_app_event_filter
+    install_app_event_filter(app, filt)
     app._mayotter_window_polish_filter = filt

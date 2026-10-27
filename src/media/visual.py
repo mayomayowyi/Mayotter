@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+from src.core.i18n import tr
 
 import struct
 import wave
@@ -9,6 +10,92 @@ from src.ui.theme import color as theme_color
 
 # 出力する動画の背景（画像が無いとき）。アプリのテーマに左右されず、半透明の白い波形が映える暗色にする
 VIDEO_BG = "#0f1117"
+
+# 試験的な輪郭平滑化。旧デザインに戻す場合は False にする。
+WAVEFORM_CONTOUR_SMOOTHING = True
+
+def _smooth_waveform_contour(levels: list[float]) -> list[float]:
+    """円形波形の細かなギザつきだけ抑える。音声や時間方向の振幅には触れない。"""
+    n = len(levels)
+    if n < 7:
+        return list(levels)
+    weights = (1, 6, 15, 20, 15, 6, 1)
+    smoothed = [
+        sum(levels[(i + k - 3) % n] * weight for k, weight in enumerate(weights)) / 64.0
+        for i in range(n)
+    ]
+    # 元の凹凸をわずかに残し、細い山も完全には消さない。
+    blended = [0.15 * a + 0.85 * b for a, b in zip(levels, smoothed)]
+    peak = max(levels)
+    smooth_peak = max(blended)
+    if peak > 0.0 and smooth_peak > 0.0:
+        # 波形全体が痩せないよう、ピーク減少を最大20%だけ補正する。
+        gain = min(1.2, peak / smooth_peak)
+        blended = [min(1.0, x * gain) for x in blended]
+    return blended
+
+def _fold_frequency_circle(levels: list[float]) -> list[float]:
+    """低域→高域→低域の往復配置。高域と低域が円周の端で直結しない。"""
+    n = len(levels)
+    if n < 4:
+        return list(levels)
+    import math
+    out = []
+    for i in range(n):
+        # cosine写像で低域と高域の折り返し点の傾きも0にする。
+        # 0度と360度が低域、180度が高域で、継ぎ目や尖りが生じない。
+        progress = 0.5 - 0.5 * math.cos(2.0 * math.pi * i / n)
+        pos = progress * (n - 1)
+        k = min(n - 1, int(pos))
+        nxt = min(n - 1, k + 1)
+        u = pos - k
+        out.append(float(levels[k] * (1.0 - u) + levels[nxt] * u))
+    return out
+
+
+def _raw_rms_at(samples: list[float], rate: int, t_sec: float) -> float:
+    """解析用ゲインをかける前の波形から約46msの実音量を得る。"""
+    import math
+    if not samples or rate <= 0:
+        return 0.0
+    width = max(256, min(4096, int(rate * 0.046)))
+    center = int(t_sec * rate)
+    lo = max(0, center - width // 2)
+    hi = min(len(samples), center + width // 2)
+    if hi <= lo:
+        return 0.0
+    try:
+        import numpy as np
+        section = np.asarray(samples[lo:hi], dtype=np.float64)
+        return float(np.sqrt(np.mean(section * section)))
+    except Exception:
+        return math.sqrt(sum(float(x) ** 2 for x in samples[lo:hi]) / (hi - lo))
+
+
+def _quiet_rms_floor(rms_values: list[float]) -> float:
+    """小音量録音を持ち上げても、無音・定常ノイズを拡大しない基準。"""
+    if not rms_values:
+        return 0.0
+    # デジタル無音(0)と一定の環境ノイズが混在する場合、0だけを
+    # ノイズフロアとするとノイズが可視化される。微小な非0区間を採用する。
+    nonzero = sorted(max(0.0, v) for v in rms_values if v >= 0.00035)
+    if not nonzero:
+        return 0.0
+    quiet = nonzero[int((len(nonzero) - 1) * 0.15)]
+    loud = nonzero[int((len(nonzero) - 1) * 0.85)]
+    # 常時大音量の音楽・声を、定常ノイズとして消さない。
+    if loud >= 0.035 and quiet >= loud * 0.70:
+        return min(quiet, 0.003)
+    return min(quiet, 0.010)
+
+
+def _audio_activity(raw_rms: float, quiet_floor: float) -> float:
+    """無音時は厳密に0。声の立ち上がりは滑らかなソフトニーで通す。"""
+    low = max(0.0009, quiet_floor * 1.55)
+    high = max(0.0025, low * 2.25)
+    x = max(0.0, min(1.0, (max(0.0, raw_rms) - low) / (high - low)))
+    return x * x * (3.0 - 2.0 * x)
+
 
 def _theme_qcolor(role: str, alpha: int | None = None):
     from PySide6.QtGui import QColor
@@ -54,6 +141,15 @@ def decode_audio_to_wav(src: str | Path, dst: Path) -> Path | None:
     except Exception:
         pass
     return None
+
+def _is_int_pcm_wav(path: str | Path) -> bool:
+    """解析用に直接読める 8/16bit 整数 PCM の WAV か（32bit float 等は変換して解析する）。"""
+    try:
+        with wave.open(str(path), "rb") as w:
+            return w.getsampwidth() in (1, 2)
+    except Exception:
+        return False
+
 
 def _load_mono_pcm(audio_path: str | Path) -> tuple[list[float], int, float]:
     path = Path(audio_path)
@@ -266,7 +362,7 @@ def _visual_map_levels(
     if peak <= 1e-6:
         return [0.0] * len(vals)
 
-    if rms is not None and rms > 0.0:
+    if rms is not None:
         raw = max(0.0, min(1.0, float(rms) * 1.15))
     else:
         raw = max(0.0, min(1.0, peak))
@@ -518,6 +614,11 @@ def _paint_frame(
         else:
             levels = list(levels)
 
+    # FFTの先頭（低音）と末尾（高音）が接する継ぎ目をなくす。
+    levels = _fold_frequency_circle(levels)
+    if WAVEFORM_CONTOUR_SMOOTHING:
+        levels = _smooth_waveform_contour(levels)
+
     def _soft_amp(a: float) -> float:
         a = max(0.0, float(a))
         return math.tanh(1.15 * a)
@@ -541,6 +642,27 @@ def _paint_frame(
 
     outer_path = _closed_catmull_rom_path(outer_pts)
     inner_rect = QRectF(cx - base_r, cy - base_r, base_r * 2.0, base_r * 2.0)
+
+    # 水紋：音があるときだけ、波形の外側に薄い同心円を放射する。
+    # phaseは経過時間で進むが、振幅が0なら描画しないため無音では動かない。
+    activity = max(amps2, default=0.0)
+    if activity > 0.015:
+        for ring in range(3):
+            phase = (current_sec * 0.52 + ring / 3.0) % 1.0
+            fade = (1.0 - phase) ** 1.7
+            alpha = int(min(62, 62.0 * fade * min(1.0, activity * 1.65)))
+            if alpha < 3:
+                continue
+            ripple_pts = []
+            travel = max_ext * (0.32 + 1.15 * phase)
+            for i, amp in enumerate(amps2):
+                ang = (2.0 * math.pi * i / n2) - math.pi / 2.0
+                r = base_r + baseline + travel + max_ext * 0.16 * _soft_amp(amp) * fade
+                ripple_pts.append(QPointF(cx + math.cos(ang) * r,
+                                           cy + math.sin(ang) * r))
+            p.setPen(QPen(QColor(184, 225, 255, alpha), 1.4))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(_closed_catmull_rom_path(ripple_pts))
 
     p.setPen(Qt.PenStyle.NoPen)
     p.setBrush(QBrush(QColor(255, 255, 255, 170)))
@@ -617,6 +739,14 @@ def write_mayotter_audio_frame(
         samples, rate, max(0.0, duration_seconds * 0.5), n_bars=128
     )
     levels = _visual_map_levels(levels, rms=float((_info or {}).get("rms", 0.0) or 0.0))
+    if samples:
+        clip_seconds = len(samples) / max(1, rate)
+        floor = _quiet_rms_floor([
+            _raw_rms_at(samples, rate, clip_seconds * (i + 0.5) / 32.0)
+            for i in range(32)
+        ])
+        activity = _audio_activity(_raw_rms_at(samples, rate, max(0.0, duration_seconds * 0.5)), floor)
+        levels = [v * activity for v in levels]
     center = None
     bg = None
     if center_image_path:
@@ -706,6 +836,7 @@ def generate_waveform_mp4(
     crop_y: float = 0.0,
     scale: float = 1.0,
     rotation: float = 0.0,
+    audio_rate: int = 44100,
 ) -> Path:
     from PySide6.QtGui import QImage, QGuiApplication
     import os
@@ -726,7 +857,7 @@ def generate_waveform_mp4(
 
     analysis_wav = audio_path
     temp_wav = None
-    if audio_path.suffix.lower() != ".wav":
+    if audio_path.suffix.lower() != ".wav" or not _is_int_pcm_wav(audio_path):
         from src.media.media_converter import media_temp_dir
         import uuid
 
@@ -736,12 +867,22 @@ def generate_waveform_mp4(
             analysis_wav = decoded
 
     samples, rate, wav_dur = _load_mono_pcm(analysis_wav)
-    samples = _level_for_analysis(samples, rate)
 
     dur = duration_seconds
     if dur is None or dur <= 0:
         dur = wav_dur or probe_duration_seconds(audio_path) or 1.0
     dur = max(0.2, float(dur))
+
+    # 生音量から静音区間を判定し、その後でFFT用のゲインを調整する。
+    # ノイズまで持ち上げられたFFT値をゲートの入力に使わない。
+    # 実際のFPS選定と独立した20HzのRMS包絡を先に求める。
+    envelope_hz = 20.0
+    raw_rms_envelope = [
+        _raw_rms_at(samples, rate, min(dur, i / envelope_hz))
+        for i in range(max(2, int(round(dur * envelope_hz)) + 1))
+    ]
+    quiet_rms = _quiet_rms_floor(raw_rms_envelope)
+    samples = _level_for_analysis(samples, rate)
 
     center_img = None
     bg_color = None
@@ -771,7 +912,7 @@ def generate_waveform_mp4(
     prev_levels: list[float] | None = None
     for ai in range(n_analysis):
         if cancel_flag is not None and cancel_flag():
-            raise FFmpegError("変換がキャンセルされました")
+            raise FFmpegError(tr('変換がキャンセルされました'))
         t_a = min(dur, ai / analysis_hz)
         levels, _info = _spectrum_bars_at_time(
             samples,
@@ -804,7 +945,7 @@ def generate_waveform_mp4(
         "-tune", "animation",
         "-c:a", "aac",
         "-b:a", "192k",
-        "-ar", "44100",
+        "-ar", str(int(audio_rate)),
         "-shortest",
         "-movflags", "+faststart",
         str(output_path),
@@ -818,7 +959,7 @@ def generate_waveform_mp4(
         for fi in range(n_frames):
             if cancel_flag is not None and cancel_flag():
                 proc.kill()
-                raise FFmpegError("変換がキャンセルされました")
+                raise FFmpegError(tr('変換がキャンセルされました'))
             t = fi / float(fps)
             pos = min(len(spectrum_frames) - 1.001, t * analysis_hz)
             i0 = int(pos)
@@ -832,6 +973,14 @@ def generate_waveform_mp4(
             rms1 = rms_frames[i1] if i1 < len(rms_frames) else rms0
             rms_i = rms0 * (1.0 - u) + rms1 * u
             levels = _visual_map_levels(levels, rms=rms_i)
+            raw_pos = min(len(raw_rms_envelope) - 1.000001, t * envelope_hz)
+            raw_i0 = int(raw_pos)
+            raw_i1 = min(raw_i0 + 1, len(raw_rms_envelope) - 1)
+            raw_frac = raw_pos - raw_i0
+            actual_rms = (raw_rms_envelope[raw_i0] * (1.0 - raw_frac)
+                          + raw_rms_envelope[raw_i1] * raw_frac)
+            activity = _audio_activity(actual_rms, quiet_rms)
+            levels = [v * activity for v in levels]
             if frame_img is None:
                 frame_img = QImage(width, height, QImage.Format.Format_RGB888)
             _paint_frame(
@@ -841,10 +990,11 @@ def generate_waveform_mp4(
                 height=height,
                 center_image=center_img,
                 bg_color=bg_color,
+                current_sec=t,
             )
             ptr = frame_img.constBits()
             if ptr is None:
-                raise FFmpegError("frame buffer unavailable")
+                raise FFmpegError(tr('frame buffer unavailable'))
             try:
                 buf = bytes(ptr)
             except TypeError:
@@ -895,11 +1045,11 @@ def generate_waveform_mp4(
     if rc_s != 0:
         msg = b"".join(stderr_tail[-5:]).decode("utf-8", errors="replace")[:400]
         raise FFmpegError(
-            f"waveform MP4 encode failed (code {format_process_rc(rc)}): {msg}"
+            tr('waveform MP4 encode failed (code {v0}): {v1}', v0=format_process_rc(rc), v1=msg)
         )
 
     if not output_path.is_file() or output_path.stat().st_size < 32:
-        raise FFmpegError("MP4 の生成に失敗しました（出力が空です）")
+        raise FFmpegError(tr('MP4 の生成に失敗しました（出力が空です）'))
     if progress_cb is not None:
         progress_cb(1.0)
     return output_path
@@ -945,9 +1095,9 @@ def make_recording_overlay(parent=None):
             self._seconds = max(0, int(seconds))
             self.update()
 
-        def set_processing(self, message: str = "音声を処理中…") -> None:
+        def set_processing(self, message: str = tr('音声を処理中…')) -> None:
             self._mode = "processing"
-            self._status_text = message or "音声を処理中…"
+            self._status_text = message or tr('音声を処理中…')
             if self._spin_timer is None:
                 self._spin_timer = QTimer(self)
                 self._spin_timer.setInterval(40)
@@ -958,7 +1108,7 @@ def make_recording_overlay(parent=None):
 
         def set_error(self, message: str) -> None:
             self._mode = "error"
-            self._status_text = message or "音声の処理に失敗しました"
+            self._status_text = message or tr('音声の処理に失敗しました')
             self._stop_spin()
             self.update()
 
@@ -1096,14 +1246,14 @@ def make_recording_overlay(parent=None):
                 p.drawText(
                     QRectF(0, h - 30, w, 22),
                     int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-                    self._status_text or "音声を処理中…",
+                    self._status_text or tr('音声を処理中…'),
                 )
             elif self._mode == "error":
                 p.setPen(_theme_qcolor("DANGER"))
                 p.drawText(
                     QRectF(12, h - 30, w - 24, 22),
                     int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-                    self._status_text or "音声の処理に失敗しました",
+                    self._status_text or tr('音声の処理に失敗しました'),
                 )
             else:
                 m, s = divmod(self._seconds, 60)

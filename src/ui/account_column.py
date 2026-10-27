@@ -1,4 +1,7 @@
 from __future__ import annotations
+from src.core.i18n import tr
+from contextlib import contextmanager
+from shiboken6 import isValid
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -16,6 +19,8 @@ from PySide6.QtCore import (
     QSize, Qt, Signal, QEvent, QTimer, QPoint, QPointF, QRectF,
     QEasingCurve, QVariantAnimation,
 )
+from PySide6.QtWebEngineCore import QWebEnginePage
+
 from PySide6.QtGui import (
     QMouseEvent, QResizeEvent, QColor, QIcon, QPainter,
     QPen, QPainterPath, QPaintEvent, QFont, QFontMetrics,
@@ -28,6 +33,7 @@ from src.ui.icons import (
     make_back_icon,
     make_forward_icon,
     make_chevron_down_icon,
+    make_chevron_up_icon,
     make_expand_h_icon,
     make_column_grip_icon,
     install_close_icon,
@@ -90,12 +96,12 @@ class _UrlBar(QLineEdit):
         can_edit = not self.isReadOnly()
         has_sel = bool(sel)
         has_text = bool(text.strip())
-        act_undo = QAction("元に戻す", menu)
-        act_redo = QAction("やり直す", menu)
-        act_cut = QAction("切り取り", menu)
-        act_copy = QAction("コピー", menu)
-        act_paste = QAction("貼り付けて検索", menu)
-        act_sel = QAction("すべて選択", menu)
+        act_undo = QAction(tr('元に戻す'), menu)
+        act_redo = QAction(tr('やり直す'), menu)
+        act_cut = QAction(tr('切り取り'), menu)
+        act_copy = QAction(tr('コピー'), menu)
+        act_paste = QAction(tr('貼り付けて検索'), menu)
+        act_sel = QAction(tr('すべて選択'), menu)
         act_undo.setEnabled(can_edit and bool(getattr(self, "isUndoAvailable", lambda: False)()))
         act_redo.setEnabled(can_edit and bool(getattr(self, "isRedoAvailable", lambda: False)()))
         act_cut.setEnabled(can_edit and has_sel)
@@ -244,7 +250,20 @@ class _BoundaryHintBar(QWidget):
 
 
 class _WebViewHost(QWidget):
+    @contextmanager
+    def defer_webview_geometry(self):
+        previous = getattr(self, "_geometry_sync_deferred", False)
+        self._geometry_sync_deferred = True
+        try:
+            yield
+        finally:
+            self._geometry_sync_deferred = previous
+            if not previous:
+                self.sync_webview_geometry()
+
     def sync_webview_geometry(self, webview: XWebView | None = None) -> None:
+        if getattr(self, "_geometry_sync_deferred", False):
+            return
         targets = [webview] if webview is not None else None
         if targets is None:
             targets = [c for c in self.children() if isinstance(c, XWebView)]
@@ -929,7 +948,7 @@ class _ColumnDragHandle(QWidget):
         self.setFixedSize(20, 28)
         self.setCursor(Qt.CursorShape.SizeAllCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setToolTip("ドラッグしてカラムを並べ替え")
+        self.setToolTip(tr('ドラッグしてカラムを並べ替え'))
         self._pressed = False
         self._dragging = False
         self._press_x = 0.0
@@ -1015,7 +1034,7 @@ class RefreshMotionButton(QToolButton):
         super().__init__(parent)
         self.setFixedSize(26, 26)
         self.setObjectName("reload_btn")
-        self.setToolTip("再読み込み")
+        self.setToolTip(tr('再読み込み'))
         self.setText("")
         self.setIcon(QIcon())
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1097,7 +1116,7 @@ class RefreshMotionButton(QToolButton):
         ):
             self._pending_complete = True
             remain = max(0, int(self._min_refresh_ms - elapsed))
-            QTimer.singleShot(remain, lambda g=gen: self._begin_complete_for(g))
+            QTimer.singleShot(remain, self, lambda g=gen: self._begin_complete_for(g))
             return
         self._begin_complete_for(gen)
 
@@ -1341,7 +1360,7 @@ class AccountColumn(QWidget):
         self._back_btn.setText("")
         self._back_btn.setFixedSize(26, 26)
         self._back_btn.setObjectName("back_btn")
-        self._back_btn.setToolTip("戻る")
+        self._back_btn.setToolTip(tr('戻る'))
         self._back_btn.clicked.connect(self._on_back)
         nav_bar.addWidget(self._back_btn)
 
@@ -1351,10 +1370,12 @@ class AccountColumn(QWidget):
         self._forward_btn.setText("")
         self._forward_btn.setFixedSize(26, 26)
         self._forward_btn.setObjectName("forward_btn")
-        self._forward_btn.setToolTip("進む")
+        self._forward_btn.setToolTip(tr('進む'))
         self._forward_btn.clicked.connect(self._on_forward)
         nav_bar.addWidget(self._forward_btn)
         self._nav_hist_bound_page = None
+        self._nav_back_action = None
+        self._nav_forward_action = None
 
         self._reload_btn = RefreshMotionButton(self)
         self._reload_btn.clicked.connect(self._on_reload)
@@ -1366,7 +1387,7 @@ class AccountColumn(QWidget):
         self._home_btn.setText("")
         self._home_btn.setFixedSize(26, 26)
         self._home_btn.setObjectName("home_btn")
-        self._home_btn.setToolTip("初期ページへ戻る")
+        self._home_btn.setToolTip(tr('初期ページへ戻る'))
         self._home_btn.clicked.connect(self.go_home)
         nav_bar.addWidget(self._home_btn)
         # 境界の ↔ カーソルを親から継承しないよう矢印を明示する
@@ -1386,7 +1407,7 @@ class AccountColumn(QWidget):
         self._stow_btn.setText("")
         self._stow_btn.setFixedSize(26, 26)
         self._stow_btn.setObjectName("stow_self_btn")
-        self._stow_btn.setToolTip("このカラムを収納")
+        self._stow_btn.setToolTip(tr('このカラムを収納'))
         self._stow_btn.setAutoRaise(True)
         self._stow_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._stow_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1395,7 +1416,7 @@ class AccountColumn(QWidget):
 
         self._url_bar = _UrlBar()
         self._url_bar.setObjectName("url_bar")
-        self._url_bar.setPlaceholderText("URL または検索キーワード")
+        self._url_bar.setPlaceholderText(tr('URL または検索キーワード'))
         self._url_bar.setMinimumHeight(26)
         self._url_bar.clicked.connect(self.url_edit_requested)
         nav_bar.addWidget(self._url_bar, 1)
@@ -1404,12 +1425,14 @@ class AccountColumn(QWidget):
         install_close_icon(close_btn, 12)
         close_btn.setFixedSize(24, 24)
         close_btn.setObjectName("close_btn")
-        close_btn.setToolTip("カラムを閉じる")
+        close_btn.setToolTip(tr('カラムを閉じる'))
         close_btn.clicked.connect(self._on_close)
         nav_bar.addWidget(close_btn)
         self._close_btn = close_btn
 
         layout.addWidget(nav_frame)
+        self._build_page_find_bar()
+        layout.addWidget(self._page_find_bar)
 
         self._body = QWidget(self)
         self._body.setObjectName("column_body")
@@ -1484,10 +1507,8 @@ class AccountColumn(QWidget):
             self._reload_btn.bind_webview(webview)
         except Exception:
             pass
-        try:
-            self._bind_nav_history(webview)
-        except Exception:
-            pass
+        # QtWebEngine の履歴状態は WebView 構築中に照会しない。
+        QTimer.singleShot(0, lambda: self._bind_nav_history(self.current_webview()))
 
         self._drag_armed = False
         self._drag_press_x = 0.0
@@ -1528,6 +1549,8 @@ class AccountColumn(QWidget):
             return None
         if webview.parentWidget() is not host:
             webview.setParent(host)
+        webview.loadStarted.connect(lambda w=webview: self._page_find_load_started(w))
+        webview.loadFinished.connect(lambda _ok, w=webview: self._page_find_load_finished(w))
         try:
             if hasattr(host, "sync_webview_geometry"):
                 host.sync_webview_geometry(webview)
@@ -1598,10 +1621,15 @@ class AccountColumn(QWidget):
         if pending:
             try:
                 active._pending_restore_url = None
+                active._scheduled_restore_url = str(pending)
             except Exception:
                 pass
 
             def _do_load(w=active, u=str(pending)):
+                w._scheduled_restore_url = None
+                if getattr(self, "_workspace_suspended", False):
+                    w._pending_restore_url = u
+                    return
                 try:
                     # サイズが確定して表示された後にロードする
                     if w is self.current_webview() and not w.isVisible():
@@ -1653,37 +1681,173 @@ class AccountColumn(QWidget):
             self._bind_nav_history(active)
         except Exception:
             pass
+        if active is not self._page_find_target:
+            self._stop_page_find_highlight()
+            self._apply_page_find(query_changed=True)
+
+    def _build_page_find_bar(self) -> None:
+        self._page_find_target = None
+        self._page_find_request = 0
+        self._page_find_composing = False
+        bar = QFrame(self)
+        bar.setObjectName("page_find_bar")
+        bar.setFixedHeight(34)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(4, 4, 4, 4)
+        row.setSpacing(2)
+        edit = QLineEdit(bar)
+        edit.setObjectName("page_find_input")
+        edit.setPlaceholderText(tr('検索文字列を入力…'))
+        edit.setClearButtonEnabled(True)
+        edit.setMinimumWidth(0)
+        edit.setFixedHeight(26)
+        edit.installEventFilter(self)
+        edit.textChanged.connect(lambda _text: self._apply_page_find(query_changed=True))
+        edit.returnPressed.connect(self.find_next_in_page)
+        row.addWidget(edit, 1)
+        self._page_find_input = edit
+        self._page_find_count = QLabel("", bar)
+        self._page_find_count.setObjectName("page_find_count")
+        self._page_find_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._page_find_count.setFixedWidth(42)
+        row.addWidget(self._page_find_count)
+        for name, tip, callback in (
+            ("previous", tr('前の候補 (Shift+Enter / Shift+F3)'), self.find_previous_in_page),
+            ("next", tr('次の候補 (Enter / F3)'), self.find_next_in_page),
+            ("close", tr('検索を閉じる (Esc)'), self.close_page_find),
+        ):
+            button = QToolButton(bar)
+            button.setObjectName(f"page_find_{name}")
+            if name == "close":
+                install_close_icon(button, 12)
+            else:
+                icon = make_chevron_up_icon if name == "previous" else make_chevron_down_icon
+                button.setIcon(icon(_COLOR_SECONDARY, 14))
+                button.setIconSize(QSize(14, 14))
+            button.setToolTip(tip)
+            button.setFixedSize(26, 26)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(callback)
+            row.addWidget(button)
+        bar.hide()
+        self._page_find_bar = bar
+
+    def _stop_page_find_highlight(self) -> None:
+        self._page_find_request += 1
+        view = self._page_find_target
+        self._page_find_target = None
+        self._page_find_count.clear()
+        self._page_find_count.setToolTip("")
+        if view is not None and isValid(view):
+            view.page().findText("")
+
+    def _apply_page_find(self, *, backward: bool = False, query_changed: bool = False) -> None:
+        view = self.current_webview()
+        if query_changed or view is not self._page_find_target:
+            self._stop_page_find_highlight()
+        query = self._page_find_input.text()
+        if self._page_find_bar.isHidden() or not query or not self.isVisible():
+            return
+        page = view.page()
+        if page.isLoading():
+            return
+        self._page_find_target = view
+        self._page_find_request += 1
+        request = self._page_find_request
+        self._page_find_count.setText("…")
+
+        def report(result):
+            if (not isValid(self) or not isValid(view)
+                    or request != self._page_find_request
+                    or self._page_find_bar.isHidden()
+                    or view is not self.current_webview()
+                    or view.page() is not page
+                    or self._page_find_input.text() != query):
+                return
+            total, active = result.numberOfMatches(), result.activeMatch()
+            self._page_find_count.setText(f"{active}/{total}")
+            self._page_find_count.setToolTip("" if total else tr('一致する文字列がありません'))
+
+        flags = QWebEnginePage.FindFlag.FindBackward if backward else QWebEnginePage.FindFlag(0)
+        page.findText(query, flags, report)
+
+    def _page_find_load_started(self, view) -> None:
+        if view is self.current_webview():
+            self._stop_page_find_highlight()
+
+    def _page_find_load_finished(self, view) -> None:
+        if view is self.current_webview():
+            self._apply_page_find(query_changed=True)
+
+    def open_page_find(self, *, backward: bool = False) -> None:
+        self.activated.emit()
+        if self._page_find_bar.isHidden():
+            self._page_find_bar.show()
+            self.layout().activate()
+            self._apply_page_find(backward=backward, query_changed=True)
+        self._page_find_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self._page_find_input.selectAll()
+
+    def find_next_in_page(self) -> None:
+        if self._page_find_bar.isHidden():
+            self.open_page_find()
+        else:
+            self._apply_page_find()
+
+    def find_previous_in_page(self) -> None:
+        if self._page_find_bar.isHidden():
+            self.open_page_find(backward=True)
+        else:
+            self._apply_page_find(backward=True)
+
+    def close_page_find(self) -> None:
+        self._stop_page_find_highlight()
+        self._page_find_bar.hide()
+        self.layout().activate()
+        self.current_webview().setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _bind_nav_history(self, wv) -> None:
-        prev_page = getattr(self, "_nav_hist_bound_page", None)
+        prev_page = self._nav_hist_bound_page
         page = None
         try:
             page = wv.page() if wv is not None else None
         except Exception:
-            page = None
-        if prev_page is not None and prev_page is not page:
-            try:
-                hist = prev_page.history()
-                hist.historyChanged.disconnect(self._update_nav_history_buttons)
-            except Exception:
-                pass
-            try:
-                prev_page.urlChanged.disconnect(self._update_nav_history_buttons)
-            except Exception:
-                pass
-        self._nav_hist_bound_page = page
-        if page is None:
+            pass
+        if prev_page is page and self._nav_back_action is not None:
             self._update_nav_history_buttons()
             return
-        try:
-            hist = page.history()
-            hist.historyChanged.connect(self._update_nav_history_buttons)
-        except Exception:
-            pass
-        try:
-            page.urlChanged.connect(self._update_nav_history_buttons)
-        except Exception:
-            pass
+        for action in (self._nav_back_action, self._nav_forward_action):
+            if action is not None:
+                try:
+                    action.changed.disconnect(self._update_nav_history_buttons)
+                except (RuntimeError, TypeError):
+                    pass
+        if prev_page is not None:
+            try:
+                prev_page.urlChanged.disconnect(self._update_nav_history_buttons)
+            except (RuntimeError, TypeError):
+                pass
+        self._nav_hist_bound_page = page
+        self._nav_back_action = None
+        self._nav_forward_action = None
+        if page is not None:
+            # QWebEngineHistory.canGoBack/Forward はページ構築中にアクセス違反を起こした。
+            # Qt が管理する Back/Forward アクションの状態を参照する。
+            for name, web_action in (
+                ("_nav_back_action", QWebEnginePage.WebAction.Back),
+                ("_nav_forward_action", QWebEnginePage.WebAction.Forward),
+            ):
+                try:
+                    action = page.action(web_action)
+                    if action is not None:
+                        action.changed.connect(self._update_nav_history_buttons)
+                        setattr(self, name, action)
+                except (RuntimeError, TypeError):
+                    pass
+            try:
+                page.urlChanged.connect(self._update_nav_history_buttons)
+            except (RuntimeError, TypeError):
+                pass
         self._update_nav_history_buttons()
 
     def refresh_theme(self) -> None:
@@ -1721,13 +1885,11 @@ class AccountColumn(QWidget):
         can_back = False
         can_fwd = False
         try:
-            wv = self.current_webview()
-            page = wv.page() if wv is not None else None
-            if page is not None:
-                hist = page.history()
-                can_back = bool(hist.canGoBack())
-                can_fwd = bool(hist.canGoForward())
-        except Exception:
+            back = self._nav_back_action
+            forward = self._nav_forward_action
+            can_back = bool(back.isEnabled()) if back is not None else False
+            can_fwd = bool(forward.isEnabled()) if forward is not None else False
+        except (RuntimeError, TypeError):
             pass
         on = _COLOR_SECONDARY
         off = _COLOR_TEXT_MUTED
@@ -1808,8 +1970,10 @@ class AccountColumn(QWidget):
                     url = (u.toString() if hasattr(u, "toString") else str(u) or "").strip()
             except Exception:
                 url = ""
-            if not url:
-                url = (getattr(wv, "_pending_restore_url", None) or "").strip()
+            restore_url = (getattr(wv, "_pending_restore_url", None)
+                           or getattr(wv, "_scheduled_restore_url", None) or "").strip()
+            if restore_url:
+                url = restore_url
             if not url or url.startswith("about:") or url.startswith("data:"):
                 url = (getattr(self, "_initial_url", None) or "") if not tabs_out else ""
             entry: dict = {"url": url or ""}
@@ -1906,23 +2070,6 @@ class AccountColumn(QWidget):
         handle = getattr(self, "_col_drag_handle", None)
         if handle is not None:
             handle.setCursor(Qt.CursorShape.SizeAllCursor)
-        try:
-            from PySide6.QtWidgets import QGraphicsOpacityEffect
-            if getattr(self, "_reorder_opacity_effect", None) is None:
-                eff = QGraphicsOpacityEffect(self)
-                self._reorder_opacity_effect = eff
-                self.setGraphicsEffect(eff)
-            self._reorder_opacity_effect.setOpacity(0.85)
-        except Exception:
-            pass
-        try:
-            self._reorder_prev_stylesheet = self.styleSheet() or ""
-            self.setStyleSheet(
-                (self._reorder_prev_stylesheet + "\n" if self._reorder_prev_stylesheet else "")
-                + "AccountColumn { border: 2px solid #1d9bf0; border-radius: 6px; background-color: rgba(29,155,240,0.06); }"
-            )
-        except Exception:
-            self._reorder_prev_stylesheet = ""
 
     def _disarm_drag(self, emit_finished: bool = True) -> None:
         was_armed = self._drag_armed
@@ -1939,20 +2086,6 @@ class AccountColumn(QWidget):
                 except Exception:
                     pass
             handle.setCursor(Qt.CursorShape.SizeAllCursor)
-        try:
-            if getattr(self, "_reorder_opacity_effect", None) is not None:
-                self._reorder_opacity_effect.setOpacity(1.0)
-                self.setGraphicsEffect(None)
-                self._reorder_opacity_effect = None
-        except Exception:
-            pass
-        try:
-            prev = getattr(self, "_reorder_prev_stylesheet", None)
-            if prev is not None:
-                self.setStyleSheet(prev)
-                self._reorder_prev_stylesheet = None
-        except Exception:
-            pass
         if was_armed and emit_finished:
             try:
                 self.reorder_drag_finished.emit()
@@ -1960,6 +2093,13 @@ class AccountColumn(QWidget):
                 pass
 
     def eventFilter(self, obj, event: QEvent) -> bool:
+        if obj is getattr(self, "_page_find_input", None):
+            if event.type() == QEvent.Type.InputMethod:
+                self._page_find_composing = bool(event.preeditString())
+            elif event.type() == QEvent.Type.FocusIn:
+                self.activated.emit()
+            elif event.type() == QEvent.Type.FocusOut:
+                self._page_find_composing = False
         if not self.is_individually_stowed():
             return False
         win = self.window()
@@ -2140,9 +2280,9 @@ class AccountColumn(QWidget):
         self._profile_state = "FAILED"
         self._profile_waiting_self_redirect = False
         try:
-            self._url_bar.setText("現在のリストを確認できませんでした")
+            self._url_bar.setText(tr('現在のリストを確認できませんでした'))
             self._url_bar.setToolTip(
-                "ログイン中のXアカウントから本人のリストURLを解決できませんでした"
+                tr('ログイン中のXアカウントから本人のリストURLを解決できませんでした')
             )
         except Exception:
             pass
@@ -2171,8 +2311,8 @@ class AccountColumn(QWidget):
         self._profile_state = "RESOLVING"
         self._begin_resolve_request("lists")
         try:
-            self._url_bar.setText("リストを取得中…")
-            self._url_bar.setToolTip("ログイン中のXアカウントからリストを取得しています")
+            self._url_bar.setText(tr('リストを取得中…'))
+            self._url_bar.setToolTip(tr('ログイン中のXアカウントからリストを取得しています'))
         except Exception:
             pass
 
@@ -2212,8 +2352,8 @@ class AccountColumn(QWidget):
         self._profile_state = "RESOLVING"
         self._begin_resolve_request("profile")
         try:
-            self._url_bar.setText("プロフィールを取得中…")
-            self._url_bar.setToolTip("ログイン中のXアカウントからプロフィールを取得しています")
+            self._url_bar.setText(tr('プロフィールを取得中…'))
+            self._url_bar.setToolTip(tr('ログイン中のXアカウントからプロフィールを取得しています'))
         except Exception:
             pass
 
@@ -2323,7 +2463,7 @@ class AccountColumn(QWidget):
             try:
                 target = getattr(self, "_session_resolve_target", "profile")
                 self._url_bar.setText(
-                    "リストを取得中…" if target == "lists" else "プロフィールを取得中…"
+                    tr('リストを取得中…') if target == "lists" else tr('プロフィールを取得中…')
                 )
             except Exception:
                 pass
@@ -2852,7 +2992,7 @@ class AccountColumn(QWidget):
                 if self._column_type == "lists":
                     self._lists_show_failed_hub()
                     try:
-                        self._url_bar.setText("Xにログインしてください")
+                        self._url_bar.setText(tr('Xにログインしてください'))
                     except Exception:
                         pass
                 else:
@@ -2878,9 +3018,9 @@ class AccountColumn(QWidget):
     def _set_profile_failed(self, state: str = "FAILED") -> None:
         self._profile_state = state
         if state == "NOT_LOGGED_IN":
-            msg = "Xにログインしてください"
+            msg = tr('Xにログインしてください')
         else:
-            msg = "現在のXアカウントを確認できませんでした"
+            msg = tr('現在のXアカウントを確認できませんでした')
         try:
             self._url_bar.setText(msg)
             self._url_bar.setToolTip(msg)
@@ -2932,7 +3072,18 @@ class AccountColumn(QWidget):
         self.restore_self_requested.emit(self)
 
     def is_individually_stowed(self) -> bool:
-        return bool(getattr(self, "_individually_stowed", False))
+        return bool(getattr(self, "_individually_stowed", False) and not getattr(self, "_flip_expanded", False))
+
+    def set_flip_expanded(self, expanded: bool) -> None:
+        if expanded == getattr(self, "_flip_expanded", False):
+            return
+        self._flip_expanded = expanded
+        if getattr(self, "_individually_stowed", False):
+            if expanded:
+                self._exit_individual_stow()
+                self.reveal_after_restore()
+            else:
+                self._enter_individual_stow()
 
     def set_individually_stowed(self, stowed: bool) -> None:
         stowed = bool(stowed)
@@ -3251,7 +3402,7 @@ class AccountColumn(QWidget):
             except Exception:
                 name = ""
         if not name:
-            name = (getattr(self, "_account_id", "") or "").strip() or "カラム"
+            name = (getattr(self, "_account_id", "") or "").strip() or tr('カラム')
         return name
 
     def _ensure_stowed_name_label(self):
@@ -3670,6 +3821,8 @@ class AccountColumn(QWidget):
         self._position_resize_handles()
         self._enforce_single_visible_tab()
         super().showEvent(event)
+        if self._page_find_target is None:
+            self._apply_page_find()
 
     def _left_stowed_neighbor(self):
         win = self.window()

@@ -1,6 +1,7 @@
 
 
 from __future__ import annotations
+from src.core.i18n import tr
 
 import os
 from pathlib import Path
@@ -9,14 +10,17 @@ import time
 from collections.abc import Callable
 from urllib.parse import quote_plus
 
-from PySide6.QtCore import Qt, QUrl, Signal, QEvent, QTimer
-from PySide6.QtGui import QColor, QImage
-from PySide6.QtWidgets import QMenu, QWidget
+from PySide6.QtCore import Qt, QUrl, Signal, QEvent, QPoint, QTimer
+from PySide6.QtGui import QColor, QImage, QWheelEvent
+from PySide6.QtWidgets import QApplication, QMenu, QWidget
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import (
     QWebEngineContextMenuRequest,
     QWebEnginePage,
     QWebEngineProfile,
+    QWebEngineSettings,
+    QWebEngineScript,
+    QWebEngineDownloadRequest,
 )
 from src.browser.url_policy import (
     apply_webengine_security_settings,
@@ -29,6 +33,7 @@ from src.browser.url_policy import (
 )
 
 from src.browser.content_filter import install_filter
+from src.browser.tls_security import enforce_certificate_error_rejection
 
 
 _nav_recent: dict[str, float] = {}
@@ -341,7 +346,7 @@ class AuthPopupWindow(QWidget):
         self._RADIUS = radius
 
         self.setObjectName("mayotter_auth_popup")
-        self.setWindowTitle("認証")
+        self.setWindowTitle(tr('認証'))
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
@@ -402,7 +407,7 @@ class AuthPopupWindow(QWidget):
         title_l.setSpacing(6)
         title_l.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        title_lbl = QLabel("認証")
+        title_lbl = QLabel(tr('認証'))
         title_lbl.setObjectName("auth_popup_title")
         title_lbl.setStyleSheet(
             f"QLabel#auth_popup_title {{"
@@ -415,7 +420,7 @@ class AuthPopupWindow(QWidget):
 
         close_btn = QToolButton(titlebar)
         close_btn.setObjectName("auth_popup_close")
-        close_btn.setToolTip("閉じる")
+        close_btn.setToolTip(tr('閉じる'))
         close_btn.setFixedSize(24, 24)
         close_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         try:
@@ -824,6 +829,7 @@ class MayotterPage(QWebEnginePage):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        enforce_certificate_error_rejection(self)
         try:
             self.setBackgroundColor(themed_qcolor("#0b111f"))
         except Exception:
@@ -841,10 +847,68 @@ class MayotterPage(QWebEnginePage):
         self._attach_choose_served = False
         self._attach_auto_mode = False
         try:
-            if hasattr(self, "featurePermissionRequested"):
+            # 新API(Qt 6.8+)を優先し、旧APIは古い環境用。二重処理を避けるため同時接続しない
+            if hasattr(self, "permissionRequested"):
+                self.permissionRequested.connect(self._on_permission_requested)
+            elif hasattr(self, "featurePermissionRequested"):
                 self.featurePermissionRequested.connect(self._on_feature_permission_requested)
         except Exception:
             pass
+
+    def _on_permission_requested(self, permission) -> None:
+        """マイク権限要求をユーザー確認のうえ grant/deny する（Qt 6.8+ の permissionRequested 用）。"""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtWebEngineCore import QWebEnginePermission
+        from PySide6.QtWidgets import QMessageBox
+
+        def _log(msg: str) -> None:
+            try:
+                from src.media.debug_log import media_debug
+                media_debug("PERM", msg)
+            except Exception:
+                pass
+
+        ptype = permission.permissionType()
+        Type = QWebEnginePermission.PermissionType
+        origin = permission.origin()
+        host = (origin.host() or "").strip() if isinstance(origin, QUrl) else ""
+        scheme = (origin.scheme() or "").strip().lower() if isinstance(origin, QUrl) else ""
+
+        # マイク系以外（カメラ単独など）は拒否
+        if ptype not in (Type.MediaAudioCapture, Type.MediaAudioVideoCapture):
+            _log(f"api=permissionRequested type={ptype} origin={host} result=deny(not_audio)")
+            permission.deny()
+            return
+
+        if not host or scheme in ("about", "data", "blob", "file"):
+            _log(f"api=permissionRequested type={ptype} origin={origin.toString()!r} result=deny(invalid_origin)")
+            permission.deny()
+            return
+
+        parent = None
+        try:
+            parent = self.view()
+        except Exception:
+            parent = None
+        if parent is None:
+            try:
+                parent = self.parent()
+            except Exception:
+                parent = None
+
+        reply = QMessageBox.question(
+            parent,
+            tr('マイクの使用'),
+            tr('{v0} がマイクの使用を要求しています。許可しますか？', v0=host),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            _log(f"api=permissionRequested type={ptype} origin={host} result=grant")
+            permission.grant()
+        else:
+            _log(f"api=permissionRequested type={ptype} origin={host} result=deny(user)")
+            permission.deny()
 
     def _on_feature_permission_requested(self, origin, feature) -> None:
         """マイク等のメディア権限要求をユーザー確認のうえ Granted/Denied する。"""
@@ -917,7 +981,7 @@ class MayotterPage(QWebEnginePage):
                 pass
             return
 
-        label = host or "このサイト"
+        label = host or tr('このサイト')
         parent = None
         try:
             parent = self.view()
@@ -931,8 +995,8 @@ class MayotterPage(QWebEnginePage):
 
         reply = QMessageBox.question(
             parent,
-            "マイクの使用",
-            f"{label} がマイクの使用を要求しています。許可しますか？",
+            tr('マイクの使用'),
+            tr('{v0} がマイクの使用を要求しています。許可しますか？', v0=label),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -941,6 +1005,48 @@ class MayotterPage(QWebEnginePage):
             self.setFeaturePermission(origin, feature, policy)
         except Exception:
             pass
+
+    def _js_dialog_parent(self):
+        try:
+            view = self.view()
+            if view is not None:
+                win = view.window()
+                return win if win is not None else view
+        except Exception:
+            pass
+        try:
+            from PySide6.QtWidgets import QApplication
+
+            return QApplication.activeWindow()
+        except Exception:
+            return None
+
+    def javaScriptAlert(self, origin, message) -> None:
+        try:
+            from src.ui.js_dialog import show_js_alert
+
+            show_js_alert(self._js_dialog_parent(), str(message or ""))
+        except Exception:
+            pass
+
+    def javaScriptConfirm(self, origin, message) -> bool:
+        try:
+            from src.ui.js_dialog import show_js_confirm
+
+            return bool(show_js_confirm(self._js_dialog_parent(), str(message or "")))
+        except Exception:
+            return False
+
+    def javaScriptPrompt(self, origin, message, defaultValue):
+        try:
+            from src.ui.js_dialog import show_js_prompt
+
+            ok, text = show_js_prompt(
+                self._js_dialog_parent(), str(message or ""), str(defaultValue or "")
+            )
+            return (bool(ok), str(text))
+        except Exception:
+            return (False, "")
 
     def chooseFiles(self, mode, old_files, accepted_mime_types):
         import os
@@ -1006,14 +1112,14 @@ class MayotterPage(QWebEnginePage):
                 if is_audio_path(path):
                     if callable(notify):
                         try:
-                            notify("音声をMP4に変換しています…")
+                            notify(tr('音声をMP4に変換しています…'))
                         except Exception:
                             pass
                     mp4 = audio_file_to_mp4(path, normalize=False)
                     out.append(str(mp4))
                     if callable(notify):
                         try:
-                            notify("MP4の準備ができました")
+                            notify(tr('MP4の準備ができました'))
                         except Exception:
                             pass
                 else:
@@ -1021,7 +1127,7 @@ class MayotterPage(QWebEnginePage):
             except Exception as exc:
                 if callable(notify):
                     try:
-                        notify(f"音声をMP4に変換できませんでした: {exc}")
+                        notify(tr('音声をMP4に変換できませんでした: {v0}', v0=exc))
                     except Exception:
                         pass
         return out
@@ -1169,6 +1275,80 @@ class MayotterPage(QWebEnginePage):
             return True
         return True
 
+# QtWebEngine はホイール1ノッチを「行数 x 20px」でスクロールする
+# （web_event_factory.cpp: cDefaultQtScrollStep）。Chrome は「行数 x 100/3 px」
+# （web_input_event_builders_win.cc: kScrollbarPixelsPerLine）で、常に 5/3 倍多い。
+# Chrome 相当を 100% とし、ユーザー設定の倍率を掛けてスクロール量を決める。
+_CHROME_WHEEL_BASE_SCALE = 5.0 / 3.0
+_WHEEL_SCROLL_PERCENT = 200
+
+# 後方互換用。旧定数を参照するコードがあっても有効な値を返す。
+_WHEEL_DELTA_SCALE = _CHROME_WHEEL_BASE_SCALE * (_WHEEL_SCROLL_PERCENT / 100.0)
+
+
+def set_wheel_scroll_percent(percent: int) -> None:
+    """ホイールスクロール速度（%）を設定する。100 = Chrome 相当。"""
+    global _WHEEL_SCROLL_PERCENT, _WHEEL_DELTA_SCALE
+    try:
+        v = int(percent)
+    except (TypeError, ValueError):
+        v = 200
+    v = max(50, min(400, v))
+    _WHEEL_SCROLL_PERCENT = v
+    _WHEEL_DELTA_SCALE = _CHROME_WHEEL_BASE_SCALE * (v / 100.0)
+
+
+def get_wheel_scroll_percent() -> int:
+    return int(_WHEEL_SCROLL_PERCENT)
+
+
+def _wheel_delta_to_chrome(value: int) -> int:
+    if not value:
+        return 0
+    return int(round(value * _WHEEL_DELTA_SCALE))
+
+
+def _wheel_pixel_to_scaled(value: int) -> int:
+    if not value:
+        return 0
+    return int(round(value * (_WHEEL_SCROLL_PERCENT / 100.0)))
+
+
+def _wheel_event_for_chrome(event: QWheelEvent) -> QWheelEvent | None:
+    """設定倍率を掛けたスクロールイベントを返す（補正不要なら None）。"""
+    angle = event.angleDelta()
+    pixel = event.pixelDelta()
+    if angle.isNull() and pixel.isNull():
+        return None
+    scaled_pixel = QPoint(
+        _wheel_pixel_to_scaled(pixel.x()), _wheel_pixel_to_scaled(pixel.y())
+    ) if not pixel.isNull() else pixel
+    if angle.isNull():
+        # 高精度タッチパッドは pixelDelta のみ。倍率だけ掛けて転送する。
+        return QWheelEvent(
+            event.position(),
+            event.globalPosition(),
+            scaled_pixel,
+            angle,
+            event.buttons(),
+            event.modifiers(),
+            event.phase(),
+            event.inverted(),
+            event.source(),
+        )
+    return QWheelEvent(
+        event.position(),
+        event.globalPosition(),
+        scaled_pixel,
+        QPoint(_wheel_delta_to_chrome(angle.x()), _wheel_delta_to_chrome(angle.y())),
+        event.buttons(),
+        event.modifiers(),
+        event.phase(),
+        event.inverted(),
+        event.source(),
+    )
+
+
 class XWebView(QWebEngineView):
 
     url_changed = Signal(str)
@@ -1176,8 +1356,20 @@ class XWebView(QWebEngineView):
     loading_finished = Signal(bool)
     pressed = Signal()
     download_progress = Signal(str, str, str, float, str)
+    zoom_requested = Signal(int)
+    zoom_changed = Signal(float)
 
     FREEZE_AFTER_SECONDS = 300
+    HIDDEN_GRACE_SECONDS = 30
+    DISCARD_AFTER_SECONDS = 120
+    # 保護中・判定不能だったページを再判定するまでの間隔。
+    MEMORY_RETRY_SECONDS = 60
+    # 安全判定の応答を待つ上限。応答が無いまま判定中で止まり続けないようにする。
+    PROBE_TIMEOUT_SECONDS = 30
+    retain_hidden_pages = False
+    _memory_views = weakref.WeakSet()
+    # 診断用の累計（view の生成・破棄、ページ読込開始）。値は整数のみ保持する。
+    memory_counters = {"created": 0, "destroyed": 0, "loads": 0, "probe_timeouts": 0}
 
     tab_opener: "Callable[[str], None] | None" = None
 
@@ -1188,7 +1380,23 @@ class XWebView(QWebEngineView):
         self._last_activity = time.time()
         self._last_user_gesture_mono: float | None = None
         self._suppress_user_gesture_mark = False
+        self._wheel_scale_guard = False
+        self._zoom_wheel_remainder = 0.0
         self._media_wide_active = False
+        self._hidden_since = time.monotonic()
+        self._memory_generation = 0
+        self._memory_check_pending = False
+        self._memory_discard_safe = False
+        self._memory_last_probe = None
+        self._memory_last_probe_at = None
+        self._memory_check_started = 0.0
+        self._memory_probe_timeouts = 0
+        self._memory_timer = QTimer(self)
+        self._memory_timer.setSingleShot(True)
+        self._memory_timer.timeout.connect(self.maybe_freeze)
+        self._memory_views.add(self)
+        XWebView.memory_counters["created"] += 1
+        self.destroyed.connect(XWebView._count_destroyed)
         self.setPage(self._create_page(profile))
         install_filter(self.page())
         attach_download_handler(profile)
@@ -1197,23 +1405,110 @@ class XWebView(QWebEngineView):
         refs = _DOWNLOAD_VIEWS.setdefault(key, [])
         refs.append(weakref.ref(self))
 
-        QTimer.singleShot(0, self._install_focus_proxy_filter)
+        self._focus_proxy_filter_target = None
+        QTimer.singleShot(0, self, self._install_focus_proxy_filter)
 
         self._connect_signals()
 
+    def setPage(self, page) -> None:
+        super().setPage(page)
+        if not hasattr(self, "_memory_timer"):
+            return
+        from src.browser.page_activity import ACTIVITY_SCRIPT
+        script = QWebEngineScript()
+        script.setName("mayotter-page-activity")
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.ApplicationWorld)
+        script.setSourceCode(ACTIVITY_SCRIPT)
+        page.scripts().insert(script)
+        page.zoomFactorChanged.connect(self.zoom_changed.emit)
+        page.loadStarted.connect(self._reset_memory_document)
+        page.loadStarted.connect(XWebView._count_load)
+        page.recommendedStateChanged.connect(self._schedule_memory_check)
+        page.lifecycleStateChanged.connect(self._memory_state_changed)
+        page.visibleChanged.connect(self._schedule_memory_check)
+        page.loadFinished.connect(self._schedule_memory_check)
+        self._reset_memory_document()
+
+    @staticmethod
+    def _count_destroyed(*_args) -> None:
+        XWebView.memory_counters["destroyed"] += 1
+
+    @staticmethod
+    def _count_load(*_args) -> None:
+        XWebView.memory_counters["loads"] += 1
+
+    def _reset_memory_document(self) -> None:
+        self._memory_generation += 1
+        self._memory_check_pending = False
+        self._memory_discard_safe = False
+        self._memory_last_probe = None
+        self._memory_last_probe_at = None
+        self.page()._memory_upload_pending = False
+        self.page()._memory_capture_active = False
+
+    def _memory_state_changed(self, state) -> None:
+        if state == QWebEnginePage.LifecycleState.Active:
+            self._memory_discard_safe = False
+
+    @classmethod
+    def set_retain_hidden_pages(cls, enabled: bool) -> None:
+        from shiboken6 import isValid
+        cls.retain_hidden_pages = bool(enabled)
+        for view in list(cls._memory_views):
+            # Python 側の参照だけ残った削除済み view は対象外。
+            if isValid(view):
+                view._schedule_memory_check()
+
+    def _schedule_memory_check(self, *_args) -> None:
+        if self.isVisible() or self.page().isVisible():
+            self._memory_timer.stop()
+            return
+        state = self.page().lifecycleState()
+        if state == QWebEnginePage.LifecycleState.Discarded:
+            return
+        if (state == QWebEnginePage.LifecycleState.Frozen
+                and self.page().recommendedState() == QWebEnginePage.LifecycleState.Active):
+            self.resume_page()
+            return
+        if self._hidden_since is None:
+            self._hidden_since = time.monotonic()
+        delay = self.HIDDEN_GRACE_SECONDS
+        if state == QWebEnginePage.LifecycleState.Frozen:
+            if self.retain_hidden_pages:
+                return
+            delay = self.DISCARD_AFTER_SECONDS
+        remaining = delay - (time.monotonic() - self._hidden_since)
+        self._memory_timer.start(max(0, round(remaining * 1000)))
+
     def _install_focus_proxy_filter(self) -> None:
+        """ホイール補正のため focusProxy（描画ウィジェット）へフィルタを設置する。
+
+        ページ読込前に生成された WebView は focusProxy がまだ無く、生成直後の
+        一度きりの設置では失敗したまま残る。読込開始/完了・表示・子ウィジェット
+        追加のたびに呼び直し、実際に現れた focusProxy へ確実に設置する。
+        """
         proxy = self.focusProxy()
         if proxy is None:
             return
-        if getattr(self, "_focus_proxy_filter_installed", False):
+        if proxy is getattr(self, "_focus_proxy_filter_target", None):
             return
         proxy.installEventFilter(self)
+        self._focus_proxy_filter_target = proxy
         self._focus_proxy_filter_installed = True
 
     def touch_activity(self) -> None:
         self._last_activity = time.time()
+        self.resume_page()
+
+    def resume_page(self) -> None:
+        self._memory_timer.stop()
+        self._memory_generation += 1
+        self._memory_check_pending = False
+        self._hidden_since = None
+        self._memory_discard_safe = False
         page = self.page()
-        if hasattr(page, "lifecycleState") and page.lifecycleState() != QWebEnginePage.LifecycleState.Active:
+        if page.lifecycleState() != QWebEnginePage.LifecycleState.Active:
             page.setLifecycleState(QWebEnginePage.LifecycleState.Active)
 
     def seconds_since_user_gesture(self) -> float | None:
@@ -1225,23 +1520,252 @@ class XWebView(QWebEngineView):
         except Exception:
             return None
 
+    def _retry_memory_check(self) -> None:
+        if not self._memory_timer.isActive():
+            self._memory_timer.start(self.MEMORY_RETRY_SECONDS * 1000)
+
+    def _memory_in_use(self) -> bool:
+        """表示中カラムの現在タブ（Dock 収納中を含む）か。owner 側の判定に委ねる。"""
+        check = getattr(self.window(), "_memory_view_in_use", None)
+        try:
+            return bool(check(self)) if callable(check) else False
+        except Exception:
+            return True
+
     def maybe_freeze(self, now: float | None = None) -> bool:
-        current = time.time() if now is None else now
-        if current - self._last_activity < self.FREEZE_AFTER_SECONDS:
+        page = self.page()
+        state = QWebEnginePage.LifecycleState
+        if self.isVisible() or page.isVisible():
+            if page.lifecycleState() == state.Frozen:
+                self.resume_page()
             return False
-        return self.freeze_now()
+        if self._memory_is_protected():
+            # 非表示のまま凍結済みのページは、ワーク切替などの一時状態のために解凍しない。
+            self._retry_memory_check()
+            return False
+        if self._memory_in_use():
+            # Dock 収納中でも未読表示・即時展開のため、使用中のタブは動かしておく。
+            if page.lifecycleState() == state.Frozen:
+                self.resume_page()
+            # 使用中でなくなった時点から猶予を数え直す。
+            self._hidden_since = None
+            return False
+        if self._hidden_since is None:
+            self._hidden_since = time.monotonic()
+        age = time.monotonic() - self._hidden_since
+        if age < self.HIDDEN_GRACE_SECONDS:
+            self._schedule_memory_check()
+            return False
+        recommended = page.recommendedState()
+        if recommended == state.Active:
+            if page.lifecycleState() == state.Frozen:
+                self.resume_page()
+            return False
+        if page.lifecycleState() == state.Discarded:
+            return False
+        if page.lifecycleState() == state.Frozen:
+            if (not self.retain_hidden_pages and self._memory_discard_safe
+                    and recommended == state.Discarded and age >= self.DISCARD_AFTER_SECONDS):
+                page.setLifecycleState(state.Discarded)
+                return page.lifecycleState() == state.Discarded
+            if not self.retain_hidden_pages and age < self.DISCARD_AFTER_SECONDS:
+                self._schedule_memory_check()
+            return False
+        from src.browser.page_activity import SAFETY_PROBE, probe_allows_freeze
+        if self._memory_check_pending:
+            waited = time.monotonic() - self._memory_check_started
+            if waited < self.PROBE_TIMEOUT_SECONDS:
+                # 応答待ち。応答が来なくても期限で戻ってこられるよう、必ず再確認を予約する。
+                self._memory_timer.start(max(0, round((self.PROBE_TIMEOUT_SECONDS - waited) * 1000)))
+                return False
+            # 期限切れの判定は打ち切る（遅れて届いた結果は世代番号で無視する）。
+            self._memory_generation += 1
+            self._memory_check_pending = False
+            self._memory_probe_timeouts += 1
+            XWebView.memory_counters["probe_timeouts"] += 1
+            fresh = (self._memory_last_probe_at is not None
+                     and self._memory_last_probe_at >= self._hidden_since)
+            if fresh and probe_allows_freeze(self._memory_last_probe):
+                # 非表示になってからの判定で休止可能だったページだけ休止する（破棄はしない）。
+                self._memory_discard_safe = False
+                page.setLifecycleState(state.Frozen)
+            else:
+                self._retry_memory_check()
+            return False
+        generation = self._memory_generation
+        self._memory_check_pending = True
+        self._memory_check_started = time.monotonic()
+        self._memory_timer.start(self.PROBE_TIMEOUT_SECONDS * 1000)
+
+        def checked(result):
+            from shiboken6 import isValid
+            from src.browser.page_activity import probe_allows_discard
+            if not isValid(self) or not isValid(page) or generation != self._memory_generation:
+                return
+            self._memory_check_pending = False
+            self._memory_timer.stop()
+            self._memory_last_probe = str(result or "unknown")[:80]
+            self._memory_last_probe_at = time.monotonic()
+            if self.isVisible() or page.isVisible():
+                return
+            if (not probe_allows_freeze(result) or self._memory_is_protected()
+                    or self._memory_in_use()):
+                # 再生中・アップロード中・判定不能などは休止せず、後で再判定する。
+                self._retry_memory_check()
+                return
+            recommended = page.recommendedState()
+            if recommended == state.Active:
+                return
+            # 休止は可能でも、破棄（再読み込み）は入力・送信・再生・判定不能が無いときだけ。
+            discard_ok = probe_allows_discard(result)
+            self._memory_discard_safe = discard_ok
+            age = time.monotonic() - self._hidden_since if self._hidden_since is not None else 0
+            target = state.Frozen
+            if (not self.retain_hidden_pages and discard_ok and recommended == state.Discarded
+                    and age >= self.DISCARD_AFTER_SECONDS):
+                target = state.Discarded
+            page.setLifecycleState(target)
+            if target == state.Frozen and not self.retain_hidden_pages and discard_ok:
+                self._schedule_memory_check()
+
+        page.runJavaScript(SAFETY_PROBE, QWebEngineScript.ScriptWorldId.ApplicationWorld, checked)
+        return False
 
     def freeze_now(self) -> bool:
+        # 互換 caller からも安全条件と猶予を迂回しない。
+        return self.maybe_freeze()
+
+    def _memory_is_protected(self) -> bool:
+        return self._memory_protection_reason() is not None
+
+    def _memory_protection_reason(self) -> str | None:
+        """休止を見送る理由（ページ自身の保護、またはワーク切替・Dock アニメーション中）。"""
+        reason = self._memory_page_protection_reason()
+        if reason is not None:
+            return reason
+        owner = self.window()
+        gate = getattr(owner, "_transition_commit_gate", None)
+        if getattr(owner, "_edge_dock_animating", False) or getattr(owner, "_edge_dock_switching", False):
+            return "dock-transition"
+        if getattr(owner, "_workspace_switching", False) or (gate is not None and gate.busy):
+            return "workspace-switching"
+        return None
+
+    def _memory_page_protected(self) -> bool:
+        """ページ自身または進行中の録音・添付・ダウンロードにより、休止・解放してはいけないか。"""
+        return self._memory_page_protection_reason() is not None
+
+    def _memory_page_protection_reason(self) -> str | None:
         page = self.page()
-        if not hasattr(page, "setLifecycleState"):
+        checks = (
+            ("loading", page.isLoading()),
+            ("audible", page.recentlyAudible()),
+            ("devtools", page.devToolsPage() is not None or page.inspectedPage() is not None),
+            ("dnd-convert", getattr(self, "_dnd_converting", False)),
+            ("media-wide", self._media_wide_active),
+            ("attach", getattr(page, "pending_attach_files", None)
+             or getattr(page, "_voice_attach_cleanup", None) is not None
+             or getattr(page, "_attach_auto_mode", False)),
+            ("upload", getattr(page, "_memory_upload_pending", False)),
+            ("capture", getattr(page, "_memory_capture_active", False)),
+        )
+        for reason, hit in checks:
+            if hit:
+                return reason
+        if any(not item.isFinished() for item in page.profile().findChildren(QWebEngineDownloadRequest)):
+            return "download"
+        owner = self.window()
+        target = getattr(owner, "_recording_target", None)
+        if target and (target.get("webview") is self or target.get("page") is page):
+            return "recording-target"
+        recorder = getattr(owner, "_audio_recorder", None)
+        if not target and (getattr(owner, "_media_convert_worker", None) is not None
+                           or (recorder is not None and recorder.is_recording)):
+            return "recording"
+        if MayotterPage.pending_attach_files or MayotterPage._attach_auto_mode_global:
+            return "attach-global"
+        return None
+
+    _DIAG_HOSTS = ("x.com", "twitter.com", "grok.com")
+
+    def memory_diagnostics(self) -> dict:
+        """診断用の状態（状態を変更しない）。URL はホスト種別のみ、入力内容は含めない。
+
+        hold は maybe_freeze と同じ順で「いま休止・破棄されない理由」を示す。
+        """
+        from src.browser.page_activity import probe_kind
+        page = self.page()
+        S = QWebEnginePage.LifecycleState
+        state, recommended = page.lifecycleState(), page.recommendedState()
+        visible = bool(self.isVisible() or page.isVisible())
+        hidden_for = None
+        if not visible and self._hidden_since is not None:
+            hidden_for = int(time.monotonic() - self._hidden_since)
+        try:
+            reason = self._memory_protection_reason()
+        except Exception:
+            reason = "error"
+        in_use = self._memory_in_use()
+        probe = self._memory_last_probe
+        if visible:
+            hold = "visible"
+        elif state == S.Discarded:
+            hold = "discarded"
+        elif reason is not None:
+            hold = "protected:" + reason
+        elif in_use:
+            hold = "in-use"
+        elif recommended == S.Active:
+            hold = "recommended-active"
+        elif state == S.Frozen:
+            if self.retain_hidden_pages:
+                hold = "frozen:retain-setting"
+            elif self._memory_discard_safe:
+                hold = "frozen:discard-pending"
+            else:
+                hold = "frozen:not-discard-safe"
+        elif hidden_for is None or hidden_for < self.HIDDEN_GRACE_SECONDS:
+            hold = "grace"
+        elif self._memory_check_pending:
+            hold = "probe-pending"
+        elif probe is None:
+            hold = "not-probed"
+        else:
+            hold = "probe:" + probe_kind(probe)
+        host = (page.url().host() or "").lower()
+        if host:
+            host = next((h for h in self._DIAG_HOSTS if host == h or host.endswith("." + h)), "other")
+        now = time.monotonic()
+        return {
+            "state": state.name, "recommended": recommended.name, "visible": visible,
+            "hidden_s": hidden_for, "in_use": in_use, "protect": reason, "probe": probe,
+            "probe_age_s": None if self._memory_last_probe_at is None else int(now - self._memory_last_probe_at),
+            "pending_s": int(now - self._memory_check_started) if self._memory_check_pending else None,
+            "probe_timeouts": self._memory_probe_timeouts,
+            "discard_safe": bool(self._memory_discard_safe), "hold": hold, "host": host,
+            "pid": int(page.renderProcessPid()),
+        }
+
+    def can_release_page(self) -> bool:
+        """View ごと破棄しても失うものがないか（破棄済み・安全確認済みの凍結・未読込）。
+
+        ワーク切替中にも呼ぶため、切替やアニメーションの一時状態は見ない。
+        """
+        if self._memory_page_protected():
             return False
-        if (
-            hasattr(page, "lifecycleState")
-            and page.lifecycleState() == QWebEnginePage.LifecycleState.Frozen
-        ):
-            return False
-        accepted = page.setLifecycleState(QWebEnginePage.LifecycleState.Frozen)
-        return bool(accepted)
+        page = self.page()
+        state = page.lifecycleState()
+        if state == QWebEnginePage.LifecycleState.Discarded:
+            return True
+        if state == QWebEnginePage.LifecycleState.Frozen and self._memory_discard_safe:
+            return True
+        return page.renderProcessPid() == 0 and not page.isLoading() and page.url().isEmpty()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        if self._hidden_since is None:
+            self._hidden_since = time.monotonic()
+        self._schedule_memory_check()
 
     def mousePressEvent(self, event) -> None:
         self.touch_activity()
@@ -1253,7 +1777,28 @@ class XWebView(QWebEngineView):
         self.pressed.emit()
         super().mousePressEvent(event)
 
+    def _handle_page_zoom_wheel(self, event) -> bool:
+        if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self._zoom_wheel_remainder = 0.0
+            return False
+        angle = event.angleDelta().y()
+        pixel = event.pixelDelta().y()
+        delta = float(angle) if angle else float(pixel) * 2.0
+        if not delta:
+            return False
+        self.touch_activity()
+        self._zoom_wheel_remainder += delta
+        steps = int(self._zoom_wheel_remainder / 120.0)
+        if steps:
+            self._zoom_wheel_remainder -= steps * 120.0
+            percent = max(50, min(150, round(self.zoomFactor() * 100) + 5 * steps))
+            self.zoom_requested.emit(percent)
+        event.accept()
+        return True
+
     def wheelEvent(self, event) -> None:
+        if self._handle_page_zoom_wheel(event):
+            return
         self.touch_activity()
         super().wheelEvent(event)
 
@@ -1360,7 +1905,7 @@ class XWebView(QWebEngineView):
             from src.media.media_converter import is_audio_path
         except Exception as exc:
             self._dnd_audio_log(f"is_audio_path import fail={exc!r}")
-            self._media_status("音声変換モジュールを読み込めませんでした")
+            self._media_status(tr('音声変換モジュールを読み込めませんでした'))
             return
         audio_paths = [p for p in paths if is_audio_path(p)]
         other_paths = [p for p in paths if not is_audio_path(p)]
@@ -1397,8 +1942,10 @@ class XWebView(QWebEngineView):
         except Exception:
             pass
         try:
-            from src.core.paths import APP_BASE_DIR
-            log_path = Path(APP_BASE_DIR) / "last_audio_dnd.log"
+            from src.core.paths import APP_BASE_DIR, IS_INSTALLED, LOGS_DIR
+            # Setup版は本体フォルダに書かず、保存先のlogsへ（アンインストール時に本体が残らないように）
+            log_path = (Path(LOGS_DIR) if IS_INSTALLED else Path(APP_BASE_DIR)) / "last_audio_dnd.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{datetime.now().strftime('%H:%M:%S')} {msg}\n")
         except Exception:
@@ -1421,7 +1968,7 @@ class XWebView(QWebEngineView):
                 f"busy_src={getattr(self, '_dnd_busy_src', None)!r} "
                 f"ignored={audio_paths!r}"
             )
-            self._media_status("音声を変換中です…")
+            self._media_status(tr('音声を変換中です…'))
             return
 
         audio_paths = [p for p in audio_paths if p and _P(p).is_file()]
@@ -1436,7 +1983,7 @@ class XWebView(QWebEngineView):
 
         self._dnd_converting = True
         self._dnd_busy_src = primary
-        self._media_status("音声を変換しています…")
+        self._media_status(tr('音声を変換しています…'))
         self._dnd_audio_log(f"handoff_to_mainwindow src={primary!r} other={other_paths!r}")
 
         if other_paths:
@@ -1452,7 +1999,7 @@ class XWebView(QWebEngineView):
             self._dnd_converting = False
             self._dnd_busy_src = None
             self._dnd_audio_log("handoff_fail reason=no_process_audio_source_for_post")
-            self._media_status("音声投稿処理を開始できませんでした")
+            self._media_status(tr('音声投稿処理を開始できませんでした'))
             return
 
         def _clear_busy() -> None:
@@ -1470,7 +2017,7 @@ class XWebView(QWebEngineView):
                 normalize=False,
                 is_recording=False,
                 min_bytes=32,
-                empty_msg="音声ファイルが空です",
+                empty_msg=tr('音声ファイルが空です'),
                 webview=self,
                 page=page,
             )
@@ -1478,7 +2025,7 @@ class XWebView(QWebEngineView):
         except Exception as exc:
             _clear_busy()
             self._dnd_audio_log(f"process_audio_source_for_post exception={exc!r}")
-            self._media_status(str(exc) or "音声変換を開始できませんでした")
+            self._media_status(str(exc) or tr('音声変換を開始できませんでした'))
             return
 
         worker = getattr(win, "_media_convert_worker", None)
@@ -1493,12 +2040,29 @@ class XWebView(QWebEngineView):
             _clear_busy()
 
     def eventFilter(self, obj, event) -> bool:
-        if obj is self.focusProxy() and event.type() == QEvent.Type.FocusIn:
-            try:
-                self._last_user_gesture_mono = time.monotonic()
-            except Exception:
-                pass
-            self.pressed.emit()
+        if obj is self.focusProxy():
+            if event.type() == QEvent.Type.FocusIn:
+                try:
+                    self._last_user_gesture_mono = time.monotonic()
+                except Exception:
+                    pass
+                self.pressed.emit()
+            elif event.type() == QEvent.Type.Wheel and not self._wheel_scale_guard:
+                if self._handle_page_zoom_wheel(event):
+                    return True
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    return super().eventFilter(obj, event)
+                # 実際のホイールは子の描画ウィジェット（focusProxy）が直接受けるため、
+                # ここで Chrome 相当のデルタへ補正してから転送し直す
+                scaled = _wheel_event_for_chrome(event)
+                if scaled is not None:
+                    self.touch_activity()
+                    self._wheel_scale_guard = True
+                    try:
+                        QApplication.sendEvent(obj, scaled)
+                    finally:
+                        self._wheel_scale_guard = False
+                    return True
         return super().eventFilter(obj, event)
 
     def focusInEvent(self, event) -> None:
@@ -1522,6 +2086,14 @@ class XWebView(QWebEngineView):
     def _create_page(self, profile: QWebEngineProfile) -> QWebEnginePage:
         page = MayotterPage(profile, self)
         apply_webengine_security_settings(page)
+        # QtWebEngine は既定でアニメーションスクロールが無効。通常ブラウザと同じ
+        # スムーズな動きになるよう有効化する
+        try:
+            page.settings().setAttribute(
+                QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True
+            )
+        except Exception:
+            pass
         try:
             page.setBackgroundColor(themed_qcolor("#0b111f"))
         except Exception:
@@ -1591,9 +2163,11 @@ class XWebView(QWebEngineView):
         self.url_changed.emit(url_str)
 
     def _on_load_started(self) -> None:
+        self._install_focus_proxy_filter()
         self.loading_started.emit()
 
     def _on_load_finished(self, success: bool) -> None:
+        self._install_focus_proxy_filter()
         self.loading_finished.emit(success)
         try:
             self._apply_x_shortcut_policy()
@@ -1615,7 +2189,7 @@ class XWebView(QWebEngineView):
     def _schedule_page_background(self) -> None:
         # 下地色は RenderWidgetHostView が安定してからでないと反映されないため、遅延を分けて掛け直す
         for ms in (0, 600, 1800):
-            QTimer.singleShot(ms, self.apply_page_background)
+            QTimer.singleShot(ms, self, self.apply_page_background)
 
     def apply_page_background(self) -> None:
         """ページの実背景色を WebEngine の下地色へ反映する。
@@ -1644,8 +2218,15 @@ class XWebView(QWebEngineView):
         except Exception:
             pass
 
+    def childEvent(self, event) -> None:
+        super().childEvent(event)
+        if event.type() == QEvent.Type.ChildAdded:
+            self._install_focus_proxy_filter()
+
     def showEvent(self, event) -> None:
+        self.resume_page()
         super().showEvent(event)
+        self._install_focus_proxy_filter()
         self._schedule_page_background()
 
     def _apply_x_shortcut_policy(self) -> None:
@@ -1705,9 +2286,9 @@ class XWebView(QWebEngineView):
 
         back_action = page_action(QWebEnginePage.WebAction.Back)
         forward_action = page_action(QWebEnginePage.WebAction.Forward)
-        add("戻る", lambda: self.page().triggerAction(QWebEnginePage.WebAction.Back), back_action.isEnabled())
-        add("進む", lambda: self.page().triggerAction(QWebEnginePage.WebAction.Forward), forward_action.isEnabled())
-        add("更新", lambda: self.reload_page())
+        add(tr('戻る'), lambda: self.page().triggerAction(QWebEnginePage.WebAction.Back), back_action.isEnabled())
+        add(tr('進む'), lambda: self.page().triggerAction(QWebEnginePage.WebAction.Forward), forward_action.isEnabled())
+        add(tr('更新'), lambda: self.reload_page())
         menu.addSeparator()
 
         has_link = bool(request is not None and request.linkUrl().isValid())
@@ -1740,24 +2321,24 @@ class XWebView(QWebEngineView):
             if can_cut:
                 cut_action = page_action(QWebEnginePage.WebAction.Cut)
                 add(
-                    "切り取り",
+                    tr('切り取り'),
                     lambda: self.page().triggerAction(QWebEnginePage.WebAction.Cut),
                     cut_action.isEnabled() if cut_action is not None else True,
                 )
             add(
-                "コピー",
+                tr('コピー'),
                 lambda: self.page().triggerAction(QWebEnginePage.WebAction.Copy),
             )
         paste_action = page_action(QWebEnginePage.WebAction.Paste)
         add(
-            "貼り付け",
+            tr('貼り付け'),
             lambda: self.page().triggerAction(QWebEnginePage.WebAction.Paste),
             paste_action.isEnabled(),
         )
         if can_select_all or True:
             sel_all = page_action(QWebEnginePage.WebAction.SelectAll)
             add(
-                "すべて選択",
+                tr('すべて選択'),
                 lambda: self.page().triggerAction(QWebEnginePage.WebAction.SelectAll),
                 sel_all.isEnabled() if sel_all is not None else True,
             )
@@ -1803,34 +2384,34 @@ class XWebView(QWebEngineView):
                     open_fn(url)
 
             add(
-                "新しいタブで開く",
+                tr('新しいタブで開く'),
                 _open_link_new_tab if callable(opener) else (lambda: None),
                 callable(opener),
             )
             add(
-                "リンクのURLをコピー",
+                tr('リンクのURLをコピー'),
                 lambda: self.page().triggerAction(QWebEnginePage.WebAction.CopyLinkToClipboard),
             )
-            add("規定のブラウザで開く", lambda url=link_url: open_in_default_browser(url))
+            add(tr('規定のブラウザで開く'), lambda url=link_url: open_in_default_browser(url))
             add(
-                "リンク先を保存",
+                tr('リンク先を保存'),
                 lambda: self.page().triggerAction(QWebEnginePage.WebAction.DownloadLinkToDisk),
             )
         if not has_link:
             page_url = self.url().toString()
             if page_url:
                 menu.addSeparator()
-                add("規定のブラウザで開く", lambda url=page_url: open_in_default_browser(url))
+                add(tr('規定のブラウザで開く'), lambda url=page_url: open_in_default_browser(url))
         if has_image:
             menu.addSeparator()
             add(
-                "画像をコピー",
+                tr('画像をコピー'),
                 lambda: self.page().triggerAction(
                     QWebEnginePage.WebAction.CopyImageToClipboard
                 ),
             )
             add(
-                "画像を保存...",
+                tr('画像を保存...'),
                 lambda: self.page().triggerAction(
                     QWebEnginePage.WebAction.DownloadImageToDisk
                 ),
@@ -1838,7 +2419,7 @@ class XWebView(QWebEngineView):
         if has_video:
             menu.addSeparator()
             add(
-                "動画を保存",
+                tr('動画を保存'),
                 lambda: self.page().triggerAction(QWebEnginePage.WebAction.DownloadMediaToDisk),
             )
         if selection:
@@ -1846,7 +2427,7 @@ class XWebView(QWebEngineView):
             opener = self.tab_opener
             search_url = normalize_user_input_url(selection)
             add(
-                f"「{selection[:20]}」をGoogle検索",
+                tr('「{v0}」をGoogle検索', v0=selection[:20]),
                 (lambda url=search_url: opener(url)) if callable(opener) else (lambda: None),
                 callable(opener),
             )
@@ -1867,6 +2448,7 @@ class XWebView(QWebEngineView):
 
             def __init__(self, profile, parent=None):
                 super().__init__(profile, parent)
+                enforce_certificate_error_rejection(self)
                 self._routed = False
                 self._interactive = False
                 self._view_ref = None
@@ -1957,7 +2539,7 @@ class XWebView(QWebEngineView):
                             | Qt.WindowType.WindowCloseButtonHint
                             | Qt.WindowType.WindowTitleHint
                         )
-                        vw.setWindowTitle("認証")
+                        vw.setWindowTitle(tr('認証'))
                         vw.setParent(None)
                         vw.show()
                         vw.raise_()

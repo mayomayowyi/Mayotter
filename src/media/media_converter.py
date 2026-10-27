@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+from src.core.i18n import tr
 
 import os
 import tempfile
@@ -8,14 +9,16 @@ from pathlib import Path
 
 from src.media.ffmpeg_util import (
     FFmpegError,
+    resampler_filter,
     TARGET_I,
     TARGET_TP,
+    analyze_dynamics,
     find_ffmpeg,
-    loudnorm_filter_string,
     DECLICK_FILTER,
     loudness_measured_usable,
     measure_loudness,
     plan_loudness_filter,
+    speech_pause_expander_filter,
     probe_duration_seconds,
     run_ffmpeg,
     wav_peak_rms,
@@ -36,6 +39,30 @@ def media_temp_dir() -> Path:
     root = Path(tempfile.gettempdir()) / "Mayotter" / "media"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+def save_recording_wav(source: Path, directory: Path) -> Path:
+    import shutil
+    from datetime import datetime
+
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = directory / f"voice_{stamp}_{source.stem}_{uuid.uuid4().hex[:8]}.wav"
+    try:
+        os.link(source, dest)
+    except FileExistsError:
+        raise
+    except OSError:
+        # 別ドライブ等ではハードリンクを作れない。GUI スレッド外で元のバイト列を保存する。
+        with dest.open("xb") as target:
+            try:
+                with source.open("rb") as original:
+                    shutil.copyfileobj(original, target)
+            except BaseException:
+                target.close()
+                dest.unlink()
+                raise
+    return dest
+
 
 def _unique_mp4_path(stem: str = "audio") -> Path:
     safe = "".join(c for c in stem if c.isalnum() or c in ("-", "_"))[:40] or "audio"
@@ -62,13 +89,21 @@ def audio_file_to_mp4(
     scale: float = 1.0,
     rotation: float = 0.0,
     declick: bool = False,
+    denoise: bool = False,
+    denoise_strength: str = "strong",
 ) -> Path:
+    """音声を投稿用 MP4（AAC 192 kbps・映像は波形）にする。
+
+    中間処理は PCM / 32bit float のまま行い、不可逆エンコードは最後の 1 回だけ。
+    denoise=True のときは AI ノイズ除去（DeepFilterNet3、別プロセス、48 kHz）を通した音声で作る。元の音声は変更しない。
+    ノイズ除去に失敗したら DenoiseError を送出する（ノイズ未除去の音声を黙って使わない）。
+    """
     src = Path(source_path).resolve()
     _media_debug(f"audio_file_to_mp4 enter src={src}")
     if not src.is_file():
-        raise ValueError(f"音声ファイルが見つかりません: {src}")
+        raise ValueError(tr('音声ファイルが見つかりません: {v0}', v0=src))
     if not is_audio_path(src):
-        raise ValueError(f"未対応の音声形式です: {src.suffix}")
+        raise ValueError(tr('未対応の音声形式です: {v0}', v0=src.suffix))
 
     out = Path(output_path).resolve() if output_path else _unique_mp4_path(src.stem)
     if output_path:
@@ -84,10 +119,99 @@ def audio_file_to_mp4(
     duration = probe_duration_seconds(src) or 0.0
     if duration > MAX_DURATION_SECONDS:
         raise ValueError(
-            f"音声が長すぎます（{int(duration)}秒）。X投稿向け上限を超えています。"
+            tr('音声が長すぎます（{v0}秒）。X投稿向け上限を超えています。', v0=int(duration))
         )
 
+    enhanced: Path | None = None
+    guard_info: dict | None = None
+    reference_dynamics: dict | None = None
+    silence_stabilized = False
+    try:
+        if denoise:
+            # 無音判定とゲート閾値は、AI処理で変化する前の録音も参照する。
+            guard_info = wav_peak_rms(src) if src.suffix.lower() == ".wav" else {}
+            reference_dynamics = analyze_dynamics(
+                src, pre_filter=DECLICK_FILTER if declick else None
+            ) or None
+            from src.media.denoise import DenoiseCancelled, run_denoise_subprocess
+            enhanced = media_temp_dir() / f"dn_{uuid.uuid4().hex[:12]}.wav"
+            try:
+                stats = run_denoise_subprocess(
+                    src, enhanced, strength=denoise_strength, declick=declick,
+                    duration=duration,
+                    progress_cb=(lambda f: progress_cb(0.6 * float(f))) if progress_cb else None,
+                    cancel_flag=cancel_flag,
+                )
+            except DenoiseCancelled:
+                raise FFmpegError(tr('変換がキャンセルされました')) from None
+            _media_debug(f"denoise done stats={stats}")
+            try:
+                from src.media.silence_stabilizer import stabilize_denoised_silence
+                silence_stabilized = stabilize_denoised_silence(src, enhanced)
+            except (OSError, ValueError, RuntimeError) as exc:
+                # 元のAI出力を壊さず、従来のゲートへフォールバックする。
+                _media_debug(f"silence_stabilizer skipped: {exc!r}")
+            _media_debug(f"silence_stabilized={silence_stabilized}")
+            src = enhanced
+            declick = False  # ノイズ除去の前段（48 kHz 化の前）で適用済み
+        return _encode_post_mp4(
+            src, out, duration=duration,
+            progress_cb=(lambda f: progress_cb(0.6 + 0.4 * float(f))) if (progress_cb and denoise) else progress_cb,
+            cancel_flag=cancel_flag, width=width, height=height, normalize=normalize,
+            center_image_path=center_image_path, crop_x=crop_x, crop_y=crop_y, scale=scale,
+            rotation=rotation, declick=declick, guard_info=guard_info,
+            reference_dynamics=reference_dynamics, silence_stabilized=silence_stabilized,
+        )
+    finally:
+        if enhanced is not None:
+            try:
+                if enhanced.is_file():
+                    enhanced.unlink()
+            except OSError:
+                pass
+
+
+def _source_rate(path: Path, peak_info: dict) -> int:
+    try:
+        rate = int(peak_info.get("rate") or 0)
+    except (TypeError, ValueError):
+        rate = 0
+    if rate <= 0 and path.suffix.lower() == ".wav":
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(64)
+            if head[:4] == b"RIFF" and head[12:16] == b"fmt ":
+                import struct
+                rate = struct.unpack("<I", head[24:28])[0]
+        except OSError:
+            rate = 0
+    return rate
+
+
+def _encode_post_mp4(
+    src: Path,
+    out: Path,
+    *,
+    duration: float,
+    progress_cb,
+    cancel_flag,
+    width: int,
+    height: int,
+    normalize: bool,
+    center_image_path,
+    crop_x: float,
+    crop_y: float,
+    scale: float,
+    rotation: float,
+    declick: bool,
+    guard_info: dict | None = None,
+    reference_dynamics: dict | None = None,
+    silence_stabilized: bool = False,
+) -> Path:
     peak_info = wav_peak_rms(src) if src.suffix.lower() == ".wav" else {}
+    # 44.1 / 48 kHz の録音はそのままの周波数でエンコードし、不要なリサンプリングをしない
+    rate = _source_rate(src, peak_info)
+    out_rate = rate if rate in (44100, 48000) else 44100
     if peak_info:
         _media_debug(
             f"wav_peak={peak_info.get('wav_peak', 0):.4f} "
@@ -106,12 +230,22 @@ def audio_file_to_mp4(
     if normalize:
         if progress_cb:
             progress_cb(0.02)
-        measured = measure_loudness(src)
-        plan = plan_loudness_filter(measured if measured else None, peak_info=peak_info or None)
+        # 測定も変換と同じ入力（declick 後）で行う
+        pre = DECLICK_FILTER if declick else None
+        measured = measure_loudness(src, pre_filter=pre)
+        dynamics = analyze_dynamics(src, pre_filter=pre)
+        plan = plan_loudness_filter(
+            measured if measured else None,
+            peak_info=(peak_info if guard_info is None else guard_info) or None,
+            dynamics=dynamics,
+        )
         af = plan.get("af")
-        if af is None and plan.get("mode") == "single_pass_measure_failed":
-            af = loudnorm_filter_string(None)
-            plan["af"] = af
+        pause_filter = None if silence_stabilized else speech_pause_expander_filter(
+            dynamics, plan, reference_dynamics=reference_dynamics
+        )
+        if pause_filter:
+            af = f"{pause_filter},{af}" if af else pause_filter
+        _media_debug(f"pause_expander={'ON' if pause_filter else 'OFF'}")
         _media_debug(
             f"input_lufs={plan.get('input_lufs')} "
             f"target_lufs={plan.get('target_i')} "
@@ -123,6 +257,7 @@ def audio_file_to_mp4(
             f"input_rms={plan.get('input_rms')} "
             f"input_peak={plan.get('input_peak')} "
             f"normalization_mode={plan.get('mode')} "
+            f"gain_class={plan.get('gain_class')} spread_db={plan.get('spread_db')} "
             f"measured_usable={loudness_measured_usable(measured) if measured else False}"
         )
     else:
@@ -130,6 +265,9 @@ def audio_file_to_mp4(
 
     if declick:
         af = f"{DECLICK_FILTER},{af}" if af else DECLICK_FILTER
+    if af or rate != out_rate:
+        # リミッター用の 192 kHz 化や入力の周波数から、高品質リサンプラーで出力周波数へ戻す
+        af = f"{af},{resampler_filter(out_rate)}" if af else resampler_filter(out_rate)
 
     def _prog(f: float) -> None:
         if progress_cb:
@@ -153,16 +291,17 @@ def audio_file_to_mp4(
             crop_y=crop_y,
             scale=scale,
             rotation=rotation,
+            audio_rate=out_rate,
         )
     except Exception as wave_exc:
         _media_debug(f"waveform stream failed → stillimage fallback ({wave_exc!r})")
         fb_af = af
         if fb_af and "measured_I" in fb_af:
             if not loudness_measured_usable(measured):
-                fb_af = loudnorm_filter_string(None)
+                fb_af = None  # 解析失敗時に無音ノイズを増幅しない
                 if declick:
                     fb_af = f"{DECLICK_FILTER},{fb_af}"
-                _media_debug("fallback af sanitized to single-pass loudnorm")
+                _media_debug("fallback af sanitized to no normalization")
         visual = media_temp_dir() / f"vis_{uuid.uuid4().hex[:10]}.png"
         try:
             visual = write_mayotter_audio_frame(
@@ -198,7 +337,7 @@ def audio_file_to_mp4(
                     "-b:a",
                     "192k",
                     "-ar",
-                    "44100",
+                    str(out_rate),
                     "-shortest",
                     "-movflags",
                     "+faststart",
@@ -220,13 +359,22 @@ def audio_file_to_mp4(
                 pass
 
     if not out.is_file() or out.stat().st_size < 32:
-        raise FFmpegError("MP4 の生成に失敗しました（出力が空です）")
+        raise FFmpegError(tr('MP4 の生成に失敗しました（出力が空です）'))
     if out.stat().st_size > MAX_OUTPUT_BYTES:
         try:
             out.unlink()
         except OSError:
             pass
-        raise ValueError("生成MP4が大きすぎます")
+        raise ValueError(tr('生成MP4が大きすぎます'))
+    if duration > 1.0:
+        out_dur = probe_duration_seconds(out) or 0.0
+        if out_dur < duration - max(0.5, duration * 0.02):
+            try:
+                out.unlink()
+            except OSError:
+                pass
+            raise FFmpegError(
+                tr('変換後の音声が短くなりました（{v0:.1f}秒 / 元 {v1:.1f}秒）', v0=out_dur, v1=duration))
 
     if os.environ.get("MAYOTTER_MEDIA_DEBUG"):
         try:
@@ -277,8 +425,18 @@ def _qt_worker_types():
             scale: float = 1.0,
             rotation: float = 0.0,
             declick: bool = False,
+            denoise: bool = False,
+            denoise_strength: str = "strong",
+            recording_wav_dir: str | None = None,
         ) -> None:
             super().__init__()
+            self.denoise = bool(denoise)
+            self.denoise_strength = denoise_strength
+            self.recording_wav_dir = recording_wav_dir
+            self.recording_wav_path: Path | None = None
+            self.wav_save_error = ""
+            # 失敗の種類（"denoise" ならノイズ除去の失敗。画面側で「ノイズ除去なしで変換」を提案する）
+            self.error_kind = ""
             self.source_path = source_path
             self.output_path = output_path
             self.normalize = bool(normalize)
@@ -309,6 +467,13 @@ def _qt_worker_types():
                     pass
 
             _wlog(f"run_start src={self.source_path!r}")
+            if self.recording_wav_dir:
+                try:
+                    self.recording_wav_path = save_recording_wav(
+                        Path(self.source_path), Path(self.recording_wav_dir))
+                except OSError as exc:
+                    self.wav_save_error = str(exc)
+                    _wlog(f"original WAV save failed; keeping temporary source: {exc}")
             try:
                 _wlog("calling audio_file_to_mp4")
                 out = audio_file_to_mp4(
@@ -323,6 +488,8 @@ def _qt_worker_types():
                     scale=self.scale,
                     rotation=self.rotation,
                     declick=self.declick,
+                    denoise=self.denoise,
+                    denoise_strength=self.denoise_strength,
                 )
                 try:
                     from pathlib import Path as _P
@@ -337,6 +504,12 @@ def _qt_worker_types():
                 _wlog("finished signal emitted")
             except Exception as exc:
                 _wlog(f"run_exception {type(exc).__name__}: {exc}")
+                try:
+                    from src.media.denoise import DenoiseError
+                    if isinstance(exc, DenoiseError):
+                        self.error_kind = "denoise"
+                except Exception:
+                    pass
                 try:
                     self.signals.failed.emit(self.source_path, str(exc))
                     _wlog("failed signal emitted")
@@ -356,6 +529,9 @@ def start_conversion(
     scale: float = 1.0,
     rotation: float = 0.0,
     declick: bool = False,
+    denoise: bool = False,
+    denoise_strength: str = "strong",
+    recording_wav_dir: str | None = None,
     start: bool = True,
 ):
     MediaConversionWorker, QThreadPool = _qt_worker_types()
@@ -369,6 +545,9 @@ def start_conversion(
         scale=scale,
         rotation=rotation,
         declick=declick,
+        denoise=denoise,
+        denoise_strength=denoise_strength,
+        recording_wav_dir=recording_wav_dir,
     )
     worker.setAutoDelete(False)
     if start:

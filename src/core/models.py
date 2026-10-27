@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+from src.core.i18n import tr
 
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlparse
@@ -139,38 +140,38 @@ def resolve_source_url(column_type: str, account_initial_url: str = "", source_u
 def default_column_title(column_type: str, account_display_name: str = "", source_url: str = "") -> str:
     column_type = migrate_column_type(column_type)
     if column_type == SOURCE_TYPE_HOME:
-        return f"{account_display_name} ホーム" if account_display_name else "ホーム"
+        return tr('{v0} ホーム', v0=account_display_name) if account_display_name else tr('ホーム')
     if column_type == SOURCE_TYPE_URL:
         if source_url:
             parsed = urlparse(source_url)
             return parsed.netloc or source_url[:30]
         return "URL"
     if column_type == SOURCE_TYPE_SEARCH:
-        return f"検索: {source_url}" if source_url else "検索"
+        return tr('検索: {v0}', v0=source_url) if source_url else tr('検索')
     if column_type == SOURCE_TYPE_NOTIFICATIONS:
-        return "通知"
+        return tr('通知')
     if column_type == SOURCE_TYPE_DIRECT_MESSAGES:
-        return "ダイレクトメッセージ"
+        return tr('ダイレクトメッセージ')
     if column_type == SOURCE_TYPE_GROK:
         return "Grok"
     if column_type == SOURCE_TYPE_SCHEDULED:
-        return "予約投稿"
+        return tr('予約投稿')
     if column_type == SOURCE_TYPE_UNSENT:
-        return "未送信"
+        return tr('未送信')
     if column_type == SOURCE_TYPE_LISTS:
         if source_url and not source_url.startswith("http"):
-            return f"リスト {source_url}"
-        return "リスト"
+            return tr('リスト {v0}', v0=source_url)
+        return tr('リスト')
     if column_type in (SOURCE_TYPE_FAVORITES, SOURCE_TYPE_SAVED):
-        return "お気に入り"
+        return tr('お気に入り')
     if column_type == SOURCE_TYPE_PROFILE:
-        return "プロフィール"
+        return tr('プロフィール')
     if column_type == SOURCE_TYPE_BOOKMARKS:
-        return "お気に入り"
+        return tr('お気に入り')
     if column_type == SOURCE_TYPE_LIKES:
-        return "お気に入り"
+        return tr('お気に入り')
     if column_type == SOURCE_TYPE_MENTIONS:
-        return "通知"
+        return tr('通知')
     if column_type == SOURCE_TYPE_USER:
         if source_url:
             username = source_url.lstrip("@").rstrip("/")
@@ -179,7 +180,7 @@ def default_column_title(column_type: str, account_display_name: str = "", sourc
                 parts = parsed.path.strip("/").split("/")
                 username = parts[-1] if parts else source_url
             return f"@{username}"
-        return "プロフィール"
+        return tr('プロフィール')
     return column_type
 
 def source_type_needs_input(column_type: str) -> bool:

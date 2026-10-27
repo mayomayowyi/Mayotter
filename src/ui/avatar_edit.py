@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+from src.core.i18n import tr
 
 from pathlib import Path
 
@@ -24,7 +25,6 @@ from PySide6.QtGui import (
 )
 from src.ui.theme import themed_qcolor
 from PySide6.QtWidgets import (
-    QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -33,6 +33,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from src.ui.animated_choice import AnimatedCheckBox as QCheckBox
+
 
 class _AvatarCanvas(QWidget):
 
@@ -154,7 +157,7 @@ class AvatarEditDialog(QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("音声投稿画像を編集")
+        self.setWindowTitle(tr('音声投稿画像を編集'))
         self.setModal(True)
         self.setWindowFlags(
             Qt.WindowType.Dialog
@@ -179,7 +182,7 @@ class AvatarEditDialog(QDialog):
         from PySide6.QtWidgets import QToolButton
         from PySide6.QtCore import QSize
         title_row = QHBoxLayout()
-        title_lbl = QLabel("音声投稿画像を編集")
+        title_lbl = QLabel(tr('音声投稿画像を編集'))
         title_lbl.setStyleSheet(f"color:{TEXT}; font-size:14px; font-weight:600;")
         title_row.addWidget(title_lbl)
         title_row.addStretch(1)
@@ -204,7 +207,7 @@ class AvatarEditDialog(QDialog):
         root.addWidget(self._canvas, 0, Qt.AlignmentFlag.AlignHCenter)
 
         scale_row = QHBoxLayout()
-        scale_lbl = QLabel("拡大縮小")
+        scale_lbl = QLabel(tr('拡大縮小'))
         scale_lbl.setStyleSheet(f"color:{TEXT_SECONDARY}; font-size:11px; min-width:56px;")
         self._scale_slider = QSlider(Qt.Orientation.Horizontal)
         self._scale_slider.setRange(100, 800)
@@ -217,7 +220,7 @@ class AvatarEditDialog(QDialog):
         if rot0 > 180.0:
             rot0 -= 360.0
         rot_row = QHBoxLayout()
-        rot_lbl = QLabel("回転")
+        rot_lbl = QLabel(tr('回転'))
         rot_lbl.setStyleSheet(f"color:{TEXT_SECONDARY}; font-size:11px; min-width:56px;")
         self._rot_slider = QSlider(Qt.Orientation.Horizontal)
         self._rot_slider.setRange(-180, 180)
@@ -247,7 +250,7 @@ class AvatarEditDialog(QDialog):
 
         self._canvas.changed.connect(_from_canvas)
 
-        self._save_crop_cb = QCheckBox("編集後の画像を保存")
+        self._save_crop_cb = QCheckBox(tr('編集後の画像を保存'))
         self._save_crop_cb.setChecked(False)
         self._save_crop_cb.setStyleSheet(
             f"QCheckBox {{ color:{TEXT}; font-size:12px; spacing:6px; }}"
@@ -256,8 +259,8 @@ class AvatarEditDialog(QDialog):
         root.addWidget(self._save_crop_cb)
 
         row = QHBoxLayout()
-        cancel = QPushButton("キャンセル")
-        apply = QPushButton("適用")
+        cancel = QPushButton(tr('キャンセル'))
+        apply = QPushButton(tr('適用'))
         apply.setDefault(True)
         cancel.clicked.connect(self.reject)
         apply.clicked.connect(self.accept)
@@ -320,10 +323,10 @@ class AvatarEditDialog(QDialog):
                     btn.setIconSize(QSize(12, 12))
                     break
             for lbl in self.findChildren(QLabel):
-                if lbl.text() == "音声投稿画像を編集":
+                if lbl.text() == tr('音声投稿画像を編集'):
                     lbl.setStyleSheet(f"color:{color('TEXT')}; font-size:14px; font-weight:600;")
             for lbl in self.findChildren(QLabel):
-                if lbl.text() in ("拡大縮小", "回転"):
+                if lbl.text() in (tr('拡大縮小'), tr('回転')):
                     lbl.setStyleSheet(f"color:{color('TEXT_SECONDARY')}; font-size:11px; min-width:56px;")
             for cb in self.findChildren(QCheckBox):
                 cb.setStyleSheet(
@@ -331,7 +334,7 @@ class AvatarEditDialog(QDialog):
                     f"QCheckBox::indicator {{ width:14px; height:14px; }}"
                 )
             for btn in self.findChildren(QPushButton):
-                if btn.text() in ("キャンセル", "適用"):
+                if btn.text() in (tr('キャンセル'), tr('適用')):
                     pass
             self.update()
         except Exception:
@@ -385,4 +388,3 @@ def open_avatar_editor(
         except Exception:
             pass
     return (path, cx, cy, sc, rot, want_save)
-
