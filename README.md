@@ -31,9 +31,13 @@ https://github.com/user-attachments/assets/2b2e85a2-ddcd-45ef-87ac-a207be3cd51e
 
 「Flip」はスマートフォン対応を想定した試験的な機能です。端末や環境によって正常に表示・動作しない場合があります。
 
-## ソースから実行
+## ソースコードについて
 
-WindowsとPython 3.10以降が必要です。PowerShellで、このフォルダーから実行します。
+Mayotterの仕組みや開発内容を確認できるよう、ソースコードを公開しています。
+
+### ソースから実行する
+
+WindowsとPython 3.10以降が必要です。PowerShellでこのフォルダーを開き、以下のコマンドを順番に実行してください。
 
 ```powershell
 python -m venv .venv
@@ -41,23 +45,34 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m src.app.launch_guard
 ```
 
-実行時のPython依存関係はPySide6（QtWebEngineを含む）、NumPy、ONNX Runtimeです。メモリ診断を使用する場合は `pip install -e ".[diagnostics]"` でpsutilも導入してください。
+基本的なPythonライブラリ（PySide6、NumPy、ONNX Runtimeなど）は、インストール時にまとめて導入されます。
 
-録音・音声変換にはFFmpegが必要です。`ffmpeg.exe` をPATHに置くか、`tools/ffmpeg/ffmpeg.exe` に配置してください。ソースにはFFmpegの実行ファイルを含めていません。
+音声関連の機能を使う場合は、次のファイルも必要です。
 
-AIノイズ除去には、別途 [DeepFilterNet3のONNXモデル](https://github.com/Rikorose/DeepFilterNet/tree/main/models) が必要です。モデルはソースに含めていません。上流の利用条件を確認したうえで、`DeepFilterNet3_onnx.tar.gz` を `tools/denoise/` に配置するか、環境変数 `MAYOTTER_DENOISE_MODEL` にファイルのパスを指定してください。アプリはモデルのSHA-256を検証します。学習済み重みの再配布条件は、[上流で確認中](https://github.com/Rikorose/DeepFilterNet/issues/697)です。
+- **録音・音声変換**：FFmpegの `ffmpeg.exe` をPATHの通った場所か `tools/ffmpeg/` に配置してください。
+- **AIノイズ除去**：[DeepFilterNet3のONNXモデル](https://github.com/Rikorose/DeepFilterNet/tree/main/models)が必要です。`DeepFilterNet3_onnx.tar.gz` を `tools/denoise/` に配置するか、環境変数 `MAYOTTER_DENOISE_MODEL` でファイルのパスを指定してください。
 
-設定・アカウントのProfile・録音は実行時に生成されます。`data/`、`data_dev/`、`audio_visual/` をGitHubへ追加しないでください。
+FFmpegやAIモデル本体はソースコードには含めていません。メモリ診断を利用する場合は、`pip install -e ".[diagnostics]"` でpsutilを追加できます。
 
-Windows配布物のビルドには `pip install -e ".[build]"` とInno Setupが必要です。`packaging/build_distribution.bat` は独立した出力先へZIP・Setupを作成します。ビルド時に外部コンポーネントを取得するため、再配布前に [第三者ライセンスと配布条件](packaging/licenses/README.md) を確認してください。
+設定やアカウントのProfile、録音データなどは、アプリの使用時に作成されます。これらの個人データも公開していません。
 
-## ソースと配布版の対応
+### Windows向けのビルド
 
-このソースは公開済みv1.1.2を基に、配布後の不具合修正を含みます。配布済みバイナリと完全に同一のコードではありません。バージョン番号は1.1.2のままです。
+配布用のZIPやインストーラーを作成するには、Inno Setupと追加のビルド環境が必要です。
 
-- `profile_manager.py`: カラムを閉じた後のProfile再利用と、エラー時の参照・ログ処理を修正。
-- `main_window.py`: Profileを開けない場合の通知、Dockの音声UI確認、設定説明文の折り返しを修正。
-- `translations_en.py` / `translations_zh_cn.py`: Profileを開けずタブを追加できない場合の通知文を追加。
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[build]"
+```
+
+`packaging/build_distribution.bat` でZIPとセットアップファイルを作成できます。外部コンポーネントも使用するため、再配布する際は[第三者ライセンスと配布条件](packaging/licenses/README.md)をご確認ください。
+
+### 配布版との違い
+
+公開しているソースコードは、Mayotter v1.1.2をベースに、その後の細かな修正も反映したものです。
+
+主に、Profileの管理やエラー時の表示、Dockの音声関連UI、英語・中国語の案内文などを調整しています。
+
+そのため、現在配布しているv1.1.2の実行ファイルとは一部のコードが異なります。バージョン番号は変更していません。
 
 ## ご利用にあたって
 
